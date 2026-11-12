@@ -1,0 +1,8 @@
+#h1{Appendix: the details}
+
+Everything after this page is here because it is needed and not because it is interesting. A
+reader who has come this far knows how the program works; what follows is the rest of what the
+program is, in the order of the source, so that the tangled output is complete. The first
+chapter holds the plain parts of the program: the entry point, the arguments, the text
+comparison, the module file and the stylesheet. The last collects small functions that were
+taken out of the chapters above, each placed there by name.

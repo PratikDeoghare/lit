@@ -1,0 +1,4457 @@
+#h1{Appendix: The Python scripts}
+
+The skill carries the other tools too, as Python scripts. They do what their Go counterparts do
+and are described here only briefly: a reader who has understood the Go chapters has understood
+these.
+
+#h2{tangle.py}
+
+Tangle is the foundation of the Python scripts as it is of the Go program, and it is the same
+program in another language: every other script imports it, so the definition of the notation
+lives here and nowhere else.
+
+#py tangle: header and imports{
+  The docstring is the manual: it states the conventions once, and the weaver shows it as the
+  first chunk of the file. The parser import is tried twice, the installed package first and the
+  bundled copy second, and failure ends with the command that installs it.
+
+  ````
+  #!/usr/bin/env python3
+  """Tangle a brashtag literate source into plain source files.
+
+      python tangle.py llm-rig.lit [outdir] [--no-map]
+
+  Needs the brashtag parser:  pip install git+https://github.com/PratikDeoghare/brashtag.git
+
+  Conventions (see llm-rig.lit):
+    #name{ ... }        a bag; any tag other than h1..h6, cite, bibliography defines a chunk.
+                        Chunks may nest; chunk names are global (spaces allowed).
+    ```...```           a fenced code Code (3+ backticks) belongs to its innermost chunk.
+                        The text is dedented by the indentation of the closing fence.
+                        One or two backticks are inline code and are prose.
+    <<<name>>>          alone on a line inside code: expands chunk `name`, keeping indentation.
+    \\<<<name>>>        the same line with a backslash first is literal text: tangle writes <<<name>>>.
+                        (A line that already starts with backslashes loses one.)
+    #img{`pic.svg` caption}  a figure for the woven output; not a chunk (see weave.py).
+    #include{chapter.lit}  replaced by the text of that file (relative to this one); lets a program span files.
+    chunk names ending in an extension (merge.go, rig/model.py) are written out as files.
+
+  Alongside the files it writes <outdir>/<source>.map, a sourcemap from generated lines back to
+  the .lit (see sourcemap.py; absorb.py uses it to fold edits of generated files back in).
+
+  The document is parsed inside an implicit root bag, because brashtag.parse() reads only
+  the first bag of its input and would silently ignore the rest.
+  """
+  import os
+  import re
+  import sys
+
+  try:
+      import brashtag
+      from brashtag import Bag, Blob, Code
+      from brashtag.parser import Error
+  except ImportError:
+      try:                                   # bundled copy (MIT), next to this script
+          import _brashtag as brashtag
+          from _brashtag import Bag, Blob, Code, Error
+      except ImportError:
+          sys.exit("needs the brashtag parser:\n  pip install git+https://github.com/PratikDeoghare/brashtag.git")
+  ````
+}
+
+#py tangle: the grammar's constants{
+  Three regular expressions carry the whole notation. REF matches a reference alone on a code
+  line, ESCAPED matches the same line with a backslash in front, and FILE decides which chunks are
+  files. The escape exists because a document about this notation has to be able to contain a
+  reference line that is not one: the backslash is removed on the way out and nothing else
+  changes.
+
+  ```
+  HEADINGS = {f"h{i}" for i in range(1, 7)}
+  HINT = "agent-fill-in"
+  RESERVED = HEADINGS | {"cite", "bibliography", "include", "img", HINT}
+  REF = re.compile(r"^(\s*)<<<(.+?)>>>\s*$")
+  ESCAPED = re.compile(r"^(\s*)\\(\\*<<<.+?>>>\s*)$")      # \<<<name>>> alone on a line: a literal line
+  FILE = re.compile(r"\.\w+$")
+  ```
+}
+
+#py tangle: a program in several files{
+  A large program is split over files, and the split must not show in anything downstream.
+  `Source` reads the root file, finds every `#include{chapter.lit}` bag, and replaces it by the
+  text of that file, recursively and relative to the including file. What comes out is one flat
+  text, which every other tool works on exactly as if it had been written in one file, and a table
+  of pieces that says which stretch of the flat text came from which file at which offset. Two
+  functions turn positions around. `locate` maps an offset in the flat text to a file, a line and
+  a column, which is how every message and every address names the chapter and the line in it.
+  `split_back` goes the other way: given a changed flat text, it finds the edits with a line diff,
+  cuts each one at the seams between files, and returns the new text of just the files that
+  changed. It then reads the result again and insists that it flattens to exactly the text it was
+  given, so an edit that would add or move an include is refused rather than guessed. Inserted
+  text that falls exactly on a seam goes to the end of the earlier file.
+
+  ```
+  class Source:
+      """A literate program made of one or more files, seen as one text.
+
+      `#include{chapter.lit}` anywhere in a file is replaced by the text of that file (relative to the
+      including file), so every tool works on one flat text, `self.text`, and `self.pieces` remembers
+      which stretch of it came from which file: (flat start, flat end, file, offset in that file).
+      Edits to the flat text are carried back to the files by `write_back`.
+      """
+
+      def __init__(self, root_path):
+          self.root = os.path.normpath(root_path)
+          self.base = os.path.dirname(self.root)
+          self.texts, self.pieces, self.order, self.text = {}, [], [], ""
+
+      @classmethod
+      def read(cls, path):
+          self = cls(path)
+          parts = []
+          self._expand(self.root, (), parts)
+          pos = 0
+          for chunk, name, ofs in parts:
+              self.pieces.append((pos, pos + len(chunk), name, ofs))
+              pos += len(chunk)
+          self.text = "".join(c for c, _, _ in parts)
+          return self
+
+      def rel(self, path):
+          return os.path.relpath(path, self.base or ".").replace(os.sep, "/")
+
+      def _read_file(self, path, why):
+          try:
+              with open(path, encoding="utf-8", newline="") as f:
+                  text = f.read()
+          except OSError as e:
+              sys.exit(f"{why}: cannot read {path}: {e.strerror or e}")
+          if "\r" in text:
+              sys.exit(f"{path}: carriage returns found; convert it to LF line endings "
+                       "(the sourcemap uses character offsets)")
+          return text
+
+      def _expand(self, path, stack, parts):
+          name = self.rel(path)
+          if path in stack:
+              sys.exit("recursive #include: " + " -> ".join(self.rel(p) for p in stack + (path,)))
+          if name in self.texts:
+              sys.exit(f"{name} is included twice; each chapter file may appear once "
+                       "(use <<<chunk>>> references to share code)")
+          text = self._read_file(path, stack and self.rel(stack[-1]) or name)
+          self.texts[name] = text
+          self.order.append(name)
+          at = 0
+          for start, end, target, line in _includes(text, name):
+              parts.append((text[at:start], name, at))
+              sub = os.path.normpath(os.path.join(os.path.dirname(path), target))
+              if not os.path.exists(sub):
+                  sys.exit(f"{name}:{line}: #include{{{target}}}: no such file")
+              self._expand(sub, stack + (path,), parts)
+              at = end
+          parts.append((text[at:], name, at))
+
+      # -- positions
+      def _piece(self, off):
+          for p in self.pieces:
+              if p[0] <= off < p[1]:
+                  return p
+          return self.pieces[-1] if self.pieces else (0, 0, self.rel(self.root), 0)
+
+      def locate(self, off):
+          """flat offset -> (file, line, column), both 1-based."""
+          s, _, name, ofs = self._piece(off)
+          at = ofs + (off - s)
+          text = self.texts.get(name, "")
+          line = text.count("\n", 0, at) + 1
+          return name, line, at - (text.rfind("\n", 0, at) + 1) + 1
+
+      def where(self, off):
+          name, line, _ = self.locate(off)
+          return f"{name}:{line}"
+
+      def flat_offset(self, name, line, col=1):
+          """(file, line, column) -> flat offset, or None if that spot is not part of the flat text."""
+          text = self.texts[name]
+          at = sum(len(l) + 1 for l in text.split("\n")[:line - 1]) + col - 1
+          for s, e, n, ofs in self.pieces:
+              if n == name and ofs <= at < ofs + (e - s):
+                  return s + at - ofs
+          return None
+
+      def parse(self):
+          return parse_text(self.text, self.where)
+
+      # -- writing back
+      def split_back(self, new_text):
+          """{file: new text} for every file that changes when the flat text becomes `new_text`."""
+          import difflib
+          old = self.text
+          if new_text == old:
+              return {}
+          la, lb = old.splitlines(True), new_text.splitlines(True)
+          ca, cb = [0], [0]
+          for l in la:
+              ca.append(ca[-1] + len(l))
+          for l in lb:
+              cb.append(cb[-1] + len(l))
+          edits = []                                         # (old start, old end, replacement)
+          for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, la, lb, autojunk=False).get_opcodes():
+              if tag == "equal":
+                  continue
+              a0, a1, rep = ca[i1], ca[i2], new_text[cb[j1]:cb[j2]]
+              if any(a0 < p[0] < a1 for p in self.pieces):   # a change that straddles two files: go finer
+                  for t2, k1, k2, m1, m2 in difflib.SequenceMatcher(None, old[a0:a1], rep, autojunk=False).get_opcodes():
+                      if t2 != "equal":
+                          edits.append((a0 + k1, a0 + k2, rep[m1:m2]))
+              else:
+                  edits.append((a0, a1, rep))
+          out = {n: [] for n in self.texts}
+          for a0, a1, rep in edits:
+              if a0 == a1:                                   # an insertion belongs to the file that ends there
+                  cand = [p for p in self.pieces if p[0] < a0 <= p[1]] or [p for p in self.pieces if p[0] == a0]
+                  s, _, name, ofs = cand[0]
+                  out[name].append((ofs + a0 - s, ofs + a0 - s, rep))
+                  continue
+              first = True
+              for s, e, name, ofs in self.pieces:
+                  lo, hi = max(a0, s), min(a1, e)
+                  if lo < hi:
+                      out[name].append((ofs + lo - s, ofs + hi - s, rep if first else ""))
+                      first = False
+          new = {}
+          for name, eds in out.items():
+              if not eds:
+                  continue
+              text, shift = self.texts[name], 0
+              for a0, a1, rep in sorted(eds):
+                  text = text[:a0 + shift] + rep + text[a1 + shift:]
+                  shift += len(rep) - (a1 - a0)
+              new[name] = text
+          check = Source.__new__(Source)
+          check.__dict__.update(root=self.root, base=self.base)
+          check.texts, check.pieces, check.order = {}, [], []
+          parts = []
+          check._read_file = lambda path, why: (new if self.rel(path) in new else self.texts).get(self.rel(path)) \
+              or self._read_file(path, why)
+          check._expand(self.root, (), parts)
+          if "".join(c for c, _, _ in parts) != new_text:
+              sys.exit("the edit cannot be carried back to the chapter files (it adds, removes or moves an "
+                       "#include); change the #include lines in the files themselves")
+          return new
+
+      def write_back(self, new_text):
+          """Write the files that change when the flat text becomes `new_text`; -> {file: (old, new)}."""
+          changed = self.split_back(new_text)
+          for name, text in changed.items():
+              path = os.path.join(self.base, name)
+              tmp = path + ".lit.tmp"
+              with open(tmp, "w", encoding="utf-8", newline="") as f:
+                  f.write(text)
+              os.replace(tmp, path)
+          done = {n: (self.texts[n], t) for n, t in changed.items()}
+          for n, t in changed.items():
+              self.texts[n] = t
+          self.text = new_text
+          self.pieces = Source.read(self.root).pieces
+          return done
+  ```
+}
+
+#py tangle: finding the includes{
+  Includes are found in the parse tree, not with a regular expression, so one inside code or in
+  the middle of a word is never mistaken for a directive. The tree is lossless, so walking it and
+  adding up lengths gives the offset of every include bag, and the walk does not descend into one.
+
+  ```
+  def _includes(text, name):
+      """[(start, end, path, line)] of the #include{path} bags in one file (not looking inside them)."""
+      root = parse_text(text, lambda off: f"{name}:{text.count(chr(10), 0, off) + 1}")
+      found, pos = [], 0
+
+      def go(bag):
+          nonlocal pos
+          for k in bag.kids:
+              if isinstance(k, Blob):
+                  pos += len(k.text)
+              elif isinstance(k, Code):
+                  pos += 2 * len(k.tag) + len(k.text)
+              else:
+                  start = pos
+                  pos += len(k.tag) + 2
+                  go(k)
+                  pos += 1
+                  if k.tag == "include":
+                      if not all(isinstance(x, Blob) for x in k.kids) or not "".join(x.text for x in k.kids).strip():
+                          sys.exit(f"{name}:{text.count(chr(10), 0, start) + 1}: #include{{}} wants a file name")
+                      found.append((start, pos, "".join(x.text for x in k.kids).strip(),
+                                    text.count("\n", 0, start) + 1))
+
+      go(root)
+      return found
+  ```
+}
+
+#py tangle: parsing a document{
+  The parser reads only the first bag of its input and would silently ignore the rest of a file,
+  so the text is wrapped in an implicit root bag. A stray hash or brace in prose then becomes an
+  error with a file and a line, taken from the flat text through `where`, instead of a truncated
+  document.
+
+  ```
+  def parse_text(text, where):
+      """Parse literate text into a root Bag; exits with file:line on malformed input.
+      `where(offset)` names a position in the text for messages."""
+      head = "#document{"
+      rest, root = brashtag.parse_bag(head + text + "}")
+      at = lambda r: max(0, len(head) + len(text) + 1 - len(r) - len(head))
+      if isinstance(root, Error):
+          sys.exit(f"{where(at(rest) if rest else len(text))}: {root.s}")
+      if rest.strip():
+          off = at(rest) - 1
+          sys.exit(f"{where(off)}: a stray '}}' in prose closed the document early, near: "
+                   f"{text[off:off + 50].strip()!r}  (a literal '}}' or '#' outside backticks is not allowed)")
+
+      def check(bag):
+          if "\n" in bag.tag or "#" in bag.tag or bag.tag != bag.tag.lstrip() or len(bag.tag) > 120:
+              i = text.find("#" + bag.tag[:30])
+              sys.exit(f"{where(max(i, 0))}: suspicious bag tag {bag.tag[:40]!r}...: a stray '#' in prose? (use backticks)")
+          for k in bag.kids:
+              if isinstance(k, Bag):
+                  check(k)
+      check(root)
+      return root
+
+
+  def parse_flat(text):
+      """Parse program text that is already spliced together (what Source.text holds)."""
+      return parse_text(text, lambda off: f"program text line {text.count(chr(10), 0, off) + 1}")
+
+
+  def load(path):
+      """Parse a .lit file (and the chapter files it includes) into a root Bag."""
+      return Source.read(path).parse()
+  ```
+}
+
+#py tangle: what is code{
+  A fence is a code run of three or more backticks. Its text is the lines between the fences,
+  dedented by the indentation of the closing fence, which lets the author indent code to match the
+  prose around it.
+
+  ```
+  def is_fence(code):
+      return len(code.tag) >= 3
+
+
+  def fence_text(code):
+      """Lines of a fenced block: drop the newline after the opening fence, and dedent
+      by the whitespace that precedes the closing fence."""
+      lines = code.text.split("\n")
+      if lines and lines[0].strip() == "":
+          lines = lines[1:]
+      indent = ""
+      if lines and lines[-1].strip() == "":
+          indent, lines = lines[-1], lines[:-1]
+      return [l[len(indent):] if l.startswith(indent) else l.lstrip() for l in lines]
+  ```
+}
+
+#py tangle: collecting chunks{
+  Collection is one walk over the tree. Each fence is appended to its innermost chunk, in document
+  order, so a chunk defined twice is the concatenation of both definitions. A hint, a bag tagged
+  `agent-fill-in` inside a chunk, is skipped: it is a gap the author left for an assistant, not
+  code. With `holes` set, each hint leaves a marker line in its chunk instead, numbered in
+  document order, so that the tool that fills the gaps can find the one it is working on in the
+  expanded file.
+
+  ```
+  def collect(root, holes=False):
+      """name -> code lines (all fenced blocks of every definition, in document order).
+
+      An #agent-fill-in{...} hint inside a chunk is left out, or with holes=True replaced by a marker line
+      "\\x00hole:N" (N counts the hints in document order) so that a tool can find the gap in the expanded text."""
+      chunks = {}
+      count = [0]
+
+      def visit(bag, depth):
+          name = bag.tag.strip()
+          if bag.tag == HINT:
+              if depth and holes:
+                  chunks[stack[-1]].append("\x00hole:%d" % count[0])
+              count[0] += depth > 0
+              return
+          if name in RESERVED:
+              return
+          lines = chunks.setdefault(name, [])
+          stack.append(name)
+          for k in bag.kids:
+              if isinstance(k, Code) and is_fence(k):
+                  lines += fence_text(k)
+              elif isinstance(k, Bag):
+                  visit(k, depth + 1)
+          stack.pop()
+
+      stack = []
+      for k in root.kids:
+          if isinstance(k, Code) and is_fence(k):
+              print("warning: code outside any chunk is ignored", file=sys.stderr)
+          elif isinstance(k, Bag):
+              visit(k, 0)
+      return chunks
+
+
+  def count_hints(root):
+      """How many #agent-fill-in hints stand inside chunks, in document order."""
+      return sum(1 for ln in sum(collect(root, True).values(), []) if ln.startswith("\x00hole:"))
+  ```
+}
+
+#py tangle: expanding references{
+  Expansion is a recursion with an indentation: a reference alone on a line is replaced by the
+  lines of its chunk, each shifted by the reference's own indentation. Writing `E(c)` for the
+  lines of chunk `c`, a line is either text, copied after removing one escape backslash, or a
+  reference `r` at indentation `i`, which becomes `i` prefixed to every non-blank line of `E(r)`.
+  A chunk that reaches itself is reported rather than expanded forever.
+
+  ```
+  def unescape(line):
+      """The text tangle writes for a code line: an escaped reference line loses its first backslash."""
+      m = ESCAPED.match(line)
+      return m.group(1) + m.group(2) if m else line
+
+
+  def expand(name, chunks, trail=()):
+      if name not in chunks:
+          sys.exit(f"undefined chunk <<<{name}>>>")
+      if name in trail:
+          sys.exit("recursive chunk: " + " -> ".join(trail + (name,)))
+      out = []
+      for line in chunks[name]:
+          m = REF.match(line)
+          if m:
+              sub = expand(m.group(2).strip(), chunks, trail + (name,))
+              out += [m.group(1) + s if s else s for s in sub]
+          else:
+              out.append(unescape(line))
+      return out
+  ```
+}
+
+#py tangle: the command line{
+  The command line writes every file chunk, warns about chunks that are never used, and then
+  writes the sourcemap. Before it overwrites a file, it hands the old and new text to the sync
+  library, which keeps a copy of any edit that is about to be lost.
+
+  ```
+  def _protect(src, outdir, name, path, new_text):
+      """Keep a copy of edits to a generated file that are about to be overwritten (see litsync.py)."""
+      try:
+          import litsync
+      except ImportError:
+          return
+      litsync.protect(src, outdir, name, path, new_text)
+
+
+  def main():
+      argv = [a for a in sys.argv[1:] if a != "--no-map"]
+      if not argv:
+          sys.exit(__doc__)
+      src, outdir = argv[0], (argv[1] if len(argv) > 1 else ".")
+      root = load(src)
+      chunks = collect(root)
+      open_hints = count_hints(root)
+      if open_hints:
+          print(f"note: {open_hints} #agent-fill-in hint(s) still open; the generated files lack them (lit fill / fill.py fills them)", file=sys.stderr)
+      used = {m.group(2).strip() for lines in chunks.values() for l in lines if (m := REF.match(l))}
+      for name in chunks:
+          if not FILE.search(name) and name not in used and chunks[name]:
+              print(f"warning: chunk '{name}' is never used", file=sys.stderr)
+      for name in chunks:
+          if FILE.search(name):
+              path = os.path.join(outdir, name)
+              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+              body = "\n".join(expand(name, chunks))
+              _protect(src, outdir, name, path, body + "\n" if body else "")
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(body + "\n" if body else "")
+              print("wrote", path)
+      if "--no-map" not in sys.argv:
+          try:
+              import sourcemap
+              print("wrote", sourcemap.write(src, outdir, chunks))
+          except ImportError:
+              print("note: sourcemap.py not found; no sourcemap written", file=sys.stderr)
+          except sourcemap.MapError as e:
+              print(f"note: no sourcemap written: {e}", file=sys.stderr)
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/tangle.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py tangle: header and imports>>>
+
+  <<<py tangle: the grammar's constants>>>
+
+
+  <<<py tangle: a program in several files>>>
+
+
+  <<<py tangle: finding the includes>>>
+
+
+  <<<py tangle: parsing a document>>>
+
+
+  <<<py tangle: what is code>>>
+
+
+  <<<py tangle: collecting chunks>>>
+
+
+  <<<py tangle: expanding references>>>
+
+
+  <<<py tangle: the command line>>>
+  ```
+}
+
+#h2{sourcemap.py}
+
+The map counts characters, where the Go program's map counts bytes, because that is what a
+Python string is indexed by. The two maps are therefore not interchangeable, and a tangle
+directory belongs to one of the two tool families.
+
+#py sourcemap: header and helpers{
+  The sourcemap speaks in character offsets, so the source is read with line endings untouched,
+  and a file with carriage returns is refused instead of being given offsets that would be wrong.
+
+  ```
+  #!/usr/bin/env python3
+  """Sourcemap between a brashtag literate source and the files tangle.py generates.
+
+  tangle.py writes <outdir>/<source>.map next to the generated files (use --no-map to skip it).
+  This module builds that map and answers lookups in both directions:
+
+      python sourcemap.py to-lit  out/llm-rig.lit.map rig/model.py:45[:COL]   # generated -> .lit (file:line:col)
+      python sourcemap.py to-gen  out/llm-rig.lit.map 182[:COL]                # .lit -> generated
+
+  How the map is made
+    * brashtag's parser reports no positions, but its tree is lossless ('#tag{' + kids + '}'),
+      so the .lit offset of every fenced block is found by summing lengths (and is asserted).
+    * To learn where each generated line came from, every code line is tagged with an invisible
+      marker and expanded with tangle.expand itself; the tag survives expansion, and whatever
+      precedes the original text is the indentation contributed by <<<references>>>.
+      The decoded result is checked, line by line, against tangle's own untagged expansion.
+
+  Map file (JSON, one block / one file per line)
+    "source", "source_sha256"      the .lit it was built from (path is relative to the map); the hash
+                                   is of the program text, with every #include already spliced in
+    "sources"                      the files that text came from, the root first (chapter paths are
+                                   relative to the root's directory); all offsets below are
+                                   offsets into the spliced text, tangle.Source maps them to files
+    "blocks": [{"chunk", "indent", "lines": [[start, end], ...], "nl_last"}]
+          one entry per fenced code block: the chunk it belongs to, the indentation stripped from
+          every line, character offsets [start, end) of each content line in the .lit (end is
+          before the newline), and whether a newline follows the last content line
+    "files": {name: {"sha256", "lines", "segments": [[at, n, block, line, prefix], ...]}}
+          generated lines at..at+n-1 (1-based) come from lines line..line+n-1 of that block;
+          prefix is the indentation added by references (the generated line is prefix + text)
+  """
+  import bisect
+  import hashlib
+  import json
+  import os
+  import re
+  import sys
+
+  from tangle import Source, Bag, Blob, Code, FILE, RESERVED, REF, collect, expand, fence_text, is_fence, load, unescape
+
+  VERSION = 1
+  MARK = "\x00"
+  MARKED = re.compile("\x00(\\d+),(\\d+)\x00$")
+
+
+  class MapError(Exception):
+      pass
+
+
+  def sha256(s):
+      return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+  def read_source(path):
+      """The .lit text exactly as the map's offsets see it: LF line endings only, with every
+      `#include{chapter.lit}` replaced by that file's text (see tangle.Source)."""
+      return Source.read(path).text
+
+
+  def file_body(lines):
+      """What tangle writes for a file made of these lines."""
+      body = "\n".join(lines)
+      return body + "\n" if body else ""
+  ```
+}
+
+#py sourcemap: positions in the lit{
+  The parser reports no positions, but its tree is lossless: a bag is a hash, its tag, a brace,
+  its children and a brace. Summing lengths therefore gives the offset of every piece of code, and
+  the sum is checked against the text at every step and at the end. The layout function repeats
+  the fence rule of tangle, records where each line lives, and insists that its answer equals
+  tangle's own.
+
+  ```
+  # ---------------------------------------------------------------- positions in the .lit
+  def code_offsets(root, text):
+      """id(Code) -> offset in `text` of the first character of that code's text."""
+      pos, out = 0, {}
+
+      def go(bag):
+          nonlocal pos
+          for k in bag.kids:
+              if isinstance(k, Blob):
+                  pos += len(k.text)
+              elif isinstance(k, Code):
+                  start = pos + len(k.tag)
+                  if text[start:start + len(k.text)] != k.text:
+                      raise MapError("internal error: parse tree does not match the source text")
+                  out[id(k)] = start
+                  pos = start + len(k.text) + len(k.tag)
+              else:
+                  pos += len(k.tag) + 2            # '#' tag '{'
+                  go(k)
+                  pos += 1                         # '}'
+
+      go(root)
+      if pos != len(text):
+          raise MapError("internal error: offsets do not add up to the source length")
+      return out
+
+
+  def layout(code, off):
+      """Mirror of tangle.fence_text that also records where each line lives in the .lit.
+      Returns (indent, [(text, start, end)], newline_follows_last_line)."""
+      raw = code.text.split("\n")
+      starts, pos = [], off
+      for r in raw:
+          starts.append(pos)
+          pos += len(r) + 1
+      lo, hi, indent = 0, len(raw), ""
+      if raw[0].strip() == "":
+          lo = 1
+      if hi > lo and raw[hi - 1].strip() == "":
+          indent, hi = raw[hi - 1], hi - 1
+      items = []
+      for i in range(lo, hi):
+          r = raw[i]
+          items.append((r[len(indent):] if r.startswith(indent) else r.lstrip(), starts[i], starts[i] + len(r)))
+      if [t for t, _, _ in items] != fence_text(code):
+          raise MapError("internal error: block layout differs from tangle.fence_text")
+      return indent, items, hi < len(raw)
+  ```
+}
+
+#py sourcemap: building the map{
+  To learn which source line produced which generated line, every code line is tagged with an
+  invisible marker holding its block and line number, and the tagged chunks are expanded by
+  tangle's own expand. Whatever precedes the original text after expansion is the indentation that
+  references added. The decoded result is compared, line by line, with tangle's untagged
+  expansion, so a disagreement stops the build instead of producing a map that lies. Consecutive
+  lines from consecutive source lines are merged into one segment.
+
+  ```
+  # ---------------------------------------------------------------- building the map
+  def build(src_path, chunks=None, src=None):
+      """-> (map dict, {file name: generated text}).  `chunks` is tangle.collect's result if known,
+      `src` the tangle.Source already read from src_path."""
+      src = src or Source.read(src_path)
+      text, root = src.text, src.parse()
+      offs = code_offsets(root, text)
+      blocks, texts, marked = [], [], {}
+
+      def visit(bag):
+          name = bag.tag.strip()
+          if name in RESERVED:
+              return
+          out = marked.setdefault(name, [])
+          for k in bag.kids:
+              if isinstance(k, Code) and is_fence(k):
+                  indent, items, nl_last = layout(k, offs[id(k)])
+                  bid = len(blocks)
+                  blocks.append({"chunk": name, "indent": indent, "lines": [[s, e] for _, s, e in items],
+                                 "nl_last": nl_last})
+                  texts.append([t for t, _, _ in items])
+                  for li, (t, _, _) in enumerate(items):
+                      out.append(t if REF.match(t) else f"{t}{MARK}{bid},{li}{MARK}")
+              elif isinstance(k, Bag):
+                  visit(k)
+
+      for k in root.kids:
+          if isinstance(k, Bag):
+              visit(k)
+      if chunks is None:
+          chunks = collect(root)
+
+      files, generated = {}, {}
+      for name in marked:
+          if not FILE.search(name):
+              continue
+          plain = expand(name, chunks)
+          segs = []
+          for i, line in enumerate(expand(name, marked), 1):
+              m = MARKED.search(line)
+              body = line[:m.start()]
+              bid, li = int(m.group(1)), int(m.group(2))
+              t = texts[bid][li]
+              if not body.endswith(t) or ("" if t == "" else unescape(body)) != plain[i - 1]:
+                  raise MapError(f"internal error: sourcemap for {name} disagrees with tangle at line {i}")
+              pfx = body[:len(body) - len(t)]
+              if segs and segs[-1][2] == bid and segs[-1][3] + segs[-1][1] == li and segs[-1][4] == pfx \
+                      and segs[-1][0] + segs[-1][1] == i:
+                  segs[-1][1] += 1
+              else:
+                  segs.append([i, 1, bid, li, pfx])
+          if len(plain) != sum(s[1] for s in segs):
+              raise MapError(f"internal error: sourcemap for {name} has the wrong number of lines")
+          content = file_body(plain)
+          files[name] = {"sha256": sha256(content), "lines": len(plain), "segments": segs}
+          generated[name] = content
+      return {"version": VERSION, "source_sha256": sha256(text), "sources": src.order, "blocks": blocks,
+              "files": files}, generated
+  ```
+}
+
+#py sourcemap: writing and reading the map{
+  The map is JSON with one block and one file per line, so that it diffs well. Writing it also
+  records the generated files as the common base for synchronisation, which is the one place where
+  the two libraries meet.
+
+  ```
+  def dumps(m, source):
+      j = lambda x: json.dumps(x, separators=(",", ":"))
+      return "\n".join([
+          "{", f'"version":{m["version"]},', f'"source":{j(source)},', f'"sources":{j(m.get("sources", []))},', f'"source_sha256":{j(m["source_sha256"])},',
+          '"blocks":[', ",\n".join(j(b) for b in m["blocks"]), "],",
+          '"files":{', ",\n".join(f"{j(k)}:{j(v)}" for k, v in m["files"].items()), "}", "}"]) + "\n"
+
+
+  def map_path(src, outdir):
+      return os.path.join(outdir, os.path.basename(src) + ".map")
+
+
+  def write(src, outdir, chunks=None, base=True):
+      """Write the map.  With base=True (what tangle.py and absorb.py want) also record the generated
+      files as the common base for two-way sync (litsync.py)."""
+      so = Source.read(src)
+      m, generated = build(src, chunks, so)
+      path = map_path(src, outdir)
+      os.makedirs(outdir or ".", exist_ok=True)
+      with open(path, "w", encoding="utf-8") as f:
+          f.write(dumps(m, os.path.relpath(os.path.abspath(src), os.path.dirname(os.path.abspath(path)))))
+      if base:
+          try:
+              import litsync
+              litsync.Store(src, outdir).set_base(generated, so.text, note="tangle", parts=so.texts)
+          except ImportError:
+              pass
+      return path
+
+
+  def load_map(path):
+      try:
+          with open(path, encoding="utf-8") as f:
+              m = json.load(f)
+      except FileNotFoundError:
+          raise MapError(f"{path}: no sourcemap; run tangle.py first")
+      if m.get("version") != VERSION:
+          raise MapError(f"{path}: unsupported sourcemap version {m.get('version')}")
+      return m
+
+
+  def origins(entry):
+      """One (block, line, prefix) per generated line of a file."""
+      out = []
+      for at, n, bid, li, pfx in entry["segments"]:
+          out += [(bid, li + k, pfx) for k in range(n)]
+      return out
+  ```
+}
+
+#py sourcemap: lookups{
+  Both directions are small. Generated to source is an index into the segments; source to
+  generated scans the segments for the block and line. Line and column arithmetic uses bisection
+  over the newline offsets.
+
+  ```
+  # ---------------------------------------------------------------- lookups
+  def newline_index(text):
+      return [i for i, c in enumerate(text) if c == "\n"]
+
+
+  def line_col(nl, off):
+      ln = bisect.bisect_left(nl, off)
+      return ln + 1, off - (nl[ln - 1] + 1 if ln else 0) + 1
+
+
+  def to_lit(m, fname, line, col=1):
+      """Generated (file, line, col) -> (.lit offset, chunk name)."""
+      if fname not in m["files"]:
+          raise MapError(f"{fname} is not in the sourcemap")
+      org = origins(m["files"][fname])
+      if not 1 <= line <= len(org):
+          raise MapError(f"{fname} has {len(org)} lines")
+      bid, li, pfx = org[line - 1]
+      blk = m["blocks"][bid]
+      start, end = blk["lines"][li]
+      off = start + len(blk["indent"]) + max(0, col - 1 - len(pfx))
+      return min(off, end), blk["chunk"]
+
+
+  def to_gen(m, lit_line, text):
+      """.lit line number -> [(file, line)] where that code line is generated."""
+      nl = newline_index(text)
+      lo = (nl[lit_line - 2] + 1) if lit_line >= 2 else 0
+      hi = nl[lit_line - 1] if lit_line - 1 < len(nl) else len(text)
+      hits = []
+      for bid, blk in enumerate(m["blocks"]):
+          for li, (s, e) in enumerate(blk["lines"]):
+              if s <= hi and e >= lo and (s < e or lo <= s <= hi):
+                  for fname, entry in m["files"].items():
+                      for at, n, b, first, _ in entry["segments"]:
+                          if b == bid and first <= li < first + n:
+                              hits.append((fname, at + li - first))
+      return hits
+  ```
+}
+
+#py sourcemap: command line{
+  The command line is a convenience; addr.py is the friendlier interface to the same lookups.
+
+  ```
+  def _cli(argv):
+      if len(argv) < 3 or argv[0] not in ("to-lit", "to-gen", "build"):
+          sys.exit(__doc__)
+      if argv[0] == "build":
+          print("wrote", write(argv[1], argv[2] if len(argv) > 2 else "."))
+          return
+      mp = load_map(argv[1])
+      src = os.path.join(os.path.dirname(os.path.abspath(argv[1])), mp["source"])
+      srcobj = Source.read(src)
+      text = srcobj.text
+      if argv[0] == "to-lit":
+          parts = argv[2].split(":")
+          fname, line = parts[0], int(parts[1])
+          off, chunk = to_lit(mp, fname, line, int(parts[2]) if len(parts) > 2 else 1)
+          name, ln, col = srcobj.locate(off)
+          print(f"{name}:{ln}:{col}  chunk \u00ab{chunk}\u00bb")
+      else:
+          parts = argv[2].split(":")
+          if len(parts) > 1 and parts[0] in srcobj.texts:        # chapter.lit:LINE
+              at = srcobj.flat_offset(parts[0], int(parts[1]))
+              if at is None:
+                  sys.exit(f"{argv[2]} is not part of the program text")
+              line = newline_index(text) and line_col(newline_index(text), at)[0]
+          else:
+              line = int(parts[0])
+          hits = to_gen(mp, line, text)
+          print("\n".join(f"{f}:{n}" for f, n in hits) or "no generated line (not code, or the chunk is unused)")
+      if sha256(text) != mp["source_sha256"]:
+          print("warning: the .lit has changed since the map was written; results may be off", file=sys.stderr)
+
+
+  if __name__ == "__main__":
+      try:
+          _cli(sys.argv[1:])
+      except MapError as e:
+          sys.exit(str(e))
+  ```
+}
+
+#internal/skill/files/scripts/sourcemap.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py sourcemap: header and helpers>>>
+
+
+  <<<py sourcemap: positions in the lit>>>
+
+
+  <<<py sourcemap: building the map>>>
+
+
+  <<<py sourcemap: writing and reading the map>>>
+
+
+  <<<py sourcemap: lookups>>>
+
+
+  <<<py sourcemap: command line>>>
+  ```
+}
+
+#h2{absorb.py}
+
+Folding edits of generated files back into the document.
+
+#py absorb: header and imports{
+  Absorb reads an edited generated file and changes the document so that tangling it again would
+  produce the edit. The docstring lists the side effects it refuses to cause silently.
+
+  ```
+  #!/usr/bin/env python3
+  """Fold edits made directly to tangled files back into the literate source.
+
+      python absorb.py llm-rig.lit [FILE ...] [-o OUTDIR] [--dry-run] [--force] [--map PATH]
+
+    FILE ...     the generated files you edited (default: every file in the sourcemap that differs)
+    -o OUTDIR    where tangle.py wrote the files and <source>.map (default: .)
+    --dry-run    show what would change in the .lit, write nothing
+    --force      apply even if the patched .lit would regenerate something other than what is on disk
+                 (see "side effects" below); the generated files are then overwritten to match the .lit
+
+  How it works
+    1. Check that the .lit is unchanged since the sourcemap was made, and re-tangle it in memory to
+       get the pristine version of each generated file.
+    2. `git diff --no-index -U0` between pristine and edited file gives the hunks (Python's difflib
+       is used instead if git is missing).  Each changed or deleted line is mapped through the
+       sourcemap to the .lit line that produced it; the indentation that <<<references>>> add is
+       removed and the block's own indentation put back.  Inserted lines go after the preceding
+       line's origin (before the first line, if inserted at the top); a note is printed when that
+       choice is ambiguous.
+    3. The patched .lit is tangled in memory again and compared with the files on disk.  If every
+       file matches exactly, the .lit is written, and the generated files and sourcemap refreshed.
+
+  Side effects: a chunk that is expanded in several places, or edits that cannot be expressed in the
+  .lit (an indentation shallower than a reference's), make the re-tangled output differ from what you
+  have on disk.  absorb.py reports those differences and refuses unless you pass --force.
+
+  Edit only code.  Prose, headings and chunk structure live in the .lit; change them there.
+  """
+  import argparse
+  import difflib
+  import os
+  import re
+  import subprocess
+  import sys
+  import tempfile
+
+  import sourcemap
+  from sourcemap import MapError
+  from tangle import FILE, Source, collect, expand, parse_flat
+
+  HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+  ```
+}
+
+#py absorb: reading and tangling in memory{
+  Absorb works on text, never on the disk's idea of it: files are read without newline
+  translation, and the pristine version of every generated file comes from tangling the document
+  in memory.
+
+  ```
+  def to_lines(text):
+      lines = text.split("\n")
+      if lines and lines[-1] == "":
+          lines.pop()
+      return lines
+
+
+  def read_disk(path):
+      with open(path, encoding="utf-8") as f:          # universal newlines: CRLF edits are fine
+          return f.read()
+
+
+  def tangle_text(lit_text):
+      """{file: generated text} for program text given as a string, using tangle's own collect/expand."""
+      chunks = collect(parse_flat(lit_text))
+      return {n: sourcemap.file_body(expand(n, chunks)) for n in chunks if FILE.search(n)}
+  ```
+}
+
+#py absorb: diff hunks{
+  The hunks come from git diff with no context lines and the histogram algorithm, which keeps
+  unrelated edits separate. Without git, the standard library's difflib gives the same shape. Both
+  descend from the shortest-edit-script idea of #cite{myers1986diff}.
+
+  ```
+  def diff_hunks(old, new):
+      """git's -U0 hunks as (a, b, c, d, removed, added): old lines a..a+b-1 became new lines c..c+d-1
+      (for b == 0, the lines were inserted after old line a)."""
+      out, ok = "", False
+      with tempfile.TemporaryDirectory() as d:
+          po, pn = os.path.join(d, "old"), os.path.join(d, "new")
+          for p, ls in ((po, old), (pn, new)):
+              with open(p, "w", encoding="utf-8", newline="") as f:
+                  f.write("".join(l + "\n" for l in ls))
+          try:
+              r = subprocess.run(["git", "diff", "--no-index", "--no-color", "--no-ext-diff", "-U0",
+                                  "--diff-algorithm=histogram", po, pn], capture_output=True, encoding="utf-8")
+              out, ok = r.stdout, r.returncode in (0, 1)
+          except FileNotFoundError:
+              pass
+      if not ok:                                         # same hunk convention as git
+          out = "\n".join(difflib.unified_diff(old, new, n=0, lineterm=""))
+      hunks, cur = [], None
+      for ln in out.split("\n"):
+          m = HUNK.match(ln)
+          if m:
+              cur = [int(m[1]), 1 if m[2] is None else int(m[2]), int(m[3]), 1 if m[4] is None else int(m[4]), [], []]
+              hunks.append(cur)
+          elif cur is not None and ln[:1] == "-":
+              cur[4].append(ln[1:])
+          elif cur is not None and ln[:1] == "+":
+              cur[5].append(ln[1:])
+      for h in hunks:
+          if len(h[4]) != h[1] or len(h[5]) != h[3]:
+              raise MapError("could not understand the diff output")
+      return [tuple(h) for h in hunks]
+  ```
+}
+
+#py absorb: the plan{
+  A plan holds the sourcemap and the document text, and collects edits as positions in that text:
+  a replacement for a line, a deletion, an insertion after a line. Every generated line is looked
+  up in the map to find the line of the document that produced it, and the indentation that
+  references added is taken off before the text goes in. Nothing is changed until the plan is
+  applied.
+
+  ```
+  class Plan:
+      """Edits to the .lit, keyed by (block, line) so that a chunk expanded twice is edited once."""
+
+      def __init__(self, m, src):
+          self.m, self.src, self.text = m, src, src.text
+          self.org = {f: sourcemap.origins(e) for f, e in m["files"].items()}
+          self.lines, self.ins = {}, {}              # (block, line) -> text | None ; (block, line, where) -> [text]
+          self.errors, self.notes, self.log = [], [], []
+
+      def where(self, bid, li):
+          blk = self.m["blocks"][bid]
+          return f"\u00ab{blk['chunk']}\u00bb, {self.src.where(blk['lines'][li][0])}"
+
+      def lit_text(self, bid, text, pfx, fname, lineno):
+          if text == "":
+              return ""
+          if not text.startswith(pfx):
+              self.errors.append(f"{fname}:{lineno}: indented less than the {len(pfx)} column(s) that "
+                                 f"<<<references>>> add at this place; change the reference in the .lit instead")
+              return None
+          return self.m["blocks"][bid]["indent"] + text[len(pfx):]
+
+      def set_line(self, key, val, fname, lineno):
+          if key in self.lines and self.lines[key] != val:
+              self.errors.append(f"{fname}:{lineno}: edits the .lit line at {self.where(*key)} differently from "
+                                 "another copy of the same chunk; make the copies agree")
+          else:
+              self.lines[key] = val
+  ```
+}
+
+#py absorb: replacing and deleting{
+  Replacing and deleting are edits of lines that exist, so their origin is known exactly. When one
+  chunk is expanded in several places, an edit to one copy is an edit of the shared source line,
+  and two copies that were edited differently are an error.
+
+  ```
+      def replace(self, fname, lineno, new):
+          bid, li, pfx = self.org[fname][lineno - 1]
+          txt = self.lit_text(bid, new, pfx, fname, lineno)
+          if txt is not None:
+              self.set_line((bid, li), txt, fname, lineno)
+
+      def delete(self, fname, lineno):
+          bid, li, _ = self.org[fname][lineno - 1]
+          self.set_line((bid, li), None, fname, lineno)
+  ```
+}
+
+#py absorb: inserting{
+  An inserted line has no origin, so it goes after the origin of the line before it, or before the
+  first line of the file when it was added at the top. When the line after it belongs to a
+  different block, the choice is ambiguous and a note says where the text went and where else it
+  could have gone.
+
+  ```
+      def insert(self, fname, a, new):
+          org = self.org[fname]
+          if not org:
+              self.errors.append(f"{fname}: no line of this file comes from the .lit, so there is nowhere to "
+                                 "anchor an insertion; write the code into the .lit by hand")
+              return
+          if a >= 1:
+              bid, li, pfx = org[a - 1]
+              where = "after"
+              if a < len(org) and not (org[a][0] == bid and org[a][1] == li + 1):
+                  self.notes.append(f"{fname}: lines inserted after line {a} sit at a chunk boundary; placed at the end "
+                                    f"of {self.where(bid, li)} (they could also start {self.where(org[a][0], org[a][1])})")
+          else:
+              bid, li, pfx = org[0]
+              where = "before"
+          lines = [self.lit_text(bid, t, pfx, fname, a + 1 + i) for i, t in enumerate(new)]
+          if any(t is None for t in lines):
+              return
+          key = (bid, li, where)
+          if key in self.ins and self.ins[key] != lines:
+              self.errors.append(f"{fname}: inserts different text than another copy of the same chunk "
+                                 f"at {self.where(bid, li)}")
+          else:
+              self.ins[key] = lines
+  ```
+}
+
+#py absorb: one file{
+  One file is a list of hunks. A hunk that removes and adds the same number of lines is a set of
+  replacements; extra added lines become an insertion and extra removed lines become deletions.
+
+  ```
+      def absorb_file(self, fname, old, new):
+          for a, b, c, d, removed, added in diff_hunks(old, new):
+              if b == 0:
+                  self.insert(fname, a, added)
+                  self.log.append(f"{fname}:{a}+  {d} line(s) added")
+                  continue
+              for i in range(min(b, d)):
+                  self.replace(fname, a + i, added[i])
+              if d > b:
+                  self.insert(fname, a + b - 1, added[b:])
+              for i in range(d, b):
+                  self.delete(fname, a + i)
+              bid, li, _ = self.org[fname][a - 1]
+              rng = f"{a}-{a + b - 1}" if b > 1 else f"{a}"
+              self.log.append(f"{fname}:{rng}  {self.where(bid, li)}: {min(b, d)} changed"
+                              + (f", {d - b} added" if d > b else "") + (f", {b - d} removed" if d < b else ""))
+  ```
+}
+
+#py absorb: applying the plan{
+  Applying a plan sorts the edits by position and splices the text in a single forward pass. Two
+  edits that overlap would make the result depend on the order, so they are refused.
+
+  ```
+      def apply(self):
+          blocks, ops = self.m["blocks"], []             # (start, end, text, order)
+          for (bid, li), new in self.lines.items():
+              blk = blocks[bid]
+              start, end = blk["lines"][li]
+              if new is None:
+                  nl = li < len(blk["lines"]) - 1 or blk["nl_last"]
+                  ops.append((start, end + (1 if nl else 0), "", 2))
+              else:
+                  ops.append((start, end, new, 2))
+          for (bid, li, where), lines in self.ins.items():
+              blk = blocks[bid]
+              start, end = blk["lines"][li]
+              if where == "before":
+                  ops.append((start, start, "\n".join(lines) + "\n", 1))
+              elif li < len(blk["lines"]) - 1 or blk["nl_last"]:
+                  ops.append((end + 1, end + 1, "\n".join(lines) + "\n", 0))
+              else:
+                  ops.append((end, end, "\n" + "\n".join(lines), 0))
+          ops.sort(key=lambda o: (o[0], o[1], o[3]))
+          out, cur = [], 0
+          for start, end, new, _ in ops:
+              if start < cur:
+                  raise MapError("overlapping edits; edit fewer lines at once")
+              out += [self.text[cur:start], new]
+              cur = end
+          out.append(self.text[cur:])
+          return "".join(out)
+  ```
+}
+
+#py absorb: running{
+  Running is the whole procedure: check that the map is current, tangle the pristine files, plan
+  every file, apply the plan, tangle the patched document in memory, and compare it with the files
+  on disk. If they differ, a shared chunk was touched or an edit could not be expressed in the
+  document, and the run stops and shows the difference unless it is forced.
+
+  ```
+  def short_diff(actual, expected, limit=14):
+      d = list(difflib.unified_diff(actual, expected, "on disk", "regenerated from the patched .lit", n=0, lineterm=""))
+      return d[:limit] + ([f"... ({len(d) - limit} more lines)"] if len(d) > limit else [])
+
+
+  def run(a):
+      src = Source.read(a.source)
+      text = src.text
+      m = sourcemap.load_map(a.map or sourcemap.map_path(a.source, a.outdir))
+      if sourcemap.sha256(text) != m["source_sha256"]:
+          raise MapError(f"{a.source} has changed since it was tangled, so the sourcemap is stale. Tangle again "
+                         "(this discards edits to generated files), absorb before touching the .lit, or merge both sides "
+                         "with sync.py.")
+      pristine = tangle_text(text)
+      for f, e in m["files"].items():
+          if sourcemap.sha256(pristine.get(f, "")) != e["sha256"]:
+              raise MapError("the sourcemap does not match what this tangle.py generates; tangle again")
+
+      targets = []
+      for f in a.files or list(m["files"]):
+          rel = f
+          if a.files:
+              rel = os.path.relpath(f, a.outdir) if os.path.exists(f) else f
+              if rel not in m["files"]:
+                  raise MapError(f"{f} is not generated from {a.source} (known: {', '.join(m['files'])})")
+          targets.append(rel)
+
+      plan = Plan(m, src)
+      touched = []
+      for f in targets:
+          path = os.path.join(a.outdir, f)
+          if not os.path.exists(path):
+              continue
+          old, new = to_lines(pristine[f]), to_lines(read_disk(path))
+          if old != new:
+              touched.append(f)
+              plan.absorb_file(f, old, new)
+      if not touched:
+          print("nothing to absorb: no generated file differs from what the .lit produces")
+          return 0
+
+      for line in plan.log:
+          print("  " + line)
+      for n in plan.notes:
+          print("note: " + n)
+      if plan.errors:
+          print("cannot absorb:\n  " + "\n  ".join(plan.errors))
+          return 1
+
+      new_text = plan.apply()
+      try:
+          regenerated = tangle_text(new_text)
+      except SystemExit as e:
+          raise MapError(f"the patched .lit no longer parses ({e}); an edited line probably contains the "
+                         "code fence delimiter")
+      problems, affected = {}, set(touched)
+      for f in m["files"]:
+          path = os.path.join(a.outdir, f)
+          if f not in regenerated:
+              problems[f] = ["no longer generated by the patched .lit"]
+          elif f in touched or to_lines(regenerated[f]) != to_lines(pristine[f]):
+              affected.add(f)                            # edited, or changed by an edit to a shared chunk
+              if os.path.exists(path) and to_lines(regenerated[f]) != to_lines(read_disk(path)):
+                  problems[f] = short_diff(to_lines(read_disk(path)), to_lines(regenerated[f]))
+                  if f not in touched and to_lines(read_disk(path)) != to_lines(pristine[f]):
+                      problems[f].append("(this file also has edits you did not name; they would be overwritten)")
+          # files the patch does not affect are left alone, even if they carry edits that are still to be absorbed
+
+      changed = src.split_back(new_text)
+      for name in sorted(changed):
+          print("\n".join(difflib.unified_diff(src.texts[name].split("\n"), changed[name].split("\n"),
+                                               f"a/{name}", f"b/{name}", n=1, lineterm="")))
+      if problems:
+          print("\nside effects: after absorbing, the .lit would regenerate these files differently from what is on disk")
+          for f, d in problems.items():
+              print(f"  {f}:\n    " + "\n    ".join(d))
+          if not a.force:
+              print("\nnothing written. Usually a chunk is used in several places: make the same edit everywhere "
+                    "(or name the other files too), or pass --force to accept the .lit's version.")
+              return 1
+      if a.dry_run:
+          print("\n(dry run: nothing written)")
+          return 0
+
+      src.write_back(new_text)
+      for f in sorted(affected & set(regenerated)):
+          path, content = os.path.join(a.outdir, f), regenerated[f]
+          if not os.path.exists(path) or to_lines(read_disk(path)) != to_lines(content):
+              with open(path, "w", encoding="utf-8") as fh:
+                  fh.write(content)
+      sourcemap.write(a.source, a.outdir)
+      print(f"\nabsorbed edits from {len(touched)} file(s) into {a.source}; sourcemap refreshed"
+            + (f"; regenerated: {', '.join(problems)}" if problems else ""))
+      return 0
+  ```
+}
+
+#py absorb: command line{
+  The command line parses options and reports errors.
+
+  ```
+  def main():
+      ap = argparse.ArgumentParser(description="Fold edits made to tangled files back into the .lit.")
+      ap.add_argument("source")
+      ap.add_argument("files", nargs="*")
+      ap.add_argument("-o", "--outdir", default=".")
+      ap.add_argument("--map")
+      ap.add_argument("--dry-run", action="store_true")
+      ap.add_argument("--force", action="store_true")
+      try:
+          sys.exit(run(ap.parse_args()))
+      except MapError as e:
+          sys.exit(f"absorb: {e}")
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/absorb.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py absorb: header and imports>>>
+
+
+  <<<py absorb: reading and tangling in memory>>>
+
+
+  <<<py absorb: diff hunks>>>
+
+
+  <<<py absorb: the plan>>>
+
+  <<<py absorb: replacing and deleting>>>
+
+  <<<py absorb: inserting>>>
+
+  <<<py absorb: one file>>>
+
+  <<<py absorb: applying the plan>>>
+
+
+  <<<py absorb: running>>>
+
+
+  <<<py absorb: command line>>>
+  ```
+}
+
+#h2{addr.py}
+
+Translating addresses between the document and the generated files.
+
+#py addr: header and imports{
+  A sourcemap is only useful if it can be asked questions. This script answers them in the units
+  editors use, a file, a line and a column, and it works in either direction.
+
+  ```
+  #!/usr/bin/env python3
+  """Translate addresses between a literate source and the files tangle.py generated from it.
+
+      python addr.py SOURCE.lit ADDRESS [ADDRESS ...] [-o OUTDIR] [--json] [--map PATH] [--ignore-stale]
+
+  An ADDRESS is FILE:LINE[:COL] (1-based; columns count characters).  The direction is detected:
+
+      python addr.py llm-rig.lit rig/model.py:64:13      generated -> .lit :  llm-rig.lit:158:9   <<attention init>>
+      python addr.py llm-rig.lit llm-rig.lit:158:9       .lit -> generated :  rig/model.py:64:13
+      python addr.py llm-rig.lit 158                     a bare LINE[:COL] is a .lit address
+
+    * If the program is split into chapters with #include{ch.lit}, FILE may be the root or any chapter
+      file (a bare LINE means a line of the root) and answers name the chapter file and its own line.
+    * If FILE is the source, the answer lists every generated place that code is written to; a chunk
+      expanded in several places gives several answers.  A <<<reference>>> line gives the places where
+      the chunk it expands appears (this includes lines of nested chunks that are also expanded
+      elsewhere); a prose line has no generated address.
+    * If FILE is a generated file, the answer is the .lit line that produced it.  A column that falls
+      inside indentation contributed by a <<<reference>>> maps to the start of the code in the .lit.
+    * Generated files may have been edited since tangling.  Lines are then matched against the pristine
+      output (difflib), so addresses refer to the file as it is now; a line you added or changed has no
+      origin in the .lit yet (absorb.py would put it there).
+    * Output is one `path:line:col` per answer (editor/grep friendly) with the chunk name after two
+      spaces; --json gives a machine-readable list.  Exit status: 0 found, 1 no address, 2 error.
+
+  Needs the sourcemap that tangle.py writes (OUTDIR/<source>.map, default OUTDIR is .) and refuses to
+  guess if the .lit changed since (use --ignore-stale to look anyway; results may then be wrong).
+  """
+  import argparse
+  import difflib
+  import json
+  import os
+  import sys
+
+  import sourcemap
+  from absorb import read_disk, tangle_text, to_lines
+  from sourcemap import MapError
+  from tangle import REF, Source
+  ```
+}
+
+#py addr: parsing addresses{
+  An address is FILE:LINE:COL with the column optional, and a bare number is a line of the
+  document. File names may contain colons, so the numbers are peeled off from the right.
+
+  ```
+  def parse_address(s):
+      """'file:12:3' -> (file, 12, 3); 'file:12' -> (file, 12, None); '12' / '12:3' -> (None, 12, 3|None)."""
+      parts = s.split(":")
+      if len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+          return ":".join(parts[:-2]), int(parts[-2]), int(parts[-1])
+      if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+          return None, int(parts[0]), int(parts[1])
+      if len(parts) >= 2 and parts[-1].isdigit():
+          return ":".join(parts[:-1]), int(parts[-1]), None
+      if len(parts) == 1 and parts[0].isdigit():
+          return None, int(parts[0]), None
+      raise MapError(f"cannot read address {s!r}; expected FILE:LINE[:COL] or LINE[:COL]")
+  ```
+}
+
+#py addr: aligning edited files{
+  A generated file may have been edited since it was tangled, in which case its line numbers no
+  longer match the map. The pristine output is aligned with the current file using difflib, and
+  only the lines they share can be translated; the rest are reported as added or changed.
+
+  ```
+  def align(pristine, current):
+      """Line-number maps for the lines two versions of a file share: (current -> pristine, pristine -> current)."""
+      c2p, p2c = {}, {}
+      for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, pristine, current, autojunk=False).get_opcodes():
+          if tag == "equal":
+              for k in range(i2 - i1):
+                  p2c[i1 + k + 1], c2p[j1 + k + 1] = j1 + k + 1, i1 + k + 1
+      return c2p, p2c
+
+
+  def ranges(numbers):
+      """[3,4,5,9] -> ['3-5', '9']"""
+      out, run = [], []
+      for n in sorted(set(numbers)):
+          if run and n == run[-1] + 1:
+              run.append(n)
+          else:
+              if run:
+                  out.append(run)
+              run = [n]
+      if run:
+          out.append(run)
+      return [f"{r[0]}-{r[-1]}" if len(r) > 1 else str(r[0]) for r in out]
+  ```
+}
+
+#py addr: the mapper{
+  The mapper loads the map and the document and refuses to answer if the document has changed
+  since the map was written, because the answers would silently be wrong.
+
+  ```
+  class Mapper:
+      def __init__(self, source, outdir=".", map_file=None, ignore_stale=False):
+          self.source, self.outdir = source, outdir
+          self.src = Source.read(source)
+          self.text = self.src.text
+          self.m = sourcemap.load_map(map_file or sourcemap.map_path(source, outdir))
+          self.stale = sourcemap.sha256(self.text) != self.m["source_sha256"]
+          if self.stale and not ignore_stale:
+              raise MapError(f"{source} has changed since it was tangled, so the sourcemap is out of date; "
+                             "run tangle.py again (or pass --ignore-stale to look anyway)")
+          self.nl = sourcemap.newline_index(self.text)
+          self.org = {f: sourcemap.origins(e) for f, e in self.m["files"].items()}
+          self.notes, self._align, self._pristine = [], {}, None
+  ```
+}
+
+#py addr: names and edited files{
+  Names are accepted as they appear in the map or as paths relative to the output directory. The
+  alignment is computed lazily and only for files that really differ from the pristine output.
+
+  ```
+      # ---- naming
+      def gen_path(self, fname):
+          return os.path.normpath(os.path.join(self.outdir, fname))
+
+      def source_name(self, name):
+          """The name of the source file (the root or a chapter) an address means, or None."""
+          for cand in (name, os.path.relpath(os.path.abspath(name), os.path.abspath(self.src.base or "."))):
+              cand = os.path.normpath(cand).replace(os.sep, "/")
+              if cand in self.src.texts:
+                  return cand
+          return None
+
+      def is_source(self, name):
+          return self.source_name(name) is not None
+
+      def source_path(self, name):
+          return os.path.normpath(os.path.join(self.src.base, name))
+
+      def flat_line(self, name, line):
+          """Line `line` of source file `name` -> its line in the program text the map was built from."""
+          total = self.src.texts[name].count("\n") + 1
+          if not 1 <= line <= total:
+              raise MapError(f"{name} has {total} lines, not {line}")
+          off = self.src.flat_offset(name, line)
+          if off is None:
+              raise MapError(f"{name}:{line} is an #include line (or lies outside the program text); "
+                             "address a line of the chapter itself")
+          return sourcemap.line_col(self.nl, off)[0]
+
+      def generated_name(self, name):
+          if name in self.m["files"]:
+              return name
+          rel = os.path.relpath(name, self.outdir).replace(os.sep, "/")
+          if rel in self.m["files"]:
+              return rel
+          raise MapError(f"{name} is neither {self.source} nor a file generated from it "
+                         f"({', '.join(self.m['files'])})")
+
+      # ---- generated files edited since tangling
+      def alignment(self, fname):
+          if fname not in self._align:
+              res, path = None, os.path.join(self.outdir, fname)
+              if not self.stale and os.path.exists(path):
+                  cur = read_disk(path)
+                  if sourcemap.sha256(cur) != self.m["files"][fname]["sha256"]:
+                      if self._pristine is None:
+                          self._pristine = tangle_text(self.text)
+                      res = align(to_lines(self._pristine[fname]), to_lines(cur))
+                      self.notes.append(f"{self.gen_path(fname)} was edited after tangling; "
+                                        "its line numbers are those of the current file")
+              self._align[fname] = res
+          return self._align[fname]
+  ```
+}
+
+#py addr: from a generated file to the document{
+  The answer is the line of the block that produced the generated line. A column that falls inside
+  indentation added by a reference is mapped to the start of the code in the document, with a
+  note.
+
+  ```
+      # ---- generated -> .lit
+      def to_lit(self, fname, line, col=None):
+          al = self.alignment(fname)
+          pl = al[0].get(line) if al else line
+          if pl is None:
+              return [{"status": "edited", "msg": f"{self.gen_path(fname)}:{line} was added or changed after "
+                       "tangling, so it has no origin in the .lit yet (absorb.py folds it in)"}]
+          org = self.org[fname]
+          if not 1 <= pl <= len(org):
+              raise MapError(f"{self.gen_path(fname)} has {len(org)} lines, not {line}")
+          bid, li, pfx = org[pl - 1]
+          blk = self.m["blocks"][bid]
+          start, end = blk["lines"][li]
+          indent, note = len(blk["indent"]), None
+          if col is None:
+              lit_col = indent + 1
+          elif col <= len(pfx):
+              lit_col, note = indent + 1, "column lies in indentation added by a <<<reference>>>"
+          else:
+              lit_col = indent + col - len(pfx)
+          off = start + min(lit_col - 1, end - start)
+          name, ln, c = self.src.locate(off)
+          return [{"file": self.source_path(name), "line": ln, "col": c, "chunk": blk["chunk"], **({"note": note} if note else {})}]
+  ```
+}
+
+#py addr: from the document to generated files{
+  The other direction is a search: a code line may be generated in several places because its
+  chunk is expanded in several places, and every place is reported. A reference line gives the
+  places where the chunk it names is expanded, including the chunks nested inside it.
+
+  ```
+      # ---- .lit -> generated
+      def lit_line_span(self, line):
+          total = len(self.nl) + (0 if self.text.endswith("\n") else 1)
+          if not 1 <= line <= max(total, 1):
+              raise MapError(f"{self.source} has {total} lines, not {line}")
+          lo = self.nl[line - 2] + 1 if line >= 2 else 0
+          hi = self.nl[line - 1] if line - 1 < len(self.nl) else len(self.text)
+          return lo, hi
+
+      def gen_places(self, bids_lines):
+          """{(block, line)} -> [(file, generated line, prefix)] across all generated files."""
+          want, hits = set(bids_lines), []
+          for fname, entry in self.m["files"].items():
+              for at, n, b, first, pfx in entry["segments"]:
+                  for k in range(n):
+                      if (b, first + k) in want:
+                          hits.append((fname, at + k, pfx))
+          return hits
+
+      def current_line(self, fname, pristine_line):
+          al = self.alignment(fname)
+          return pristine_line if not al else al[1].get(pristine_line)
+
+      def to_gen(self, line, col=None):
+          lo, hi = self.lit_line_span(line)
+          here = [(bid, li) for bid, blk in enumerate(self.m["blocks"]) for li, (s, e) in enumerate(blk["lines"])
+                  if lo <= s and e <= hi]
+          if not here:
+              return []
+          results = []
+          hits = self.gen_places(here)
+          if hits:
+              blk = self.m["blocks"][here[0][0]]
+              for fname, gl, pfx in hits:
+                  cl = self.current_line(fname, gl)
+                  if cl is None:
+                      results.append({"status": "edited", "msg": f"{self.gen_path(fname)}: the line generated here "
+                                      "was changed after tangling"})
+                      continue
+                  gcol = len(pfx) + 1 if col is None else len(pfx) + max(1, col - len(blk["indent"]))
+                  results.append({"file": self.gen_path(fname), "line": cl, "col": gcol, "chunk": blk["chunk"]})
+              return results
+          ref = REF.match(self.text[lo:hi])           # a <<<reference>>> line: where does the chunk appear?
+          if ref:
+              return self.reference_places(ref.group(2).strip())
+          return []
+
+      def reference_places(self, name):
+          """Generated lines of chunk `name` and of every chunk it expands (found through the .lit's own lines)."""
+          reach, todo = set(), [name]
+          while todo:
+              n = todo.pop()
+              if n in reach:
+                  continue
+              reach.add(n)
+              for blk in self.m["blocks"]:
+                  if blk["chunk"] == n:
+                      for s, e in blk["lines"]:
+                          r = REF.match(self.text[s:e])
+                          if r:
+                              todo.append(r.group(2).strip())
+          pairs = [(bid, li) for bid, blk in enumerate(self.m["blocks"]) if blk["chunk"] in reach
+                   for li in range(len(blk["lines"]))]
+          per_file = {}
+          for fname, gl, _ in self.gen_places(pairs):
+              cl = self.current_line(fname, gl)
+              if cl is not None:
+                  per_file.setdefault(fname, []).append(cl)
+          return [{"file": self.gen_path(f), "lines": ranges(ls), "chunk": name, "reference": True}
+                  for f, ls in per_file.items()]
+  ```
+}
+
+#py addr: output and command line{
+  Output is one address per line in the form editors and grep use, or JSON. The exit status says
+  whether anything was found, so the script can be used in shell pipelines.
+
+  ```
+  def render(res, direction):
+      if "status" in res:
+          return f"# {res['msg']}"
+      if res.get("reference"):
+          return f"{res['file']}:{','.join(res['lines'])}  (where \u00ab{res['chunk']}\u00bb is expanded)"
+      s = f"{res['file']}:{res['line']}:{res['col']}  \u00ab{res['chunk']}\u00bb"
+      return s + (f"  ({res['note']})" if res.get("note") else "")
+
+
+  def main():
+      ap = argparse.ArgumentParser(description="Translate addresses between a .lit file and its tangled output.")
+      ap.add_argument("source")
+      ap.add_argument("addresses", nargs="+")
+      ap.add_argument("-o", "--outdir", default=".")
+      ap.add_argument("--map")
+      ap.add_argument("--json", action="store_true")
+      ap.add_argument("--ignore-stale", action="store_true")
+      a = ap.parse_args()
+      try:
+          mp = Mapper(a.source, a.outdir, a.map, a.ignore_stale)
+          report, found = [], True
+          for addr in a.addresses:
+              fname, line, col = parse_address(addr)
+              if fname is None or mp.is_source(fname):
+                  name = mp.source_name(fname) if fname else mp.src.rel(mp.src.root)
+                  direction, res = "lit->gen", mp.to_gen(mp.flat_line(name, line), col)
+              else:
+                  g = mp.generated_name(fname)
+                  direction, res = "gen->lit", mp.to_lit(g, line, col)
+              found &= any("status" not in r for r in res)
+              report.append({"address": addr, "direction": direction, "results": res})
+      except MapError as e:
+          sys.exit(f"addr: {e}")
+      if a.json:
+          print(json.dumps(report, indent=1, ensure_ascii=False))
+      else:
+          many = len(report) > 1
+          for r in report:
+              if many:
+                  print(f"{r['address']}  [{r['direction']}]")
+              for res in r["results"]:
+                  print(("  " if many else "") + render(res, r["direction"]))
+              if not r["results"]:
+                  print(("  " if many else "") + "# no address: not code, or the chunk is never expanded into a file")
+      for n in mp.notes:
+          print("note: " + n, file=sys.stderr)
+      sys.exit(0 if found else 1)
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/addr.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py addr: header and imports>>>
+
+
+  <<<py addr: parsing addresses>>>
+
+
+  <<<py addr: aligning edited files>>>
+
+
+  <<<py addr: the mapper>>>
+
+  <<<py addr: names and edited files>>>
+
+  <<<py addr: from a generated file to the document>>>
+
+  <<<py addr: from the document to generated files>>>
+
+
+  <<<py addr: output and command line>>>
+  ```
+}
+
+#h2{litsync.py}
+
+The memory and the three-way logic behind sync.
+
+#py litsync: header and constants{
+  This library is the memory and the logic of two-way synchronisation. The docstring states the
+  problem and the answer; the decisions are short strings so that they can be logged.
+
+  ```
+  #!/usr/bin/env python3
+  """Two-way reconciliation of a .lit and the files tangled from it (library; see sync.py and watch.py).
+
+  The problem: edit the .lit and a generated file, and whichever of tangle.py / absorb.py runs first
+  discards the other edit.  The fix is a three-way merge against a remembered common base, done in the one
+  coordinate system both sides share, the generated files:
+
+      base   the generated files at the last sync (written by tangle.py / absorb.py / sync.py)
+      lit    tangle(current .lit)          what the .lit side now says
+      gen    the files on disk             what you typed into the generated files
+
+  Where only one side changed a region, that change crosses over (a .lit change regenerates the file; a file
+  edit is folded into the .lit through the sourcemap, exactly as absorb.py does).  Where both changed the
+  same lines differently it is a conflict, and you choose.  Anything you choose to leave alone stays pending
+  on its side: the base keeps the old text for that region, so it is still a change next time.
+
+  State lives in <outdir>/<source>.sync/:
+      base/<file>, base.lit, state.json    the common base (the .lit text is kept for reference)
+      snapshots/<sha256>                   every version ever recorded, content addressed
+      journal.jsonl                        events: edits seen by watch.py, backups, syncs, with timestamps
+  Nothing here ever deletes a recorded version.
+  """
+  import difflib
+  import hashlib
+  import json
+  import os
+  import shutil
+  import sys
+  import tempfile
+  import time
+  from dataclasses import dataclass, field
+
+  import sourcemap
+  from absorb import Plan, diff_hunks, read_disk, tangle_text, to_lines
+  from sourcemap import MapError, file_body
+  from tangle import Source
+
+  APPLY, LEAVE, REVERT, TAKE_LIT, TAKE_GEN, BOTH, CUSTOM = "apply", "leave", "revert", "lit", "gen", "both", "custom"
+  ```
+}
+
+#py litsync: the store{
+  The store keeps, next to the generated files, the base they were in at the last sync, a
+  content-addressed pile of every version ever seen, and a journal of events. Writing a base also
+  snapshots the document. Nothing in the store is ever deleted.
+
+  ```
+  def sha(text):
+      return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+  # ================================================================ the store
+  class Store:
+      def __init__(self, source, outdir):
+          self.source, self.outdir = source, outdir
+          self.dir = os.path.join(outdir, os.path.basename(source) + ".sync")
+
+      def p(self, *parts):
+          return os.path.join(self.dir, *parts)
+
+      def has_base(self):
+          return os.path.exists(self.p("state.json"))
+
+      def state(self):
+          try:
+              with open(self.p("state.json"), encoding="utf-8") as f:
+                  return json.load(f)
+          except FileNotFoundError:
+              return {}
+
+      def base_files(self):
+          return {n: read_disk(self.p("base", n)) for n in self.state().get("files", [])}
+
+      def base_lit(self, name=None):
+          """The .lit text at the last sync: the whole program text, or one chapter file of it."""
+          try:
+              return read_disk(self.p("base_lit", name) if name else self.p("base.lit"))
+          except FileNotFoundError:
+              return None if name is None else self.base_lit()
+
+      def set_base(self, files, lit_text, note="", parts=None):
+          """Record the common base: generated `files`, the program text, and (for a program split into
+          chapter files) each chapter `parts` {name: text}."""
+          parts = parts or {os.path.basename(self.source): lit_text}
+          shutil.rmtree(self.p("base"), ignore_errors=True)
+          shutil.rmtree(self.p("base_lit"), ignore_errors=True)
+          for name, text in parts.items():
+              path = self.p("base_lit", name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8", newline="") as f:
+                  f.write(text)
+          for name, text in files.items():
+              path = self.p("base", name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+          with open(self.p("base.lit"), "w", encoding="utf-8", newline="") as f:
+              f.write(lit_text)
+          with open(self.p("state.json"), "w", encoding="utf-8") as f:
+              json.dump({"files": sorted(files), "lit_sha": sha(lit_text), "lit_files": {n: sha(t) for n, t in parts.items()},
+                         "t": time.time(), "note": note}, f)
+          self.snapshot(lit_text)
+          for name, text in parts.items():
+              self.log("base", "lit", name, text, note=note)
+
+      def snapshot(self, text):
+          h = sha(text)
+          path = self.p("snapshots", h)
+          if not os.path.exists(path):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8", newline="") as f:
+                  f.write(text)
+          return h
+
+      def read_snapshot(self, prefix):
+          hits = [h for h in os.listdir(self.p("snapshots"))] if os.path.isdir(self.p("snapshots")) else []
+          hits = [h for h in hits if h.startswith(prefix)]
+          if len(hits) != 1:
+              raise MapError(f"snapshot {prefix!r} matches {len(hits)} recorded versions")
+          return hits[0], read_disk(self.p("snapshots", hits[0]))
+
+      def log(self, kind, side, path, text=None, **extra):
+          os.makedirs(self.dir, exist_ok=True)
+          ev = {"t": time.time(), "kind": kind, "side": side, "path": path,
+                "sha": self.snapshot(text) if text is not None else None, **extra}
+          with open(self.p("journal.jsonl"), "a", encoding="utf-8") as f:
+              f.write(json.dumps(ev) + "\n")
+          return ev
+
+      def events(self):
+          try:
+              with open(self.p("journal.jsonl"), encoding="utf-8") as f:
+                  return [json.loads(l) for l in f if l.strip()]
+          except FileNotFoundError:
+              return []
+
+      def last_edit(self, side, path):
+          t = [e["t"] for e in self.events() if e["kind"] == "edit" and e["side"] == side and e["path"] == path]
+          return max(t) if t else None
+  ```
+}
+
+#py litsync: protecting edits from tangle{
+  Tangle calls this just before it overwrites a file. If the file differs from what is known to be
+  the last synchronised version, a copy is logged first and a warning tells the author how to get
+  it back, so running tangle is never destructive.
+
+  ```
+  def protect(source, outdir, name, path, new_text):
+      """Called by tangle.py before it overwrites a generated file: keep a copy of edits that are not in the .lit."""
+      if not os.path.exists(path):
+          return
+      try:
+          cur = read_disk(path)
+      except (OSError, UnicodeDecodeError):
+          return
+      if cur == new_text:
+          return
+      store = Store(source, outdir)
+      if store.has_base():
+          known = store.base_files().get(name)
+      else:
+          try:
+              known = None if sourcemap.load_map(sourcemap.map_path(source, outdir))["files"][name]["sha256"] != sha(cur) \
+                  else cur
+          except (MapError, KeyError):
+              known = None
+      if known is not None and cur == known:
+          return                                        # untouched since the last sync; nothing to protect
+      h = store.log("backup", "gen", name, cur, note="replaced by tangle.py")["sha"]
+      print(f"warning: {path} had edits that are not in the .lit; tangle replaced them, but a copy is kept "
+            f"(snapshot {h[:8]}; see sync.py {source} log / restore)", file=sys.stderr)
+
+
+  # ================================================================ three-way regions
+  @dataclass
+  ```
+}
+
+#py litsync: three-way regions{
+  The three-way merge is done in generated-file space, the one coordinate system both sides share.
+  The base is compared with each side, the hunks of the two comparisons are grouped where they
+  touch, and each group is classified: changed only by the document, only by the file, by both in
+  the same way, or by both differently, which is a conflict. Two insertions at one point count as
+  touching. This is the diff3 algorithm whose properties are analysed in #cite{khanna2007diff3},
+  and each comparison is a shortest edit script in the sense of #cite{myers1986diff}.
+
+  ```
+  class Region:
+      s: int                    # base lines [s, e) are affected
+      e: int
+      base: list
+      lit: list                 # what the .lit side has there
+      gen: list                 # what the generated file has there
+      kind: str                 # "lit" | "gen" | "same" | "conflict"
+
+
+  def _hunks(old, new):
+      if old == new:
+          return []
+      out = []
+      for a, b, c, d, removed, added in diff_hunks(old, new):
+          s = a if b == 0 else a - 1
+          out.append((s, s + b, added))
+      return out
+
+
+  def _overlap(g, h):
+      if h[0] == h[1] == g["s"] == g["e"]:
+          return True                                   # two insertions at the same point
+      return h[0] < g["e"] and g["s"] < h[1]
+
+
+  def diff3(base, ours, theirs):
+      """Regions where ours (the .lit side) or theirs (the file) differ from base, with who changed what."""
+      items = sorted([(s, e, n, "o") for s, e, n in _hunks(base, ours)] +
+                     [(s, e, n, "t") for s, e, n in _hunks(base, theirs)], key=lambda h: (h[0], h[1], h[3]))
+      groups = []
+      for it in items:
+          if groups and _overlap(groups[-1], it):
+              g = groups[-1]
+              g["s"], g["e"] = min(g["s"], it[0]), max(g["e"], it[1])
+              g["h"].append(it)
+          else:
+              groups.append({"s": it[0], "e": it[1], "h": [it]})
+      regions = []
+      for g in groups:
+          s, e = g["s"], g["e"]
+
+          def side(which):
+              out, pos = [], s
+              for hs, he, new, who in sorted(g["h"], key=lambda h: (h[0], h[1])):
+                  if who == which:
+                      out += base[pos:hs] + new
+                      pos = he
+              return out + base[pos:e]
+
+          has_o, has_t = any(h[3] == "o" for h in g["h"]), any(h[3] == "t" for h in g["h"])
+          lit, gen = side("o"), side("t")
+          kind = "lit" if not has_t else "gen" if not has_o else "same" if lit == gen else "conflict"
+          regions.append(Region(s, e, base[s:e], lit, gen, kind))
+      return regions
+
+
+  def default_decision(r):
+      return (LEAVE, None) if r.kind == "conflict" else (APPLY, None)
+  ```
+}
+
+#py litsync: what a decision does{
+  Each decision maps a region to three texts: what the document side will yield, what the file
+  will hold and what the base becomes. Leaving a region alone keeps the old base text there, which
+  is how an unchosen change stays a change next time.
+
+  ```
+  def outcome(r, decision):
+      """(what the .lit side will yield, what the file will hold, what the base becomes) for one region."""
+      act, custom = decision
+      if act == APPLY:
+          if r.kind == "conflict":
+              raise MapError("a conflict has to be resolved, not applied")
+          x = r.lit if r.kind in ("lit", "same") else r.gen
+          return x, x, x
+      if act == REVERT:
+          return r.base, r.base, r.base
+      if act == LEAVE:
+          return r.lit, r.gen, r.base
+      if act == TAKE_LIT:
+          return r.lit, r.lit, r.lit
+      if act == TAKE_GEN:
+          return r.gen, r.gen, r.gen
+      if act == BOTH:
+          both = r.lit + r.gen
+          return both, both, both
+      if act == CUSTOM:
+          return custom, custom, custom
+      raise MapError(f"unknown decision {act!r}")
+
+
+  # ================================================================ analysis of the current state
+  @dataclass
+  ```
+}
+
+#py litsync: analysis of the current state{
+  The analysis tangles the document in memory, reads the files, loads the base and runs the
+  three-way diff on every file.
+
+  ```
+  class FileState:
+      name: str
+      base: list
+      ours: list
+      gen: list
+      missing: bool
+      regions: list = field(default_factory=list)
+
+
+  class Analysis:
+      def __init__(self, source, outdir=".", store=None):
+          self.source, self.outdir = source, outdir
+          self.store = store or Store(source, outdir)
+          self.src = Source.read(source)
+          self.lit_text = self.src.text
+          self.ours = tangle_text(self.lit_text)
+          self.base = self._base()
+          self.files = {}
+          for name in sorted(self.ours):
+              path = os.path.join(outdir, name)
+              missing = not os.path.exists(path)
+              B = to_lines(self.base.get(name, ""))
+              O = to_lines(self.ours[name])
+              T = O if missing else to_lines(read_disk(path))
+              fs = FileState(name, B, O, T, missing)
+              fs.regions = diff3(B, O, T)
+              self.files[name] = fs
+
+      def _base(self):
+          if self.store.has_base():
+              return self.store.base_files()
+          try:
+              m = sourcemap.load_map(sourcemap.map_path(self.source, self.outdir))
+          except MapError:
+              raise MapError("no sync base yet: run tangle.py once (it records one)")
+          if sourcemap.sha256(self.lit_text) == m["source_sha256"]:
+              return dict(self.ours)                    # the .lit is unchanged since it was tangled
+          raise MapError("no sync base was recorded and the .lit changed since the last tangle; give the .lit "
+                         "the generated files came from: sync.py adopt --base-lit OLD.lit (or --gen-is-base "
+                         "if you never edited the generated files)")
+
+      def pending(self):
+          return {n: fs.regions for n, fs in self.files.items() if fs.regions or fs.missing}
+
+      def lit_changed(self):
+          return sha(self.lit_text) != self.store.state().get("lit_sha")
+
+
+  # ================================================================ applying decisions
+  @dataclass
+  ```
+}
+
+#py litsync: preparing and committing{
+  Preparing is a pure function from decisions to results. It builds the wanted text of each side
+  and, where the document must change, uses absorb's plan to fold the file-side changes through
+  the sourcemap. It then tangles the patched document and compares, since a shared chunk can make
+  the document yield something other than what was wanted; in that case the document wins there
+  and the difference is reported. Committing writes the results after backing up whatever it
+  replaces, and records the new base.
+
+  ```
+  class Outcome:
+      new_lit: str
+      gen_text: dict            # file -> text to write
+      base_text: dict           # file -> new base
+      regenerated: dict
+      ripple: dict              # file -> (wanted lines, lines the patched .lit really yields)
+      notes: list
+      errors: list
+      lit_changed: bool
+
+
+  def prepare(an, decisions):
+      """Compute the result of `decisions` ({(file, region index): (action, custom lines)}); writes nothing."""
+      L, G, B = {}, {}, {}
+      for name, fs in an.files.items():
+          l, g, b, pos = [], [], [], 0
+          for i, r in enumerate(fs.regions):
+              lt, gt, bt = outcome(r, decisions.get((name, i)) or default_decision(r))
+              stable = fs.base[pos:r.s]
+              l += stable + lt
+              g += stable + gt
+              b += stable + bt
+              pos = r.e
+          stable = fs.base[pos:]
+          L[name], G[name], B[name] = l + stable, g + stable, b + stable
+
+      new_lit, notes, errors = an.lit_text, [], []
+      need = [n for n, fs in an.files.items() if L[n] != fs.ours]
+      if need:
+          m, _ = sourcemap.build(an.source, src=an.src)
+          plan = Plan(m, an.src)
+          for n in need:
+              plan.absorb_file(n, an.files[n].ours, L[n])
+          errors, notes = list(plan.errors), list(plan.notes)
+          if not errors:
+              new_lit = plan.apply()
+      regenerated, ripple = (tangle_text(new_lit) if not errors else dict(an.ours)), {}
+      for n, fs in an.files.items():
+          got = to_lines(regenerated[n])
+          if not errors and got != L[n]:
+              ripple[n] = (L[n], got)
+              G[n], B[n] = got, got                     # the .lit wins in places we could not keep apart
+      return Outcome(new_lit, {n: file_body(g) for n, g in G.items()}, {n: file_body(b) for n, b in B.items()},
+                     regenerated, ripple, notes, errors, new_lit != an.lit_text)
+
+
+  def commit(an, out, note="sync"):
+      """Write an Outcome: back up what is about to change, write the .lit and files, record the new base."""
+      st = an.store
+      name = os.path.basename(an.source)
+      if out.lit_changed:
+          for n in an.src.split_back(out.new_lit):             # only the chapter files that change
+              st.log("backup", "lit", n, an.src.texts[n], note=f"before {note}")
+          an.src.write_back(out.new_lit)
+      written = []
+      for n, text in out.gen_text.items():
+          path = os.path.join(an.outdir, n)
+          cur = None if an.files[n].missing else read_disk(path)
+          if cur is not None and to_lines(cur) == to_lines(text):
+              continue
+          if cur is not None and to_lines(cur) != an.files[n].base:      # worth keeping: it was not just the old output
+              st.log("backup", "gen", n, cur, note=f"before {note}")
+          os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(text)
+          written.append(n)
+      sourcemap.write(an.source, an.outdir, base=False)
+      st.set_base(out.base_text, out.new_lit, note=note, parts=an.src.texts)
+      st.log(note, "lit", name, None, files=written)
+      return written
+  ```
+}
+
+#internal/skill/files/scripts/litsync.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py litsync: header and constants>>>
+
+
+  <<<py litsync: the store>>>
+
+
+  <<<py litsync: protecting edits from tangle>>>
+  <<<py litsync: three-way regions>>>
+
+
+  <<<py litsync: what a decision does>>>
+  <<<py litsync: analysis of the current state>>>
+  <<<py litsync: preparing and committing>>>
+  ```
+}
+
+#h2{sync.py}
+
+The command that shows, merges and cherry-picks.
+
+#py sync: header{
+  This is the interface to the library. Its docstring documents every command and the interactive
+  keys, since it is what people read before using the script.
+
+  ```
+  #!/usr/bin/env python3
+  """Reconcile a .lit with the files tangled from it, in both directions, without losing either side's edits.
+
+      python sync.py SOURCE.lit COMMAND [-o OUTDIR] ...
+
+      status [--check]               what changed on each side since the last sync (--check: exit 1 if anything)
+      diff [FILE ...]                every region: made in the .lit / made in a generated file / conflict
+      merge [--prefer lit|gen|newer] [--dry-run] [--force]
+                                     bring every non-conflicting change across, both ways; conflicts are left
+                                     pending (exit 1) unless --prefer decides them
+      pick [FILE ...] [--force] [--yes]
+                                     choose region by region, interactively (like `git add -p`, both ways)
+      log [-n N] [--path P]          the journal: edits watch.py saw, backups, syncs
+      restore PATH [--list | --sha S | --stdout]
+                                     bring back a recorded version of a generated file or of the .lit
+      adopt (--base-lit OLD.lit | --gen-is-base)
+                                     start from a project tangled before sync existed
+
+  How it works (details in litsync.py): the generated files at the last sync are the base.  The .lit side is
+  tangle(.lit), the other side is the files on disk.  A three-way merge in generated-file space sorts every
+  changed region into "only the .lit changed it", "only the file changed it", "both, identically" and
+  "conflict".  A change that crosses from the .lit regenerates the file; one that crosses from a file is folded
+  into the .lit through the sourcemap (as absorb.py does).  What you leave alone stays pending: it is still a
+  change next time.  Everything replaced is kept as a snapshot (see `log`, `restore`).
+
+  Interactive keys for a change made on one side:
+      y  apply it to the other side         n  leave it pending          r  revert it where it was made
+      e  edit the text, then apply to both  a  apply all remaining in this file     A  apply all remaining
+      d  done: leave everything else pending                 p  previous      q  quit, change nothing
+  For a conflict:
+      l  take the .lit's version   g  take the file's version   b  both (.lit's then file's)
+      e  edit   r  revert both to the base   n  leave pending   d / p / q as above
+
+  Edits you make with `e` start from the .lit's version (conflicts) or the changed text; $VISUAL / $EDITOR is used.
+  """
+  import argparse
+  import difflib
+  import os
+  import shlex
+  import subprocess
+  import sys
+  import tempfile
+  import time
+
+  import sourcemap
+  from absorb import read_disk, tangle_text, to_lines
+  from litsync import (APPLY, BOTH, CUSTOM, LEAVE, REVERT, TAKE_GEN, TAKE_LIT, Analysis, Store, commit, prepare, sha)
+  from sourcemap import MapError
+  from tangle import Source
+
+  COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+  paint = lambda s, code: f"\033[{code}m{s}\033[0m" if COLOR else s
+
+  LABEL = {"lit": "made in the .lit; the generated file does not have it",
+           "gen": "made in the generated file; the .lit does not have it",
+           "same": "the same change on both sides",
+           "conflict": "CONFLICT: both sides changed these lines differently"}
+
+
+  class Quit(Exception):
+      pass
+  ```
+}
+
+#py sync: showing what changed{
+  Display functions render a region with a little context, as a unified diff or as the two
+  competing versions of a conflict, and summarise the outcome of a set of decisions before
+  anything is written.
+
+  ```
+  # ---------------------------------------------------------------- display
+  def where(r):
+      return f"base lines {r.s + 1}-{r.e}" if r.e > r.s else f"inserted after base line {r.s}"
+
+
+  def show_region(fs, i, ctx=3):
+      r = fs.regions[i]
+      kind = {"lit": "36", "gen": "33", "same": "32", "conflict": "31;1"}[r.kind]
+      print(paint(f"\n== {fs.name}  region {i + 1}/{len(fs.regions)}  ({where(r)})  {LABEL[r.kind]}", kind))
+      for n in range(max(0, r.s - ctx), r.s):
+          print(f"   {n + 1:4d} | {fs.base[n]}")
+      if r.kind == "conflict":
+          print(paint("<<<<<<< .lit side", "36"))
+          print("\n".join(r.lit) if r.lit else paint("(nothing)", "2"))
+          print("||||||| base")
+          print("\n".join(r.base) if r.base else paint("(nothing)", "2"))
+          print(paint("======= generated file", "33"))
+          print("\n".join(r.gen) if r.gen else paint("(nothing)", "2"))
+          print(">>>>>>>")
+      else:
+          new = r.lit if r.kind in ("lit", "same") else r.gen
+          for line in r.base:
+              print(paint(f" -     | {line}", "31"))
+          for line in new:
+              print(paint(f" +     | {line}", "32"))
+      for n in range(r.e, min(len(fs.base), r.e + ctx)):
+          print(f"   {n + 1:4d} | {fs.base[n]}")
+
+
+  def lit_diff(an, new):
+      """What the .lit would look like after the change, one diff per file of the program."""
+      changed = an.src.split_back(new)
+      return "\n".join("\n".join(difflib.unified_diff(an.src.texts[n].split("\n"), t.split("\n"), f"a/{n}", f"b/{n}",
+                                                      n=1, lineterm="")) for n, t in sorted(changed.items()))
+
+
+  def describe(an, out, decisions=None):
+      if out.lit_changed:
+          print(paint("\nthe .lit would change:", "1"))
+          print(lit_diff(an, out.new_lit))
+      else:
+          print("\nthe .lit would not change")
+      rewrite = [n for n, t in out.gen_text.items()
+                 if an.files[n].missing or to_lines(read_disk(os.path.join(an.outdir, n))) != to_lines(t)]
+      print("generated files rewritten: " + (", ".join(rewrite) if rewrite else "none"))
+      left = sum(1 for k, (a, _) in (decisions or {}).items() if a == LEAVE)
+      unresolved = sum(1 for n, fs in an.files.items() for i, r in enumerate(fs.regions)
+                       if r.kind == "conflict" and (n, i) not in (decisions or {}))
+      if left or unresolved:
+          print(f"left pending: {left + unresolved} region(s)")
+      for note in out.notes:
+          print("note: " + note)
+
+
+  def report_problems(out):
+      for e in out.errors:
+          print(paint("cannot sync: " + e, "31"))
+      for n, (want, got) in out.ripple.items():
+          print(paint(f"side effect in {n}: the patched .lit regenerates it differently from what was chosen "
+                      "(a chunk used in several places)", "33"))
+          for line in list(difflib.unified_diff(want, got, "chosen", "regenerated from the .lit", n=0, lineterm=""))[:12]:
+              print("    " + line)
+  ```
+}
+
+#py sync: asking{
+  The interactive part is a loop over regions in the style of git add with the patch option, but
+  in both directions. A prompt is a single key; the editor is the one named by the environment.
+
+  ```
+  # ---------------------------------------------------------------- interactive
+  def ask(prompt, valid):
+      while True:
+          try:
+              ans = input(prompt).strip()
+          except EOFError:
+              raise Quit()
+          if ans and ans[0] in valid:
+              return ans[0]
+          print("  choose one of: " + " ".join(valid) + "   (? for help)")
+
+
+  def edit_text(lines):
+      editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+      with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+          f.write("\n".join(lines) + ("\n" if lines else ""))
+      try:
+          subprocess.call(shlex.split(editor) + [f.name])
+          return to_lines(read_disk(f.name))
+      finally:
+          os.unlink(f.name)
+
+
+  def pick(an, names, yes=False, force=False):
+      todo = [(n, i) for n in names for i in range(len(an.files[n].regions))]
+      if not todo:
+          print("nothing to choose: both sides agree.")
+          return 0
+      decisions, k, auto = {}, 0, None
+      while k < len(todo):
+          n, i = todo[k]
+          fs = an.files[n]
+          r = fs.regions[i]
+          if auto and r.kind != "conflict" and auto in ("ALL", n):
+              decisions[(n, i)] = (APPLY, None)
+              k += 1
+              continue
+          show_region(fs, i)
+          if r.kind == "conflict":
+              keys = "lgbernpdq?"
+              question = "[l]it's  [g]en's  [b]oth  [e]dit  [r]evert  [n]ext/leave  [p]rev  [d]one  [q]uit  [?] > "
+          else:
+              keys = "ynreaApdq?"
+              to = "the generated file" if r.kind == "lit" else "the .lit" if r.kind == "gen" else "both"
+              question = f"apply to {to}? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > "
+          try:
+              c = ask(question, keys)
+          except Quit:
+              print("\nquit: nothing changed.")
+              return 1
+          if c == "?":
+              print(__doc__.split("Interactive keys")[1].split("Edits you make")[0])
+              continue
+          if c == "q":
+              print("quit: nothing changed.")
+              return 1
+          if c == "p":
+              k = max(0, k - 1)
+              continue
+          if c == "d":
+              for n2, i2 in todo[k:]:
+                  decisions.setdefault((n2, i2), (LEAVE, None))
+              break
+          if c in "yn" and r.kind != "conflict":
+              decisions[(n, i)] = (APPLY, None) if c == "y" else (LEAVE, None)
+          elif c == "n":
+              decisions[(n, i)] = (LEAVE, None)
+          elif c == "r":
+              decisions[(n, i)] = (REVERT, None)
+          elif c == "l":
+              decisions[(n, i)] = (TAKE_LIT, None)
+          elif c == "g":
+              decisions[(n, i)] = (TAKE_GEN, None)
+          elif c == "b":
+              decisions[(n, i)] = (BOTH, None)
+          elif c == "e":
+              start = r.lit if r.kind in ("lit", "same", "conflict") else r.gen
+              decisions[(n, i)] = (CUSTOM, edit_text(start))
+          elif c == "a":
+              auto = n
+              decisions[(n, i)] = (APPLY, None)
+          elif c == "A":
+              auto = "ALL"
+              decisions[(n, i)] = (APPLY, None)
+          k += 1
+      out = prepare(an, decisions)
+      return finish(an, out, decisions, yes, force, interactive=True)
+  ```
+}
+
+#py sync: applying and merging{
+  Finishing a decision set shows what will happen, asks for confirmation unless told not to, and
+  commits. The merge command decides every region by the default rule, or by a preference, and
+  leaves conflicts pending when there is no preference; newer means the side whose last recorded
+  edit is later.
+
+  ```
+  # ---------------------------------------------------------------- applying
+  def finish(an, out, decisions, yes, force, interactive=False, dry=False):
+      describe(an, out, decisions)
+      report_problems(out)
+      if out.errors:
+          return 1
+      if out.ripple and not force:
+          if not interactive:
+              print("\nnothing written. Make the same edit in every copy of the chunk, or pass --force to let the "
+                    ".lit's version win.")
+              return 1
+          try:
+              if ask("\nAccept these side effects (the .lit wins)? [y/n] > ", "yn") != "y":
+                  print("nothing written.")
+                  return 1
+          except Quit:
+              print("nothing written.")
+              return 1
+      if dry:
+          print("\n(dry run: nothing written)")
+          return 0
+      if interactive and not yes:
+          try:
+              if ask("\nWrite these changes? [y/n] > ", "yn") != "y":
+                  print("nothing written.")
+                  return 1
+          except Quit:
+              print("nothing written.")
+              return 1
+      written = commit(an, out, note="sync")
+      print(f"\nsynced. .lit {'updated' if out.lit_changed else 'unchanged'}; wrote: "
+            + (", ".join(written) if written else "no generated files") + ". Previous versions are kept (see `log`).")
+      return 0
+
+
+  def newer(an, name):
+      st = an.store
+      t_lit = max([st.last_edit("lit", n) or os.path.getmtime(os.path.join(an.src.base, n)) for n in an.src.order])
+      path = os.path.join(an.outdir, name)
+      t_gen = st.last_edit("gen", name) or (os.path.getmtime(path) if os.path.exists(path) else 0)
+      return "lit" if t_lit >= t_gen else "gen"
+
+
+  def merge(an, prefer, dry, force):
+      decisions, undecided = {}, 0
+      for n, fs in an.files.items():
+          for i, r in enumerate(fs.regions):
+              if r.kind != "conflict":
+                  continue
+              side = newer(an, n) if prefer == "newer" else prefer
+              if side == "lit":
+                  decisions[(n, i)] = (TAKE_LIT, None)
+              elif side == "gen":
+                  decisions[(n, i)] = (TAKE_GEN, None)
+              else:
+                  undecided += 1
+      if not any(fs.regions for fs in an.files.values()) and not any(fs.missing for fs in an.files.values()):
+          print("nothing to merge: both sides agree.")
+          return 0
+      out = prepare(an, decisions)
+      rc = finish(an, out, decisions, yes=True, force=force, dry=dry)
+      if rc == 0 and undecided:
+          print(paint(f"{undecided} conflict(s) left pending; resolve with `pick` or `merge --prefer ...`", "33"))
+          return 1
+      return rc
+  ```
+}
+
+#py sync: status, log, restore and adopt{
+  Status is the quick overview; log prints the journal; restore brings back a recorded version of
+  any file; adopt creates a base for projects tangled before there was one.
+
+  ```
+  # ---------------------------------------------------------------- other commands
+  def status(an, check):
+      pending = 0
+      if an.lit_changed():
+          print("the .lit has changed since the last sync")
+      for n, fs in an.files.items():
+          c = {k: sum(1 for r in fs.regions if r.kind == k) for k in ("lit", "gen", "same", "conflict")}
+          if not fs.regions and not fs.missing:
+              print(f"  {n:28s} in sync")
+              continue
+          pending += len(fs.regions) + fs.missing
+          bits = [f"{c['lit']} from the .lit" if c["lit"] else "", f"{c['gen']} edited in the file" if c["gen"] else "",
+                  f"{c['same']} identical" if c["same"] else "", paint(f"{c['conflict']} CONFLICT", "31") if c["conflict"] else "",
+                  "file missing" if fs.missing else ""]
+          print(f"  {n:28s} " + ", ".join(b for b in bits if b))
+      if pending:
+          print(f"\n{pending} thing(s) to reconcile: python sync.py {an.source} merge   or   ... pick")
+      else:
+          print("\neverything is in sync.")
+      return 1 if (check and pending) else 0
+
+
+  def show_log(store, n, path):
+      evs = [e for e in store.events() if not path or e["path"] == path]
+      for e in evs[-n:]:
+          when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["t"]))
+          extra = e.get("note") or (", ".join(e["files"]) if e.get("files") else "")
+          print(f"{when}  {e['kind']:9s} {e['side']:4s} {e['path']:28s} {(e['sha'] or '-')[:8]}  {extra}")
+      if not evs:
+          print("(the journal is empty)")
+
+
+  def restore(an, path, sha_prefix, to_stdout, list_only):
+      st = an.store
+      versions = [e for e in st.events() if e["path"] == path and e.get("sha")]
+      if list_only or not sha_prefix:
+          for e in versions:
+              print(f"{time.strftime('%H:%M:%S', time.localtime(e['t']))}  {e['kind']:9s} {e['sha'][:8]}  {e.get('note') or ''}")
+          if not versions:
+              print(f"no recorded versions of {path}")
+          return 0
+      h, text = st.read_snapshot(sha_prefix)
+      if to_stdout:
+          sys.stdout.write(text)
+          return 0
+      is_lit = path in an.src.texts                      # the root or a chapter file
+      target = os.path.join(an.src.base, path) if is_lit else os.path.join(an.outdir, path)
+      if os.path.exists(target):
+          st.log("backup", "lit" if is_lit else "gen", path, read_disk(target), note="before restore")
+      os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+      with open(target, "w", encoding="utf-8", newline="") as f:
+          f.write(text)
+      st.log("restore", "lit" if is_lit else "gen", path, text, note=f"restored {h[:8]}")
+      print(f"restored {path} to {h[:8]}; it now counts as an edit, run `status` or `merge`")
+      return 0
+
+
+  def adopt(source, outdir, base_lit, gen_is_base):
+      store = Store(source, outdir)
+      cur = sourcemap.read_source(source)
+      if base_lit:
+          old = Source.read(base_lit)
+          store.set_base(tangle_text(old.text), old.text, note="adopt", parts=old.texts)
+      elif gen_is_base:
+          files = {n: (read_disk(os.path.join(outdir, n)) if os.path.exists(os.path.join(outdir, n)) else "")
+                   for n in tangle_text(cur)}
+          store.set_base(files, cur, note="adopt")
+      else:
+          raise MapError("say what the base is: --base-lit OLD.lit or --gen-is-base")
+      print("base recorded; run `status`")
+      return 0
+  ```
+}
+
+#py sync: command line{
+  The command line is a dispatcher over the commands above.
+
+  ```
+  def main():
+      common = argparse.ArgumentParser(add_help=False)
+      common.add_argument("-o", "--outdir", default=".", help="where the generated files and the .map live")
+      ap = argparse.ArgumentParser(description="Reconcile a .lit with the files tangled from it, both ways.")
+      ap.add_argument("source")
+      sub = ap.add_subparsers(dest="cmd", required=True)
+      p = sub.add_parser("status", parents=[common]); p.add_argument("--check", action="store_true")
+      p = sub.add_parser("diff", parents=[common]); p.add_argument("files", nargs="*")
+      p = sub.add_parser("merge", parents=[common]); p.add_argument("--prefer", choices=["lit", "gen", "newer"])
+      p.add_argument("--dry-run", action="store_true"); p.add_argument("--force", action="store_true")
+      p = sub.add_parser("pick", parents=[common]); p.add_argument("files", nargs="*")
+      p.add_argument("--force", action="store_true"); p.add_argument("--yes", action="store_true")
+      p = sub.add_parser("log", parents=[common]); p.add_argument("-n", type=int, default=30); p.add_argument("--path")
+      p = sub.add_parser("restore", parents=[common]); p.add_argument("path"); p.add_argument("--sha")
+      p.add_argument("--list", action="store_true"); p.add_argument("--stdout", action="store_true")
+      p = sub.add_parser("adopt", parents=[common]); p.add_argument("--base-lit"); p.add_argument("--gen-is-base", action="store_true")
+      a = ap.parse_args()
+      try:
+          if a.cmd == "adopt":
+              sys.exit(adopt(a.source, a.outdir, a.base_lit, a.gen_is_base))
+          if a.cmd == "log":
+              show_log(Store(a.source, a.outdir), a.n, a.path)
+              return
+          an = Analysis(a.source, a.outdir)
+          if a.cmd == "status":
+              sys.exit(status(an, a.check))
+          if a.cmd == "restore":
+              sys.exit(restore(an, a.path, a.sha, a.stdout, a.list))
+          names = [f for f in (a.files if a.cmd in ("diff", "pick") and a.files else an.files)
+                   if f in an.files and (an.files[f].regions)]
+          if getattr(a, "files", None):
+              bad = [f for f in a.files if f not in an.files]
+              if bad:
+                  raise MapError(f"not generated from {a.source}: {', '.join(bad)}")
+          if a.cmd == "diff":
+              for n in names:
+                  for i in range(len(an.files[n].regions)):
+                      show_region(an.files[n], i)
+              if not names:
+                  print("both sides agree.")
+          elif a.cmd == "merge":
+              sys.exit(merge(an, a.prefer, a.dry_run, a.force))
+          elif a.cmd == "pick":
+              sys.exit(pick(an, names, a.yes, a.force))
+      except MapError as e:
+          sys.exit(f"sync: {e}")
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/sync.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py sync: header>>>
+
+
+  <<<py sync: showing what changed>>>
+
+
+  <<<py sync: asking>>>
+
+
+  <<<py sync: applying and merging>>>
+
+
+  <<<py sync: status, log, restore and adopt>>>
+
+
+  <<<py sync: command line>>>
+  ```
+}
+
+#h2{watch.py}
+
+The recorder.
+
+#py watch: header and diff counting{
+  The watcher is the least clever tool and the one that makes the others safe. It records, never
+  changes. Its docstring explains why recording is useful even if you never intend to look at it.
+
+  ```
+  #!/usr/bin/env python3
+  """Record every change to a .lit and to the files generated from it.  It never modifies any of them.
+
+      python watch.py SOURCE.lit [-o OUTDIR] [--interval 0.5] [--settle 0.4] [--once] [--for SECONDS] [--quiet]
+
+  Leave it running in a terminal while you work.  Each time the .lit or a generated file changes (and has
+  stopped changing for --settle seconds, so half-saved files are not recorded) it saves the new version in
+  OUTDIR/SOURCE.sync/snapshots, appends an event to the journal, and prints one line, followed by a summary of
+  what is now waiting to be reconciled.  Nothing is written to your files and nothing is synced; you decide
+  when to run `sync.py merge` or `sync.py pick`.
+
+  Why record at all?  Because the order of tools no longer matters, and nothing is lost:
+    * if tangle.py or sync.py later replaces an edited file, the edit is still there:
+          python sync.py SOURCE.lit restore FILE --list
+    * the journal gives each side's last-edit time, which `sync.py merge --prefer newer` uses for conflicts
+    * `sync.py SOURCE.lit log` shows what happened, in order
+
+  Each event is classified:  edit    a person changed it
+                             tangled a generated file now equals what the .lit produces
+                             synced  the .lit is the version recorded at the last sync / tangle
+  --once records whatever changed since the watcher last ran (also while it was not running) and exits.
+  Polling is used so that nothing needs installing; the cost is a stat() per file every interval.
+  """
+  import argparse
+  import difflib
+  import os
+  import sys
+  import time
+
+  import sourcemap
+  from absorb import read_disk, tangle_text
+  from litsync import Analysis, Store, sha
+  from sourcemap import MapError
+
+  COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+  paint = lambda s, code: f"\033[{code}m{s}\033[0m" if COLOR else s
+  KIND_COLOR = {"edit": "33", "tangled": "32", "synced": "32", "deleted": "31"}
+
+
+  def delta(old, new):
+      a, b = old.split("\n"), new.split("\n")
+      plus = minus = 0
+      for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+          if tag in ("replace", "delete"):
+              minus += i2 - i1
+          if tag in ("replace", "insert"):
+              plus += j2 - j1
+      return plus, minus
+  ```
+}
+
+#py watch: what is watched and the saved state{
+  The set of watched files comes from the sourcemap, plus the document. Polling needs no
+  dependency and costs a stat call per file per interval.
+
+  ```
+  class Watcher:
+      def __init__(self, source, outdir, quiet=False, settle=0.4):
+          self.source, self.outdir, self.quiet, self.settle = source, outdir, quiet, settle
+          self.store = Store(source, outdir)
+          os.makedirs(self.store.dir, exist_ok=True)
+          self.stat, self.dirty, self._ours = {}, {}, (None, None)
+          self.seen_path = self.store.p("watch.json")
+          self.seen = self._load_seen()
+          self.lit_name = os.path.basename(source)
+
+      # ---- what is watched
+      def targets(self):
+          m = sourcemap.load_map(sourcemap.map_path(self.source, self.outdir))
+          base = os.path.dirname(self.source)                  # the root file and every chapter it includes
+          lits = [("lit", n, os.path.join(base, n)) for n in m.get("sources") or [self.lit_name]]
+          return lits + [("gen", n, os.path.join(self.outdir, n)) for n in m["files"]]
+
+      def _load_seen(self):
+          import json
+          try:
+              with open(self.seen_path, encoding="utf-8") as f:
+                  return json.load(f)
+          except (FileNotFoundError, ValueError):
+              return {}
+
+      def _save_seen(self):
+          import json
+          with open(self.seen_path, "w", encoding="utf-8") as f:
+              json.dump(self.seen, f)
+  ```
+}
+
+#py watch: classifying a change{
+  A change to a generated file is a tangle if the file now equals what the document produces, and
+  an edit otherwise. A change to the document is a sync if it is the version recorded at the last
+  sync. A document that does not parse yet is simply an edit.
+
+  ```
+      # ---- classification
+      def ours(self):
+          try:
+              text = sourcemap.read_source(self.source)
+          except (OSError, MapError):
+              return None
+          if self._ours[0] != sha(text):
+              try:
+                  self._ours = (sha(text), tangle_text(text))
+              except (SystemExit, MapError, Exception):          # the .lit is mid-edit and does not parse
+                  self._ours = (sha(text), None)
+          return self._ours[1]
+
+      def classify(self, side, name, text):
+          if text is None:
+              return "deleted"
+          if side == "lit":
+              st = self.store.state()
+              return "synced" if sha(text) == st.get("lit_files", {}).get(name, st.get("lit_sha")) else "edit"
+          ours = self.ours()
+          return "tangled" if ours is not None and ours.get(name) == text else "edit"
+
+      def vs_base(self, side, name, text):
+          if text is None:
+              return ""
+          base = self.store.base_lit(name) if side == "lit" else None
+          if side == "gen":
+              try:
+                  base = read_disk(self.store.p("base", name))
+              except FileNotFoundError:
+                  base = None
+          if base is None:
+              return ""
+          p, m = delta(base, text)
+          return f"+{p} -{m} vs base" if (p or m) else "same as base"
+  ```
+}
+
+#py watch: recording and summarising{
+  Recording saves the new version and appends an event; the summary asks the analysis what is now
+  waiting, so that each line the watcher prints ends with the state of things.
+
+  ```
+      # ---- recording
+      def say(self, line):
+          if not self.quiet:
+              print(line, flush=True)
+
+      def record(self, side, name, path):
+          key = f"{side}:{name}"
+          text = read_disk(path) if os.path.exists(path) else None
+          h = sha(text) if text is not None else "deleted"
+          if self.seen.get(key) == h:
+              return False
+          prev = self.seen.get(key)
+          kind = self.classify(side, name, text)
+          ev = self.store.log(kind, side, name, text, prev=prev if prev and prev != "deleted" else None)
+          self.seen[key] = h
+          self._save_seen()
+          when = time.strftime("%H:%M:%S", time.localtime(ev["t"]))
+          snap = f"[snapshot {ev['sha'][:8]}]" if ev["sha"] else ""
+          self.say(f"{when}  {side:3s}  {name:28s} {paint(f'{kind:8s}', KIND_COLOR.get(kind, '0'))} "
+                   f"{self.vs_base(side, name, text):18s} {snap}")
+          return True
+
+      def summary(self):
+          try:
+              an = Analysis(self.source, self.outdir, self.store)
+          except (MapError, SystemExit) as e:
+              self.say(f"          (cannot compare the two sides right now: {e})")
+              return
+          n_lit = sum(1 for fs in an.files.values() for r in fs.regions if r.kind == "lit")
+          n_gen = sum(1 for fs in an.files.values() for r in fs.regions if r.kind == "gen")
+          n_con = sum(1 for fs in an.files.values() for r in fs.regions if r.kind == "conflict")
+          if not (n_lit or n_gen or n_con):
+              self.say("          both sides agree")
+              return
+          bits = [f"{n_lit} change(s) from the .lit" if n_lit else "", f"{n_gen} edit(s) in generated files" if n_gen else "",
+                  paint(f"{n_con} CONFLICT(s)", "31") if n_con else ""]
+          self.say("          waiting: " + ", ".join(b for b in bits if b) + f"   ->  python sync.py {self.source} status")
+  ```
+}
+
+#py watch: the loop{
+  A file that is still changing is not recorded until it has been quiet for the settle time, so a
+  half-saved file is never taken for an edit.
+
+  ```
+      # ---- the loop
+      def start(self):
+          changed = False
+          for side, name, path in self.targets():
+              key = f"{side}:{name}"
+              if key not in self.seen:                                    # first sight: a baseline, not an event
+                  self.seen[key] = sha(read_disk(path)) if os.path.exists(path) else "deleted"
+              elif self.record(side, name, path):                         # changed while we were not watching
+                  changed = True
+              self.stat[key] = self._stat(path)
+          self._save_seen()
+          self.store.log("watch", "lit", self.lit_name, note="started")
+          if changed:
+              self.summary()
+
+      @staticmethod
+      def _stat(path):
+          try:
+              st = os.stat(path)
+              return (st.st_mtime_ns, st.st_size)
+          except FileNotFoundError:
+              return None
+
+      def scan(self, now):
+          recorded = False
+          for side, name, path in self.targets():
+              key = f"{side}:{name}"
+              cur = self._stat(path)
+              if cur != self.stat.get(key):
+                  self.stat[key] = cur
+                  self.dirty[key] = now                                   # still changing: wait for it to settle
+              elif key in self.dirty and now - self.dirty[key] >= self.settle:
+                  del self.dirty[key]
+                  recorded |= self.record(side, name, path)
+          if recorded:
+              self.summary()
+
+      def flush(self):
+          for side, name, path in self.targets():
+              self.dirty.pop(f"{side}:{name}", None)
+              self.record(side, name, path)
+  ```
+}
+
+#py watch: command line{
+  The options set the interval and the settle time, and the once mode records what changed while
+  nothing was watching and exits.
+
+  ```
+  def main():
+      ap = argparse.ArgumentParser(description="Record changes to a .lit and its generated files (read-only).")
+      ap.add_argument("source")
+      ap.add_argument("-o", "--outdir", default=".")
+      ap.add_argument("--interval", type=float, default=0.5)
+      ap.add_argument("--settle", type=float, default=0.4)
+      ap.add_argument("--once", action="store_true")
+      ap.add_argument("--for", dest="duration", type=float, help="stop after this many seconds (useful in scripts)")
+      ap.add_argument("--quiet", action="store_true")
+      a = ap.parse_args()
+      try:
+          w = Watcher(a.source, a.outdir, a.quiet, a.settle)
+          w.start()
+          if a.once:
+              w.flush()
+              w.summary()
+              return
+          w.say(f"watching {a.source} and its generated files in {a.outdir} (Ctrl-C to stop); nothing is modified")
+          end = time.time() + a.duration if a.duration else None
+          while end is None or time.time() < end:
+              w.scan(time.time())
+              time.sleep(a.interval)
+          w.flush()
+      except MapError as e:
+          sys.exit(f"watch: {e}")
+      except KeyboardInterrupt:
+          w.flush()
+          print(f"\nstopped; {len(w.store.events())} events are in {w.store.dir}/journal.jsonl")
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/watch.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py watch: header and diff counting>>>
+
+
+  <<<py watch: what is watched and the saved state>>>
+
+  <<<py watch: classifying a change>>>
+
+  <<<py watch: recording and summarising>>>
+
+  <<<py watch: the loop>>>
+
+
+  <<<py watch: command line>>>
+  ```
+}
+
+#h2{weave.py}
+
+Rendering to HTML and LaTeX.
+
+#py weave: header and constants{
+  Weaving reads the same tree as tangle, through tangle's own loader, so the two can never
+  disagree about the notation. Citations and inline code are replaced by private-use characters
+  while text is processed, which keeps their contents from being altered by quoting or escaping.
+
+  ```
+  #!/usr/bin/env python3
+  """Weave a brashtag literate source into interlinked HTML (MathJax) and LaTeX.
+
+      python weave.py llm-rig.lit [-o outdir] [--only html|tex] [--mathjax URL] [--highlight]
+
+  Writes <outdir>/<name>.html and <outdir>/<name>.tex. No PDF is produced here: compile the
+  LaTeX yourself, e.g.   xelatex llm-rig.tex   (twice; pdflatex cannot read all of Unicode).
+
+  Needs the brashtag parser (pip install git+https://github.com/PratikDeoghare/brashtag.git)
+  and tangle.py next to this file, which defines how the notation is read.
+  Optional: pygments, with --highlight (syntax colours in HTML and LaTeX). Without it code is written as plain
+  text, so the .html and .tex stay readable as source.
+
+  What the woven document contains
+    * prose, headings (#h1{} .. #h6{}), a table of contents, and the code in document order
+    * every chunk numbered (§n); every <<<reference>>> inside code links to the chunk it
+      expands, and every chunk lists where it is used and which files it ends up in
+    * #cite{key} (or #cite{a,b}) as numbered, linked citations, and a bibliography built from
+      #bibliography{...} whose entries link back to the chunks that cite them
+    * a chunk index
+    * figures: #img{`diagram.svg` A caption.} is a figure. The path names a file chunk of the program
+      (so the picture can be part of the literate source) or a file next to the root .lit.  HTML inlines
+      SVG and embeds other images; LaTeX gets a PDF (SVG is converted with rsvg-convert or inkscape if
+      one is installed; PNG and JPEG are copied beside the .tex)
+    * math: an inline code span of the form `$...$` is LaTeX math; a paragraph consisting of
+      nothing but one such span is display math.  HTML: typeset by MathJax (loaded from a CDN,
+      or from --mathjax).  LaTeX: passed through unchanged.
+
+  LaTeX needs: amsmath amssymb xcolor fancyvrb hyperref longtable iftex (all standard);
+  fvextra is used for line breaking if installed.  Use xelatex or lualatex (pdflatex cannot read all of Unicode).
+  """
+  import argparse
+  import base64
+  import html
+  import mimetypes
+  import os
+  import re
+  import shutil
+  import subprocess
+  import sys
+  import tempfile
+  import unicodedata
+
+  from tangle import REF, FILE, HEADINGS, HINT, Bag, Blob, Code, Source, collect, expand, fence_text, is_fence, unescape
+
+  MATHJAX = "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js"
+
+  # Inline pieces are swapped for private-use placeholders while prose is split into
+  # paragraphs and lists, then substituted back as HTML or LaTeX.
+  CITE_RUN = re.compile("\ue002[^\ue003]*\ue003(?:\\s+\ue002[^\ue003]*\ue003)*")
+  CITE_ONE = re.compile("\ue002([^\ue003]*)\ue003")
+  CODE_PH = re.compile("\ue000(\\d+)\ue001")
+  QUOTES = re.compile(r'"([^"]*)"')
+  esc = lambda s: html.escape(s, quote=False)
+
+
+  # ============================================================ document tree
+  ```
+}
+
+#py weave: the chunk tree{
+  The tree is rebuilt as a list of items, each a heading, a piece of prose or a chunk, and chunks
+  carry their children. Plain text is extracted from the tree by a handful of small functions, and
+  a math span is recognised by the dollar signs inside an inline code span.
+
+  ```
+  class Chunk:
+      def __init__(self, name, parent):
+          self.name, self.parent, self.items = name, parent, []
+          self.num = self.id = None
+          self.refs = []          # chunk names referenced from this chunk's code
+
+
+  def plain(kids):
+      return "".join(k.text for k in kids if isinstance(k, (Blob, Code))).strip()
+
+
+  def run_text(kids):
+      """Inline kids -> (text with placeholders, table of Code spans)."""
+      text, table = [], []
+      for k in kids:
+          if isinstance(k, Blob):
+              text.append(k.text)
+          elif isinstance(k, Code):
+              table.append(k)
+              text.append(f"\ue000{len(table) - 1}\ue001")
+          elif isinstance(k, Bag):                       # #cite{...}
+              text.append(f"\ue002{plain(k.kids)}\ue003")
+      return "".join(text), table
+
+
+  def math_of(code):
+      mm = re.fullmatch(r"\s*\$(.+)\$\s*", code.text, re.S)
+      return mm.group(1).strip() if mm else None
+
+
+  def build(bag, parent):
+      """Brashtag tree -> Chunk tree.
+      Items: ("prose", kids) | ("code", lines) | ("head", level, kids) | ("chunk", Chunk) | ("bib", Bag)."""
+      c = Chunk(None if parent is None else bag.tag.strip(), parent)
+      run = []
+
+      def flush():
+          if run:
+              c.items.append(("prose", list(run)))
+              run.clear()
+
+      for k in bag.kids:
+          if isinstance(k, Code) and is_fence(k):
+              flush()
+              c.items.append(("code", fence_text(k)))
+          elif isinstance(k, Bag):
+              tag = k.tag.strip()
+              if tag == "cite":
+                  run.append(k)                           # inline
+              elif tag == "img":
+                  flush()
+                  c.items.append(("img", k))
+              elif tag == HINT:
+                  flush()
+                  c.items.append(("hint", " ".join(plain(k.kids).split())))
+              elif tag in HEADINGS:
+                  flush()
+                  c.items.append(("head", int(tag[1]), k.kids))
+              elif tag == "bibliography":
+                  flush()
+                  c.items.append(("bib", k))
+              else:
+                  flush()
+                  c.items.append(("chunk", build(k, c)))
+          else:
+              run.append(k)                               # Blob or inline Code
+      flush()
+      return c
+
+
+  def img_parts(bag):
+      """#img{`path` caption} (or #img{path caption}) -> (path, caption)."""
+      code = next((k for k in bag.kids if isinstance(k, Code)), None)
+      rest = " ".join("".join(k.text for k in bag.kids if isinstance(k, Blob)).split())
+      if code is not None:
+          return code.text.strip(), rest
+      path, _, cap = rest.partition(" ")
+      return path, cap.strip()
+
+
+  def walk(chunk):
+      """Depth-first, document order: yields (chunk, item)."""
+      for it in chunk.items:
+          yield chunk, it
+          if it[0] == "chunk":
+              yield from walk(it[1])
+
+
+  def slug(s):
+      return re.sub(r"[^A-Za-z0-9]+", "-", s).strip("-") or "x"
+
+
+  # ============================================================ bibtex
+  ```
+}
+
+#py weave: bibliography parsing{
+  The bibliography is BibTeX written inside code, parsed here with a small reader that handles
+  braces and quotes, converts LaTeX accents, and formats an author list and a full stop in one
+  house style. Nothing here tries to be a general BibTeX engine.
+
+  ```
+  ACCENTS = {"'": "\u0301", "`": "\u0300", '"': "\u0308", "^": "\u0302", "~": "\u0303"}
+
+
+  def tex_text(s):
+      s = re.sub(r"\\([\'`\"^~])\{?(\w)\}?", lambda m: unicodedata.normalize("NFC", m.group(2) + ACCENTS[m.group(1)]), s)
+      s = s.replace("--", "\u2013").replace(r"\&", "&")
+      return re.sub(r"[{}]", "", s).strip()
+
+
+  def parse_bibtex(src):
+      m = re.match(r"\s*@(\w+)\s*\{\s*([^,]+),", src)
+      pos, fields = (m.end() if m else 0), {}
+      while True:
+          fm = re.compile(r"\s*(\w+)\s*=\s*").search(src, pos)
+          if not fm:
+              break
+          p = fm.end()
+          if p < len(src) and src[p] == "{":
+              depth, j = 0, p
+              while j < len(src):
+                  depth += (src[j] == "{") - (src[j] == "}")
+                  if depth == 0:
+                      break
+                  j += 1
+              val, pos = src[p + 1:j], j + 1
+          else:
+              nm = re.match(r"[^,}\s]+", src[p:])
+              val = nm.group(0) if nm else ""
+              pos = p + len(val)
+          fields[fm.group(1).lower()] = val
+      return fields
+
+
+  def bib_parts(f):
+      names = [n.strip() for n in re.split(r"\s+and\s+", tex_text(f.get("author", "")))]
+      if names and names[-1] == "others":
+          authors = ", ".join(names[:-1]) + " et al."
+      elif len(names) > 1:
+          authors = ", ".join(names[:-1]) + " and " + names[-1]
+      else:
+          authors = names[0] if names and names[0] else ""
+      venue = re.sub(r"\s*arXiv:\S+", "", f.get("journal") or f.get("booktitle") or f.get("institution")
+                     or f.get("publisher") or "")
+      hp = f.get("howpublished", "")
+      um = re.search(r"\\url\{([^}]+)\}", hp)
+      am = re.search(r"arXiv:([\w./-]+)", f.get("note", "") + " " + f.get("journal", ""))
+      return dict(authors=authors, title=tex_text(f.get("title", "")), venue=tex_text(venue),
+                  vol=f.get("volume", "") + (f"({f['number']})" if f.get("number") else ""),
+                  pages=tex_text(f.get("pages", "")), year=f.get("year", ""),
+                  url=um.group(1) if um else "", hp="" if um else tex_text(hp), arxiv=am.group(1) if am else "")
+
+
+  def _stop(s):                       # add a full stop unless the text already ends in punctuation
+      return s if s[-1:] in ".?!" else s + "."
+
+
+  # ============================================================ analysis (shared by both backends)
+  ```
+}
+
+#py weave: the document model{
+  A document is analysed once and both weavers use the result. The analysis numbers the chunks in
+  the order of the text, finds where each is used, which files it ends up in, and which chunks
+  cite each reference.
+
+  ```
+  class Doc:
+      def __init__(self, root_bag, src_name, base="."):
+          self.src_name, self.base, self.bag, self._files = src_name, base or ".", root_bag, None
+          self.root = build(root_bag, None)
+          self.defs, self.uses, self.partof, self.lang = {}, {}, {}, {}
+          self.bibsrc, self.cite_no, self.cited_in, self.heads = {}, {}, {}, []
+          self.used_ids, self.head_id, self.head_title = set(), {}, {}
+          self._analyse()
+          self.title = next((t for lvl, t, _ in self.heads if lvl == 1), os.path.splitext(src_name)[0])
+
+      def image(self, path):
+          """('text', content) for a file chunk, ('file', path) for a file on disk, or None."""
+          if self._files is None:
+              import contextlib, io
+              with contextlib.redirect_stderr(io.StringIO()):
+                  chunks = collect(self.bag)
+              self._files = {n: "\n".join(expand(n, chunks)) + "\n" for n in chunks if FILE.search(n)}
+          if path in self._files:
+              return "text", self._files[path]
+          full = os.path.join(self.base, path)
+          return ("file", full) if os.path.isfile(full) else None
+
+      def unique_id(self, base):
+          i, cand = 1, base
+          while cand in self.used_ids:
+              i += 1
+              cand = f"{base}-{i}"
+          self.used_ids.add(cand)
+          return cand
+
+      @staticmethod
+      def cite_keys(text):
+          return [k.strip() for g in CITE_ONE.findall(text) for k in g.split(",") if k.strip()]
+  ```
+}
+
+#py weave: analysing the tree{
+  The walk assigns unique identifiers to headings and chunks, numbers chunks, collects uses from
+  the reference lines and citations from the prose, and resolves each bibliography entry.
+
+  ```
+      def _analyse(self):
+          n = 0
+          for chunk, it in walk(self.root):
+              if it[0] == "head":
+                  title = run_text(it[2])[0].strip()
+                  hid = self.unique_id("h-" + slug(title))
+                  self.heads.append((it[1], title, hid))
+                  self.head_id[id(it)], self.head_title[hid] = hid, title
+              elif it[0] == "chunk":
+                  n += 1
+                  c = it[1]
+                  c.num, c.id = n, self.unique_id("c-" + slug(c.name))
+                  self.defs.setdefault(c.name, []).append(c)
+              elif it[0] == "bib":
+                  for k in it[1].kids:
+                      if isinstance(k, Bag):
+                          self.bibsrc[k.tag.strip()] = "\n".join(
+                              ln for kk in k.kids if isinstance(kk, Code) and is_fence(kk) for ln in fence_text(kk))
+          cur_head = None                                     # references, uses, citations
+          for chunk, it in walk(self.root):
+              if it[0] == "head":
+                  hid = self.head_id[id(it)]
+                  cur_head = (self.head_title[hid], hid)
+              elif it[0] == "code":
+                  for ln in it[1]:
+                      m = REF.match(ln)
+                      if m:
+                          name = m.group(2).strip()
+                          chunk.refs.append(name)
+                          lst = self.uses.setdefault(name, [])
+                          if chunk not in lst:
+                              lst.append(chunk)
+              elif it[0] == "prose":
+                  for key in self.cite_keys(run_text(it[1])[0]):
+                      if key not in self.cite_no:
+                          self.cite_no[key] = len(self.cite_no) + 1
+                      if chunk.name:
+                          where = (chunk.name, chunk.id)
+                      elif cur_head:
+                          where = ("introduction" if cur_head[1] == self.heads[0][2] else cur_head[0], cur_head[1])
+                      else:
+                          where = None
+                      if where and where not in self.cited_in.setdefault(key, []):
+                          self.cited_in[key].append(where)
+          for chunk, it in walk(self.root):
+              if it[0] == "img" and self.image(img_parts(it[1])[0]) is None:
+                  print(f"warning: #img{{{img_parts(it[1])[0]}}}: no such file chunk or file", file=sys.stderr)
+          for name in self.uses:
+              if name not in self.defs:
+                  print(f"warning: <<<{name}>>> is referenced but never defined", file=sys.stderr)
+          for f in [n for n in self.defs if FILE.search(n)]:  # which files each chunk ends up in
+              seen, queue = {f}, [f]
+              self.lang.setdefault(f, os.path.splitext(f)[1])
+              while queue:
+                  cur = queue.pop(0)
+                  for c in self.defs.get(cur, []):
+                      for r in c.refs:
+                          if r in self.defs and r not in seen:
+                              seen.add(r)
+                              queue.append(r)
+                              self.partof.setdefault(r, []).append(f)
+                              self.lang.setdefault(r, os.path.splitext(f)[1])
+          for key in self.cite_no:
+              if key not in self.bibsrc:
+                  print(f"warning: #cite{{{key}}} has no bibliography entry", file=sys.stderr)
+  ```
+}
+
+#py weave: grouping prose{
+  Prose is grouped into paragraphs, and a paragraph that consists of one math span is promoted to
+  display math.
+
+  ```
+      def blocks(self, kids):
+          """Prose run -> ([("p", text) | ("ul", [text]) | ("math", tex)], table); text has placeholders."""
+          text, table = run_text(kids)
+          paras, cur = [], []
+          for ln in text.split("\n") + [""]:
+              if ln.strip():
+                  cur.append(ln.strip())
+              elif cur:
+                  paras.append(cur)
+                  cur = []
+          out = []
+          for p in paras:
+              if p[0].startswith("- "):
+                  items = []
+                  for ln in p:
+                      if ln.startswith("- "):
+                          items.append(ln[2:])
+                      else:
+                          items[-1] += " " + ln
+                  out.append(("ul", items))
+                  continue
+              t = " ".join(p)
+              m = CODE_PH.fullmatch(t)
+              tex = math_of(table[int(m.group(1))]) if m else None
+              out.append(("math", tex) if tex is not None else ("p", t))
+          return out, table
+
+      def users(self, c):
+          return [u for u in self.uses.get(c.name, []) if u is not c]
+  ```
+}
+
+#py weave: syntax highlighting{
+  Highlighting is off by default and asked for with `--highlight`. The markup a highlighter adds
+  (a macro around every token in LaTeX, a span around every token in HTML) buries the code, and
+  people read and diff the `.tex` and `.html` as text, so the default output keeps code as plain
+  text and lets the page style and the LaTeX environment do the work. With the flag and pygments
+  installed, the lexer is chosen from the extension of the file the chunk ends up in; without
+  pygments the flag only prints a note.
+
+  ```
+  HIGHLIGHT = False        # --highlight: colour code with pygments; the markup it adds makes .tex and .html hard to read
+
+
+  def pygments_tools():
+      if not HIGHLIGHT:
+          return None
+      try:
+          from pygments import highlight
+          from pygments.formatters import HtmlFormatter, LatexFormatter
+          from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
+      except ImportError:
+          print("note: pygments not found; code is not syntax-highlighted", file=sys.stderr)
+          return None
+
+      def lexer(ext):
+          try:
+              if ext in (".md", ".txt", ""):
+                  return get_lexer_by_name("text", stripnl=False, ensurenl=False)
+              return get_lexer_for_filename("x" + ext, stripnl=False, ensurenl=False)
+          except Exception:
+              return get_lexer_by_name("text", stripnl=False, ensurenl=False)
+
+      return dict(highlight=highlight, Html=HtmlFormatter, Latex=LatexFormatter, lexer=lexer)
+
+
+  # ============================================================ HTML backend (MathJax)
+  ```
+}
+
+#py weave: HTML, inline text{
+  The HTML weaver turns the tree into a page with a table of contents, a sidebar, numbered and
+  cross-linked chunks, and MathJax for the math. Inline text is built from the kids of a bag, with
+  citations and code spans substituted through placeholders.
+
+  ```
+  class HtmlWeaver:
+      def __init__(self, doc, mathjax):
+          self.d, self.mathjax, self.P = doc, mathjax, pygments_tools()
+
+      # ---- inline
+      def cite_html(self, m):
+          d = self.d
+          keys = d.cite_keys(m.group(0))
+          links = [f'<a href="#bib-{k}">{d.cite_no[k]}</a>' if k in d.bibsrc else f"?{esc(k)}" for k in keys]
+          return '<span class="cite">[' + ", ".join(links) + "]</span>"
+
+      @staticmethod
+      def math_html(tex, display=False):
+          body = esc(tex)
+          return f'<div class="display">\\[{body}\\]</div>' if display else f'<span class="math">\\({body}\\)</span>'
+
+      def code_span(self, k):
+          tex = math_of(k)
+          return self.math_html(tex) if tex is not None else f"<code>{esc(k.text)}</code>"
+
+      def fill(self, s, table):
+          s = QUOTES.sub("\u201c\\1\u201d", esc(s))
+          s = CITE_RUN.sub(self.cite_html, s)
+          return CODE_PH.sub(lambda m: self.code_span(table[int(m.group(1))]), s)
+
+      def inline(self, kids):
+          text, table = run_text(kids)
+          return self.fill(text.strip(), table)
+
+      def prose(self, kids):
+          blocks, table = self.d.blocks(kids)
+          out = []
+          for kind, val in blocks:
+              if kind == "ul":
+                  out.append("<ul>" + "".join(f"<li>{self.fill(i, table)}</li>" for i in val) + "</ul>")
+              elif kind == "math":
+                  out.append(self.math_html(val, display=True))
+              else:
+                  out.append(f"<p>{self.fill(val, table)}</p>")
+          return "\n".join(out)
+
+      # ---- code
+      def highlight(self, code, ext):
+          if not self.P or not code:
+              return esc(code)
+          return self.P["highlight"](code, self.P["lexer"](ext), self.P["Html"](nowrap=True))
+
+      def ref_link(self, name, indent):
+          d = self.d
+          if name not in d.defs:
+              return f'{esc(indent)}<span class="ref bad">\u00ab{esc(name)}\u00bb</span>'
+          c = d.defs[name][0]
+          return (f'{esc(indent)}<a class="ref pg" href="#{c.id}">\u00ab{esc(name)}\u00bb'
+                  f'<span class="rn">\u00a7{c.num}</span></a>')
+  ```
+}
+
+#py weave: HTML, code and chunks{
+  Code is highlighted line by line, and each reference line becomes a link to the chunk it
+  expands, with its section number beside it. A chunk shows its number, its name, where it is used
+  and which files it belongs to. A hint is shown as a note, "to be filled in by an agent", with
+  the author's words.
+
+  ```
+      def code(self, lines, chunk):
+          ext, segs, buf = self.d.lang.get(chunk.name, ""), [], []
+          for ln in lines:
+              m = REF.match(ln)
+              if m:
+                  if buf:
+                      segs.append(self.highlight("\n".join(buf), ext))
+                      buf = []
+                  segs.append(self.ref_link(m.group(2).strip(), m.group(1)))
+              else:
+                  buf.append(unescape(ln))
+          if buf:
+              segs.append(self.highlight("\n".join(buf), ext))
+          return '<pre class="code">' + "\n".join(segs) + "</pre>"
+
+      # ---- structure
+      @staticmethod
+      def label(name):
+          return esc(name) if FILE.search(name) else f"\u00ab{esc(name)}\u00bb"
+
+      def chunk_link(self, c):
+          return f'<a class="pg" href="#{c.id}">{self.label(c.name)} \u00a7{c.num}</a>'
+
+      def meta(self, c):
+          d, bits = self.d, []
+          users = d.users(c)
+          if users:
+              bits.append("used in " + ", ".join(self.chunk_link(u) for u in users))
+          if not FILE.search(c.name) and d.partof.get(c.name):
+              bits.append("part of " + ", ".join(f'<a href="#{d.defs[f][0].id}">{esc(f)}</a>' for f in d.partof[c.name]))
+          sep = " \u00b7 ".join(bits)
+          return f'<div class="meta">{sep}</div>' if bits else ""
+
+      def chunk(self, c, depth):
+          isfile = bool(FILE.search(c.name))
+          title = (f'<span class="badge">file</span> <span class="fname">{esc(c.name)}</span>' if isfile
+                   else f'<span class="cname">\u00ab{esc(c.name)}\u00bb</span> <span class="eq">\u2261</span>')
+          h = [f'<section class="chunk{" nested" if depth else ""}" id="{c.id}">',
+               f'<div class="chunk-head"><a class="num" href="#{c.id}">\u00a7{c.num}</a> {title}</div>', self.meta(c)]
+          for it in c.items:
+              if it[0] == "prose":
+                  h.append(self.prose(it[1]))
+              elif it[0] == "code":
+                  h.append(self.code(it[1], c))
+              elif it[0] == "chunk":
+                  h.append(self.chunk(it[1], depth + 1))
+              elif it[0] == "head":
+                  h.append(self.heading(it))
+              elif it[0] == "img":
+                  h.append(self.figure(it))
+              elif it[0] == "hint":
+                  h.append(self.hint(it))
+          h.append("</section>")
+          return "\n".join(x for x in h if x)
+
+      def heading(self, it):
+          return f'<h{it[1]} id="{self.d.head_id[id(it)]}">{self.inline(it[2])}</h{it[1]}>'
+
+      def hint(self, it):
+          return '<p class="hint"><b>to be filled in by an agent:</b> ' + esc(it[1]) + "</p>"
+  ```
+}
+
+#py weave: HTML, figures{
+  A figure is `#img{` followed by a path in code and a caption in text, and ends with a brace. The
+  path is looked up first among the file chunks of the document, so a diagram can be part of the
+  literate source and be tangled like code, and then as a file next to the root. SVG is put into
+  the page itself, so it takes the colours of the text around it and needs no second file; other
+  images are embedded as data, so the page stays one file. A figure that cannot be found is a
+  warning when the document is analysed and a visible note in the page.
+
+  ```
+      def figure(self, it):
+          path, cap = img_parts(it[1])
+          found = self.d.image(path)
+          if found is None:
+              return f'<p class="bad">missing figure {esc(path)}</p>'
+          kind, val = found
+          ext = os.path.splitext(path)[1].lower()
+          if ext == ".svg":
+              svg = val if kind == "text" else open(val, encoding="utf-8").read()
+              svg = re.sub(r"<\?xml.*?\?>|<!DOCTYPE.*?>", "", svg, flags=re.S).strip()
+              body = svg.replace("<svg", f'<svg role="img" aria-label="{html.escape(cap or path)}"', 1)
+          else:
+              data = val.encode() if kind == "text" else open(val, "rb").read()
+              mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+              body = f'<img alt="{html.escape(cap or path)}" src="data:{mime};base64,{base64.b64encode(data).decode()}">'
+          return f'<figure class="fig">{body}' + (f"<figcaption>{esc(cap)}</figcaption>" if cap else "") + "</figure>"
+  ```
+}
+
+#py weave: HTML, back matter{
+  The bibliography links each entry back to the chunks that cite it, the index lists every chunk
+  with the places that use it, and render assembles the page.
+
+  ```
+      def bibliography(self):
+          d, rows = self.d, []
+          for key in sorted(d.cite_no, key=d.cite_no.get):
+              if key not in d.bibsrc:
+                  continue
+              p = bib_parts(parse_bibtex(d.bibsrc[key]))
+              parts = [_stop(esc(p["authors"])) if p["authors"] else "", f"\u201c{_stop(esc(p['title']))}\u201d"]
+              tail = ", ".join(x for x in [f"<i>{esc(p['venue'])}</i>" if p["venue"].strip() else "",
+                                           esc(p["vol"]), esc(p["pages"]), esc(p["year"])] if x)
+              parts.append(tail + "." if tail else "")
+              if p["url"]:
+                  parts.append(f'<a href="{p["url"]}">{esc(p["url"])}</a>')
+              elif p["hp"]:
+                  parts.append(_stop(esc(p["hp"])))
+              if p["arxiv"]:
+                  parts.append(f'<a href="https://arxiv.org/abs/{p["arxiv"]}">arXiv:{p["arxiv"]}</a>')
+              back = ", ".join(f'<a class="pg" href="#{i}">{self.label(n)}</a>' if i.startswith("c-") else
+                               f'<a href="#{i}">{esc(n)}</a>' for n, i in d.cited_in.get(key, []))
+              rows.append(f'<li id="bib-{key}" value="{d.cite_no[key]}">{" ".join(x for x in parts if x)}'
+                          f'<div class="meta">cited in {back}</div></li>')
+          return ('<section class="backmatter" id="bibliography"><h2>Bibliography</h2>\n<ol class="bib">'
+                  + "\n".join(rows) + "</ol></section>")
+
+      def index(self):
+          d, rows = self.d, []
+          for name in sorted(d.defs, key=str.lower):
+              c = d.defs[name][0]
+              users = ", ".join(f'<a class="pg" href="#{u.id}">\u00a7{u.num}</a>' for u in d.users(c))
+              rows.append(f'<tr><td><a class="pg" href="#{c.id}">{self.label(name)}</a></td>'
+                          f'<td class="n">\u00a7{c.num}</td><td>{users}</td></tr>')
+          return ('<section class="backmatter" id="index"><h2>Chunk index</h2>\n<table class="index"><thead><tr><th>chunk</th>'
+                  '<th>defined</th><th>used in</th></tr></thead><tbody>' + "\n".join(rows) + "</tbody></table></section>")
+
+      def render(self):
+          d, body, first_h1 = self.d, [], True
+          for it in d.root.items:
+              if it[0] == "head":
+                  if it[1] == 1 and first_h1:
+                      first_h1 = False
+                      body.append(f'<h1 class="title" id="{d.head_id[id(it)]}">{self.inline(it[2])}</h1>'
+                                  f'<p class="sub">Woven from <code>{esc(d.src_name)}</code> \u2014 '
+                                  f'code chunks are numbered and cross-linked</p>@@CONTENTS@@')
+                  else:
+                      body.append(self.heading(it))
+              elif it[0] == "prose":
+                  body.append(self.prose(it[1]))
+              elif it[0] == "code":
+                  body.append(self.code(it[1], d.root))
+              elif it[0] == "chunk":
+                  body.append(self.chunk(it[1], 0))
+              elif it[0] == "img":
+                  body.append(self.figure(it))
+              elif it[0] == "hint":
+                  body.append(self.hint(it))
+          body += [self.index(), self.bibliography()]
+          toc = [(lvl, t, i) for lvl, t, i in d.heads if not (lvl == 1 and t == d.title)]
+          toc += [(2, "Chunk index", "index"), (2, "Bibliography", "bibliography")]
+          toc_html = "".join(f'<li class="l{lvl}"><a class="pg" href="#{i}">{esc(t)}</a></li>' for lvl, t, i in toc)
+          files = [n for n in d.defs if FILE.search(n)]
+          files_html = "".join(f'<li><a class="pg" href="#{d.defs[n][0].id}">{esc(n)}</a></li>' for n in files)
+          contents = f'<nav id="contents"><h2>Contents</h2><ul>{toc_html}</ul><h3>Files</h3><ul class="files">{files_html}</ul></nav>'
+          side = (f'<nav id="side"><div class="st">{esc(d.title)}</div><ul>{toc_html}</ul>'
+                  f'<div class="st">Files</div><ul class="files">{files_html}</ul></nav>')
+          css = CSS + ("\n" + self.P["Html"](style="default").get_style_defs("pre.code") if self.P else "")
+          mj = ('<script>window.MathJax={tex:{inlineMath:[["\\\\(","\\\\)"]],displayMath:[["\\\\[","\\\\]"]]},'
+                'options:{skipHtmlTags:["script","noscript","style","textarea","pre","code"]}};</script>'
+                f'<script async src="{html.escape(self.mathjax)}"></script>')
+          return (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" '
+                  f'content="width=device-width,initial-scale=1"><title>{esc(d.title)}</title>{mj}'
+                  f'<style>{css}</style></head><body>{side}<main>'
+                  + "\n".join(body).replace("@@CONTENTS@@", contents) + "</main></body></html>")
+
+
+  # ============================================================ LaTeX backend
+  ```
+}
+
+#py weave: LaTeX escapes and preamble{
+  LaTeX is the output format in place of a PDF. Three escaping functions cover ordinary text,
+  inline code, and the inside of a verbatim block with command characters, and the preamble uses
+  only standard packages, with fvextra optional for line breaking.
+
+  ```
+  TEX_SPECIAL = {"\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$", "&": r"\&", "#": r"\#", "_": r"\_",
+                 "%": r"\%", "~": r"\textasciitilde{}", "^": r"\textasciicircum{}", "<": r"\textless{}",
+                 ">": r"\textgreater{}", "|": r"\textbar{}"}
+
+
+  def tex_esc(s):
+      return "".join(TEX_SPECIAL.get(ch, ch) for ch in s)
+
+
+  def tex_code_esc(s):                    # for \texttt: allow line breaks after _ / .
+      return re.sub(r"(\\_|/|\.)", r"\1\\allowbreak{}", tex_esc(s))
+
+
+  def verb_esc(s):                        # inside Verbatim with commandchars=\\\{\}
+      return s.replace("\\", r"\textbackslash{}").replace("{", r"\{").replace("}", r"\}")
+
+
+  PREAMBLE = r"""\documentclass[10pt,a4paper]{article}
+  \usepackage{iftex}
+  \ifPDFTeX
+    \usepackage[utf8]{inputenc}
+    \usepackage[T1]{fontenc}
+    \IfFileExists{lmodern.sty}{\usepackage{lmodern}}{}
+    \DeclareUnicodeCharacter{2261}{\ensuremath{\equiv}}
+  \else
+    \usepackage{fontspec}
+    \IfFontExistsTF{TeX Gyre Pagella}{\setmainfont{TeX Gyre Pagella}}{\IfFontExistsTF{texgyrepagella-regular.otf}{\setmainfont{texgyrepagella-regular.otf}[BoldFont=texgyrepagella-bold.otf,ItalicFont=texgyrepagella-italic.otf,BoldItalicFont=texgyrepagella-bolditalic.otf]}{\IfFontExistsTF{STIX Two Text}{\setmainfont{STIX Two Text}}{}}}
+    \IfFontExistsTF{DejaVu Sans Mono}{\setmonofont{DejaVu Sans Mono}[Scale=MatchLowercase]}{}
+  \fi
+  \usepackage[a4paper,left=24mm,textwidth=118mm,marginparwidth=58mm,marginparsep=6mm,top=24mm,bottom=26mm]{geometry}
+  \usepackage{amsmath,amssymb}
+  \usepackage[dvipsnames]{xcolor}
+  \definecolor{tufteink}{HTML}{111111}
+  \definecolor{tuftepaper}{HTML}{FFFFF8}
+  \definecolor{tufteaccent}{HTML}{8A2A2A}
+  \definecolor{tuftegray}{HTML}{6F6F66}
+  \AtBeginDocument{\pagecolor{tuftepaper}\color{tufteink}}
+  \usepackage{fancyvrb}
+  \IfFileExists{fvextra.sty}{\usepackage{fvextra}\fvset{breaklines=true}}{}
+  \usepackage{longtable}
+  \usepackage{graphicx}
+  \usepackage[colorlinks=true,linkcolor=tufteaccent,citecolor=tufteaccent,urlcolor=tufteaccent]{hyperref}
+  \fvset{commandchars=\\\{\},fontsize=\scriptsize,frame=leftline,framesep=3mm,rulecolor=\color{tuftegray!45}}
+  @@STYLE@@
+  \setlength{\parindent}{0pt}
+  \setlength{\parskip}{0.55em plus 0.15em}
+  \linespread{1.06}
+  \emergencystretch=2em
+  \makeatletter
+  \renewcommand\section{\@startsection{section}{1}{\z@}{-3.2ex \@plus -1ex \@minus -.2ex}{1.2ex \@plus .2ex}{\normalfont\LARGE\itshape}}
+  \renewcommand\subsection{\@startsection{subsection}{2}{\z@}{-2.6ex \@plus -1ex \@minus -.2ex}{1ex \@plus .2ex}{\normalfont\Large\itshape}}
+  \renewcommand\subsubsection{\@startsection{subsubsection}{3}{\z@}{-2.2ex \@plus -1ex \@minus -.2ex}{.8ex \@plus .2ex}{\normalfont\large\itshape}}
+  \makeatother
+  \newcounter{chunk}
+  \renewcommand{\thechunk}{\S\arabic{chunk}}
+  \newcommand{\chunkhead}[2]{\par\addvspace{1.2ex}\noindent\refstepcounter{chunk}\label{#1}{\bfseries\thechunk}\enspace #2\par\nopagebreak}
+  \newcommand{\chunkmeta}[1]{\marginpar{\raggedright\scriptsize\itshape\color{tuftegray}#1}\nopagebreak}
+  \newcommand{\chunkname}[1]{\ensuremath{\langle}\texttt{#1}\ensuremath{\rangle}}
+  \newcommand{\chunklink}[2]{\hyperref[#1]{#2~\ref*{#1}}\ (p.~\pageref*{#1})}
+  \newcommand{\chunkrefv}[1]{\hyperref[#1]{\ensuremath{\langle}\csname cn@#1\endcsname\ensuremath{\rangle}\textsuperscript{\ref*{#1}}}}
+  \newcommand{\filebadge}{{\footnotesize\itshape\color{tuftegray}file}}
+  \newenvironment{nested}{\begin{list}{}{\setlength{\leftmargin}{1.1em}\setlength{\rightmargin}{0pt}\setlength{\topsep}{0pt}\setlength{\partopsep}{0pt}\setlength{\parsep}{\parskip}\setlength{\itemsep}{0pt}}\item[]}{\end{list}}
+  \hypersetup{pdftitle={@@PDFTITLE@@}}
+  \title{@@TITLE@@\\[0.4em]\large Woven from \texttt{@@SOURCE@@}}
+  \author{}
+  \date{}
+  @@NAMES@@
+  \begin{document}
+  \maketitle
+  \tableofcontents
+  """
+  ```
+}
+
+#py weave: LaTeX, text and code{
+  The LaTeX weaver follows the HTML one, but its labels are plain letters and digits, because a
+  hyphen in a label inside a verbatim block breaks the compilation. Names of chunks are mapped to
+  labels through a lookup, never written into the label.
+
+  ```
+  class TexWeaver:
+      def __init__(self, doc, outdir="."):
+          self.d, self.P, self.outdir = doc, pygments_tools(), outdir
+          self.lab = {c.id: f"chunk{c.num}" for cs in doc.defs.values() for c in cs}   # hyphen-free: safe in verbatim
+          mins = [lvl for lvl, t, _ in doc.heads if not (lvl == 1 and t == doc.title)]
+          self.min_level = min(mins) if mins else 1
+
+      # ---- inline
+      def label(self, name):
+          return rf"\texttt{{{tex_code_esc(name)}}}" if FILE.search(name) else rf"\chunkname{{{tex_code_esc(name)}}}"
+
+      def cite_tex(self, m):
+          keys = self.d.cite_keys(m.group(0))
+          known = [k for k in keys if k in self.d.bibsrc]
+          out = [rf"\cite{{{','.join(known)}}}"] if known else []
+          out += [rf"\textbf{{?{tex_esc(k)}}}" for k in keys if k not in self.d.bibsrc]
+          return "".join(out)
+
+      @staticmethod
+      def code_span(k):
+          tex = math_of(k)
+          return rf"\({tex}\)" if tex is not None else rf"\texttt{{{tex_code_esc(k.text)}}}"
+
+      def fill(self, s, table):
+          s = QUOTES.sub(lambda m: "``" + m.group(1) + "''", tex_esc(s))
+          s = CITE_RUN.sub(self.cite_tex, s)
+          return CODE_PH.sub(lambda m: self.code_span(table[int(m.group(1))]), s)
+
+      def inline(self, kids):
+          text, table = run_text(kids)
+          return self.fill(text.strip(), table)
+
+      def prose(self, kids):
+          blocks, table = self.d.blocks(kids)
+          out = []
+          for kind, val in blocks:
+              if kind == "ul":
+                  out.append("\\begin{itemize}\n" + "\n".join(f"\\item {self.fill(i, table)}" for i in val) + "\n\\end{itemize}")
+              elif kind == "math":
+                  out.append(f"\\[\n{val}\n\\]")
+              else:
+                  out.append(self.fill(val, table))
+          return "\n\n".join(out)
+
+      # ---- code
+      def highlight(self, code, ext):
+          if not code:
+              return ""
+          if self.P:
+              return self.P["highlight"](code, self.P["lexer"](ext), self.P["Latex"](nowrap=True))
+          return verb_esc(code)
+  ```
+}
+
+#py weave: LaTeX, chunks{
+  Code goes into a Verbatim environment in which a reference is a hyperlinked label, and each
+  chunk gets a header with its section number and its uses. A hint is a small note in the margin
+  of the text, for the same reason.
+
+  ```
+      def code(self, lines, chunk):
+          if not lines:
+              return ""
+          d, ext, segs, buf = self.d, self.d.lang.get(chunk.name, ""), [], []
+          for ln in lines:
+              m = REF.match(ln)
+              if m:
+                  if buf:
+                      segs.append(self.highlight("\n".join(buf), ext))
+                      buf = []
+                  name = m.group(2).strip()
+                  segs.append(m.group(1) + (rf"\chunkrefv{{{self.lab[d.defs[name][0].id]}}}" if name in d.defs else r"\textbf{??}"))
+              else:
+                  buf.append(unescape(ln))
+          if buf:
+              segs.append(self.highlight("\n".join(buf), ext))
+          return "\\begin{Verbatim}\n" + "\n".join(segs) + "\n\\end{Verbatim}"
+
+      # ---- structure
+      def link(self, c):
+          return rf"\chunklink{{{self.lab[c.id]}}}{{{self.label(c.name)}}}"
+
+      def meta(self, c):
+          d, bits = self.d, []
+          users = d.users(c)
+          if users:
+              bits.append("used in " + ", ".join(self.link(u) for u in users))
+          if not FILE.search(c.name) and d.partof.get(c.name):
+              bits.append("part of " + ", ".join(rf"\hyperref[{self.lab[d.defs[f][0].id]}]{{\texttt{{{tex_code_esc(f)}}}}}" for f in d.partof[c.name]))
+          sep = " \\textperiodcentered{} ".join(bits)
+          return rf"\chunkmeta{{{sep}}}" if bits else ""
+
+      def chunk(self, c, depth):
+          isfile = bool(FILE.search(c.name))
+          title = (rf"\filebadge\ \textbf{{\texttt{{{tex_code_esc(c.name)}}}}}" if isfile
+                   else rf"\textbf{{\ensuremath{{\langle}}\texttt{{{tex_code_esc(c.name)}}}\ensuremath{{\rangle}}}}\enspace\ensuremath{{\equiv}}")
+          parts = [r"\begin{nested}"] if depth else []
+          parts += [rf"\chunkhead{{{self.lab[c.id]}}}{{{title}}}", self.meta(c)]
+          for it in c.items:
+              if it[0] == "prose":
+                  parts.append(self.prose(it[1]))
+              elif it[0] == "code":
+                  parts.append(self.code(it[1], c))
+              elif it[0] == "chunk":
+                  parts.append(self.chunk(it[1], depth + 1))
+              elif it[0] == "head":
+                  parts.append(self.heading(it))
+              elif it[0] == "img":
+                  parts.append(self.figure(it))
+              elif it[0] == "hint":
+                  parts.append(self.hint(it))
+          if depth:
+              parts.append(r"\end{nested}")
+          return "\n".join(p for p in parts if p)
+
+      def heading(self, it):
+          d = self.d
+          hid, depth = d.head_id[id(it)], min(it[1] - self.min_level, 3)
+          cmd, kind = [("section", "section"), ("subsection", "subsection"), ("subsubsection", "subsubsection"),
+                       ("paragraph", "paragraph")][max(depth, 0)]
+          return (rf"\hypertarget{{{hid}}}{{}}\phantomsection\addcontentsline{{toc}}{{{kind}}}{{{tex_esc(d.head_title[hid])}}}"
+                  "\n" rf"\{cmd}*{{{self.inline(it[2])}}}")
+
+      def hint(self, it):
+          return r"\par\noindent{\small\textbf{to be filled in by an agent:} " + tex_esc(it[1]) + "}"
+  ```
+}
+
+#py weave: LaTeX, figures{
+  LaTeX cannot include SVG, so the picture is converted to a PDF beside the `.tex` with
+  rsvg-convert or inkscape, whichever is installed. Raster images are copied. With neither
+  converter the figure is left out and a note says why, because a missing figure should not stop
+  the document from compiling.
+
+  ```
+      def figure(self, it):
+          """A figure environment; the picture is written beside the .tex as a PDF (or copied, if raster)."""
+          path, cap = img_parts(it[1])
+          found = self.d.image(path)
+          stem, ext = os.path.splitext(os.path.basename(path))
+          target = None
+          if found is not None:
+              kind, val = found
+              os.makedirs(self.outdir, exist_ok=True)
+              if ext.lower() == ".svg":
+                  tool = shutil.which("rsvg-convert") or shutil.which("inkscape")
+                  if tool:
+                      with tempfile.TemporaryDirectory() as t:
+                          src = os.path.join(t, stem + ".svg")
+                          if kind == "text":
+                              open(src, "w", encoding="utf-8").write(val)
+                          else:
+                              shutil.copy(val, src)
+                          out = os.path.join(self.outdir, stem + ".pdf")
+                          cmd = ([tool, "-f", "pdf", "-o", out, src] if tool.endswith("rsvg-convert")
+                                 else [tool, src, "--export-type=pdf", "--export-filename=" + out])
+                          if subprocess.run(cmd, capture_output=True).returncode == 0:
+                              target = stem + ".pdf"
+                  if target is None:
+                      print(f"note: {path}: no rsvg-convert or inkscape, so the figure is left out of the LaTeX", file=sys.stderr)
+              else:
+                  target = os.path.basename(path)
+                  if kind == "file":
+                      shutil.copy(val, os.path.join(self.outdir, target))
+                  else:
+                      open(os.path.join(self.outdir, target), "w", encoding="utf-8").write(val)
+          pic = (rf"\includegraphics[width=\linewidth]{{{target}}}" if target
+                 else rf"\fbox{{\texttt{{{tex_code_esc(path)}}} (figure not available)}}")
+          return ("\\begin{figure}[htbp]\n\\centering\n" + pic + "\n"
+                  + (rf"{{\small\itshape {tex_esc(cap)}\par}}" + "\n" if cap else "") + "\\end{figure}")
+  ```
+}
+
+#py weave: LaTeX, back matter{
+  The bibliography becomes a thebibliography environment, and the index is a long table.
+
+  ```
+      def bibliography(self):
+          d, items = self.d, []
+          for key in sorted(d.cite_no, key=d.cite_no.get):
+              if key not in d.bibsrc:
+                  continue
+              p = bib_parts(parse_bibtex(d.bibsrc[key]))
+              parts = [_stop(tex_esc(p["authors"])) if p["authors"] else "", "``" + _stop(tex_esc(p["title"])) + "''"]
+              tail = ", ".join(x for x in [rf"\emph{{{tex_esc(p['venue'])}}}" if p["venue"].strip() else "",
+                                           tex_esc(p["vol"]), tex_esc(p["pages"]), tex_esc(p["year"])] if x)
+              parts.append(tail + "." if tail else "")
+              if p["url"]:
+                  parts.append(rf"\url{{{p['url']}}}")
+              elif p["hp"]:
+                  parts.append(_stop(tex_esc(p["hp"])))
+              if p["arxiv"]:
+                  parts.append(rf"\href{{https://arxiv.org/abs/{p['arxiv']}}}{{arXiv:{p['arxiv']}}}")
+              back = ", ".join(self.link_back(i, n) for n, i in d.cited_in.get(key, []))
+              items.append(rf"\bibitem{{{key}}} {' '.join(x for x in parts if x)}" + "\n"
+                           rf"\par{{\footnotesize\color{{tuftegray}}cited in {back}}}")
+          return ("\\clearpage\n\\phantomsection\\addcontentsline{toc}{section}{Bibliography}\n"
+                  "\\renewcommand{\\refname}{Bibliography}\n\\begin{thebibliography}{99}\n" + "\n".join(items)
+                  + "\n\\end{thebibliography}")
+
+      def link_back(self, i, name):
+          return (rf"\hyperref[{self.lab[i]}]{{{self.label(name)}}}" if i.startswith("c-")
+                  else rf"\hyperlink{{{i}}}{{{tex_esc(name)}}}")
+
+      def index(self):
+          d, rows = self.d, []
+          for name in sorted(d.defs, key=str.lower):
+              c = d.defs[name][0]
+              users = ", ".join(rf"\hyperref[{self.lab[u.id]}]{{\ref*{{{self.lab[u.id]}}}}}" for u in d.users(c))
+              rows.append(rf"\hyperref[{self.lab[c.id]}]{{{self.label(name)}}} & \ref*{{{self.lab[c.id]}}} & {users} \\")
+          return ("\\clearpage\n\\hypertarget{index}{}\\phantomsection\\addcontentsline{toc}{section}{Chunk index}\n"
+                  "\\section*{Chunk index}\n\\begin{longtable}{@{}p{0.40\\textwidth}rp{0.42\\textwidth}@{}}\n"
+                  "\\textbf{chunk} & \\textbf{defined} & \\textbf{used in} \\\\\\hline\n\\endhead\n" + "\n".join(rows)
+                  + "\n\\end{longtable}")
+
+      def render(self):
+          d = self.d
+          style = self.P["Latex"](style="default").get_style_defs() if self.P else ""
+          head = (PREAMBLE.replace("@@STYLE@@", style).replace("@@TITLE@@", tex_esc(d.title))
+                  .replace("@@PDFTITLE@@", tex_esc(d.title)).replace("@@SOURCE@@", tex_code_esc(d.src_name))
+                  .replace("@@NAMES@@", "\n".join(rf"\expandafter\gdef\csname cn@{self.lab[cs[0].id]}\endcsname{{{tex_code_esc(n)}}}"
+                                                  for n, cs in d.defs.items())))
+          body, first_h1 = [], True
+          for it in d.root.items:
+              if it[0] == "head":
+                  if it[1] == 1 and first_h1:
+                      first_h1 = False                       # the first level-1 heading is the title
+                  else:
+                      body.append(self.heading(it))
+              elif it[0] == "prose":
+                  body.append(self.prose(it[1]))
+              elif it[0] == "code":
+                  body.append(self.code(it[1], d.root))
+              elif it[0] == "chunk":
+                  body.append(self.chunk(it[1], 0))
+              elif it[0] == "img":
+                  body.append(self.figure(it))
+              elif it[0] == "hint":
+                  body.append(self.hint(it))
+          body += [self.index(), self.bibliography(), "\\end{document}"]
+          return head + "\n\n".join(b for b in body if b) + "\n"
+
+
+  # ============================================================ HTML stylesheet
+  ```
+}
+
+#py weave: the style sheet{
+  The style sheet is a string; with `--highlight`, pygments contributes its own rules at the end.
+
+  ```
+  CSS = r"""
+  :root{--fg:#111;--muted:#6f6f66;--rule:#cfcfc2;--code:transparent;--accent:#8a2a2a;--hl:#f4eecb;--paper:#fffff8;--bad:#a00;--hint-bg:transparent}
+  @media (prefers-color-scheme:dark){:root{--fg:#dedcd2;--muted:#9a988c;--rule:#45443d;--accent:#d99a8a;--hl:#3b3820;--paper:#151513;--bad:#f08a72}}
+  *{box-sizing:border-box}
+  ::selection{background:var(--hl)}
+  html{font-size:16px}
+  body{margin:0;font:1.1rem/1.55 et-book,"Palatino Linotype","Book Antiqua",Palatino,"TeX Gyre Pagella",Georgia,serif;color:var(--fg);background:var(--paper);
+   text-rendering:optimizeLegibility;font-variant-numeric:oldstyle-nums}
+  main{max-width:41rem;margin:0 auto;padding:3rem 1.4rem 6rem}
+  a{color:inherit;text-decoration:underline;text-decoration-thickness:.05em;text-decoration-color:var(--muted);text-underline-offset:.18em}
+  a:hover{color:var(--accent);text-decoration-color:var(--accent)}
+  h1,h2,h3{font-family:inherit;font-weight:400;font-style:italic;line-height:1.15;color:var(--fg)}
+  figure.fig{margin:1.6rem 0;text-align:center;color:var(--fg)}figure.fig svg,figure.fig img{max-width:100%;height:auto}
+  figcaption{color:var(--muted);font-size:.9rem;margin-top:.4rem}
+  h1.title{font-style:normal;font-size:2.6rem;margin:.4rem 0 .3rem}.sub{color:var(--muted);font-style:italic;font-size:1.2rem;margin-top:0}
+  h2{font-size:1.8rem;margin:3.2rem 0 1rem;border:0}h3{font-size:1.4rem;margin:2.2rem 0 .8rem}
+  code,pre,.fname{font-family:"Latin Modern Mono",ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace}
+  code{background:none;padding:0;font-size:.86em}
+  .display{margin:.8rem 0;overflow-x:auto}
+  .cite a{font-size:.92em}.cite{white-space:nowrap}
+  .chunk{margin:2.2rem 0;padding:0}
+  .chunk.nested{margin:1.4rem 0 1.4rem .9rem;padding-left:.9rem;border-left:1px solid var(--rule)}
+  .chunk:target>.chunk-head{background:var(--hl)}
+  .chunk-head{font-size:1.02rem;padding:.1rem .3rem;margin-left:-.3rem}
+  .chunk-head .num{color:var(--muted);margin-right:.4rem}
+  .cname{font-style:normal;font-family:"Latin Modern Mono",ui-monospace,"DejaVu Sans Mono",monospace;font-size:.88em}.eq{color:var(--muted)}
+  .badge{font-variant:small-caps;letter-spacing:.06em;color:var(--muted);font-size:.9rem;font-weight:400}
+  .fname{font-weight:400}
+  .meta{font-style:italic;font-size:.82rem;line-height:1.4;color:var(--muted);margin:.1rem 0 .6rem}
+  pre.code{background:none;border:0;border-left:1px solid var(--rule);border-radius:0;padding:.15rem 0 .15rem 1rem;white-space:pre-wrap;overflow-wrap:anywhere;
+   font-size:.8rem;line-height:1.45;margin:.9rem 0;tab-size:4}
+  a.ref{font-weight:400}.ref.bad{color:var(--bad)}.rn{color:var(--muted);font-size:.8em;margin-left:.15rem}
+  .hint{border-left:2px solid var(--accent);padding:.2rem .9rem;font-style:italic;margin:1rem 0}
+  table.index{border-collapse:collapse;width:100%;font-size:.9rem;border-top:2px solid var(--fg);border-bottom:2px solid var(--fg)}
+  .index th{border-bottom:1px solid var(--fg);padding:.3rem .5rem;text-align:left;font-weight:400;font-style:italic}
+  .index td{padding:.2rem .5rem;text-align:left;vertical-align:top}
+  .index td.n{white-space:nowrap;color:var(--muted)}
+  ol.bib{padding-left:2.2rem;font-size:.95rem}ol.bib li{margin:.5rem 0}
+  nav ul{list-style:none;padding:0;margin:0}
+  nav#contents{border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);padding:.5rem 0;margin:1.6rem 0;font-size:.95rem}
+  nav#contents h2{border:0;margin:.4rem 0;font-size:1.3rem}nav#contents h3{margin:.8rem 0 .2rem;font-size:1rem}
+  nav li.l2{margin-left:.9rem}nav li{margin:.12rem 0}
+  nav#side{display:none}
+  @media screen and (min-width:1180px){
+   nav#side{display:block;position:fixed;top:0;left:0;bottom:0;width:17rem;overflow-y:auto;padding:1.6rem 1.1rem;
+    border-right:1px solid var(--rule);font-size:.88rem;line-height:1.4}
+   nav#side a{text-decoration:none}nav#side a:hover{text-decoration:underline}
+   nav#side .st{font-style:italic;margin:.7rem 0 .3rem;color:var(--muted)}nav#side li.l2{margin-left:.7rem}
+   main{margin-left:19rem;margin-right:0;max-width:44rem;padding-left:2.5rem;padding-right:2.5rem}nav#contents{display:none}}
+  @media screen and (min-width:1340px){
+   main{max-width:none;padding-right:3rem}
+   main>*{max-width:38rem}
+   .chunk{position:relative}
+   .meta{float:right;clear:right;width:14.5rem;margin:.2rem -16.5rem .6rem 0;font-size:.8rem}
+   .chunk.nested .meta{margin-right:-17.4rem}.chunk.nested .chunk.nested .meta{margin-right:-18.3rem}}
+  @media print{body{background:#fff}nav#side{display:none}main{max-width:none;margin:0;padding:0}
+   pre.code{break-inside:avoid;white-space:pre-wrap}h1,h2,h3,.chunk-head,.meta{break-after:avoid}}
+  """
+  ```
+}
+
+#py weave: command line{
+  The command line writes the HTML file, the LaTeX file, or both.
+
+  ```
+  def main():
+      ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+      ap.add_argument("source")
+      ap.add_argument("-o", "--outdir", default=".")
+      ap.add_argument("--highlight", action="store_true", help="colour code with pygments (needs pygments; the files get harder to read)")
+      ap.add_argument("--only", choices=["html", "tex"], help="write just one of the two outputs")
+      ap.add_argument("--mathjax", default=MATHJAX, help="URL of the MathJax script used by the HTML (default: jsDelivr CDN)")
+      a = ap.parse_args()
+      global HIGHLIGHT
+      HIGHLIGHT = a.highlight
+      src = Source.read(a.source)
+      doc = Doc(src.parse(), os.path.basename(a.source), src.base)
+      os.makedirs(a.outdir, exist_ok=True)
+      stem = os.path.join(a.outdir, os.path.splitext(os.path.basename(a.source))[0])
+      if a.only != "tex":
+          open(stem + ".html", "w", encoding="utf-8").write(HtmlWeaver(doc, a.mathjax).render())
+          print(f"wrote {stem}.html  ({len(doc.defs)} chunks, {len(doc.cite_no)} citations)")
+      if a.only != "html":
+          open(stem + ".tex", "w", encoding="utf-8").write(TexWeaver(doc, a.outdir).render())
+          print(f"wrote {stem}.tex   -> compile with:  xelatex {os.path.basename(stem)}.tex   (twice; pdflatex cannot read all of Unicode)")
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/weave.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py weave: header and constants>>>
+  <<<py weave: the chunk tree>>>
+  <<<py weave: bibliography parsing>>>
+  <<<py weave: the document model>>>
+
+  <<<py weave: analysing the tree>>>
+
+  <<<py weave: grouping prose>>>
+
+
+  <<<py weave: syntax highlighting>>>
+  <<<py weave: HTML, inline text>>>
+
+  <<<py weave: HTML, code and chunks>>>
+
+  <<<py weave: HTML, figures>>>
+
+  <<<py weave: HTML, back matter>>>
+  <<<py weave: LaTeX escapes and preamble>>>
+
+
+  <<<py weave: LaTeX, text and code>>>
+
+  <<<py weave: LaTeX, chunks>>>
+
+  <<<py weave: LaTeX, figures>>>
+
+  <<<py weave: LaTeX, back matter>>>
+  <<<py weave: the style sheet>>>
+
+
+  <<<py weave: command line>>>
+  ```
+}
+
+#h2{lint.py}
+
+The checks that tangle and weave are not strict about.
+
+#py lint: header and imports{
+  A literate document can fail in ways a compiler will never see: a stray hash that truncates the
+  rest of a file, a reference to a chunk that does not exist, a citation with no entry. Linting
+  reuses tangle and weave to find them before a reader does.
+
+  ```
+  #!/usr/bin/env python3
+  """Pre-flight checks for a brashtag literate source.
+
+      python lint.py program.lit [--refs]
+
+  Errors (exit status 1): the .lit does not parse (stray '#' or '}' in prose, unterminated fence,
+  ...), a <<<reference>>> to an undefined chunk, a #cite{} key with no bibliography entry, a
+  bibliography entry missing author, title or year.
+  Warnings (exit status 0): chunks defined but never used, empty chunks, long stretches of code with
+  no prose, bibliography entries nobody cites, entries with nothing to verify them against
+  (no arXiv id, DOI, ISBN or URL).
+
+  --refs prints one line per cited reference (key, authors, year, title, identifier): the checklist
+  to verify against the real papers before delivering the document.  Finally a size summary
+  (chunks, code lines, prose words, citations) helps judge the balance of prose and code.
+  """
+  import contextlib
+  import io
+  import os
+  import re
+  import sys
+
+  from tangle import FILE, REF, load
+  from weave import Doc, img_parts, parse_bibtex, bib_parts, run_text, walk
+
+  LONG_CODE = 40          # lines of code in one chunk, without any prose, before we warn
+  ```
+}
+
+#py lint: the checks{
+  Errors end in exit status 1 and warnings do not. The reference listing is what an author checks
+  the bibliography against, one line per citation. A hint that is still open is a warning, because
+  the program is not finished while one is.
+
+  ```
+  def main():
+      args = [a for a in sys.argv[1:] if not a.startswith("--")]
+      if not args:
+          sys.exit(__doc__)
+      show_refs = "--refs" in sys.argv
+      src = args[0]
+      root = load(src)                                   # exits with a located message if the .lit is malformed
+      with contextlib.redirect_stderr(io.StringIO()):    # Doc warns about the same things we report below
+          doc = Doc(root, os.path.basename(src), os.path.dirname(src))
+      errors, warnings = [], []
+
+      # ---- figures
+      for chunk, it in walk(doc.root):
+          if it[0] == "img" and doc.image(img_parts(it[1])[0]) is None:
+              errors.append(f"#img{{{img_parts(it[1])[0]}}}: neither a file chunk of this document nor a file next to it")
+
+      # ---- chunks
+      code_lines = prose_words = 0
+      per_chunk = {}
+      for chunk, it in walk(doc.root):
+          if it[0] == "code" and chunk.name:
+              per_chunk.setdefault(chunk.name, {"code": 0, "prose": 0})["code"] += len(it[1])
+              code_lines += len(it[1])
+          elif it[0] == "prose" and chunk.name:
+              words = len(re.sub("[\ue000-\ue003]", " ", run_text(it[1])[0]).split())
+              per_chunk.setdefault(chunk.name, {"code": 0, "prose": 0})["prose"] += words
+              prose_words += words
+          elif it[0] == "prose":
+              prose_words += len(re.sub("[\ue000-\ue003]", " ", run_text(it[1])[0]).split())
+      for name, cs in doc.defs.items():
+          stats = per_chunk.get(name, {"code": 0, "prose": 0})
+          if name not in doc.uses and not FILE.search(name) and stats["code"]:
+              warnings.append(f"chunk \u00ab{name}\u00bb has code but is never referenced, so it is never written to a file")
+          if not stats["code"] and not stats["prose"] and not FILE.search(name):
+              warnings.append(f"chunk \u00ab{name}\u00bb is empty")
+          if stats["code"] > LONG_CODE and stats["prose"] == 0:
+              warnings.append(f"chunk \u00ab{name}\u00bb has {stats['code']} lines of code and no prose; "
+                              "split it into named steps and explain them")
+      for chunk, it in walk(doc.root):                # hints for an agent that are still open
+          if it[0] == "hint":
+              warnings.append(f"an agent hint is still open in \u00ab{chunk.name}\u00bb: {it[1][:60]}")
+      for name in doc.uses:
+          if name not in doc.defs:
+              errors.append(f"<<<{name}>>> is referenced but no chunk of that name is defined")
+
+      # ---- citations and bibliography
+      for key in doc.cite_no:
+          if key not in doc.bibsrc:
+              errors.append(f"#cite{{{key}}} has no entry in #bibliography{{}}")
+      rows = []
+      for key, src_text in doc.bibsrc.items():
+          fields = parse_bibtex(src_text)
+          if key not in doc.cite_no:
+              warnings.append(f"bibliography entry '{key}' is never cited")
+          missing = [f for f in ("author", "title", "year") if not fields.get(f, "").strip()]
+          if missing:
+              errors.append(f"bibliography entry '{key}' lacks: {', '.join(missing)}")
+          p = bib_parts(fields)
+          ident = (f"arXiv:{p['arxiv']}" if p["arxiv"] else "") or (f"doi:{fields['doi']}" if fields.get("doi") else "") \
+              or (f"isbn:{fields['isbn']}" if fields.get("isbn") else "") or p["url"]
+          if not ident:
+              warnings.append(f"bibliography entry '{key}' has no arXiv id, DOI, ISBN or URL; check it by title and authors")
+          rows.append((key, p["authors"], p["year"], p["title"], ident or "(no identifier)"))
+
+      # ---- report
+      if show_refs:
+          print("references to verify (author, year, title, identifier):")
+          for key, authors, year, title, ident in rows:
+              print(f"  {key:28s} {authors[:46]:46s} {year}  {title[:70]}  {ident}")
+          print()
+      for w in warnings:
+          print("warning:", w)
+      for e in errors:
+          print("error:", e)
+      print(f"{len(doc.defs)} chunks, {code_lines} code lines, {prose_words} words of prose, "
+            f"{len(doc.cite_no)} citations, {len(doc.bibsrc)} bibliography entries; "
+            f"{len(errors)} error(s), {len(warnings)} warning(s)")
+      sys.exit(1 if errors else 0)
+
+
+  if __name__ == "__main__":
+      main()
+  ```
+}
+
+#internal/skill/files/scripts/lint.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py lint: header and imports>>>
+
+
+  <<<py lint: the checks>>>
+  ```
+}
+
+#h2{_brashtag.py}
+
+The scripts use a copy of the brashtag parser that sits beside them, so that the skill needs no
+installation. It is the same parser as the Go program's, and the license of the original travels
+with it.
+
+#py brashtag: data types{
+  A bag has a tag and children; a blob is text; code carries its backtick run and its text. The
+  parse is lossless, which is the property the sourcemap relies on.
+
+  ```
+  """Bundled copy of the brashtag parser (https://github.com/PratikDeoghare/brashtag), used only when
+  the package is not installed.  MIT License, Copyright (c) 2021 Pratik Deoghare - see LICENSE.brashtag."""
+  from __future__ import annotations
+  import sys
+  from dataclasses import dataclass
+
+  @dataclass
+  class Bag:
+  	tag: str
+  	kids: list[Bag | Blob | Code]
+
+  	def __str__(self):
+  		s = ''.join(str(k) for k in self.kids)
+  		return f'#{self.tag}{{{s}}}'
+
+
+  @dataclass
+  class Blob:
+  	text: str
+
+  	def __str__(self):
+  		return str(self.text)
+
+
+  @dataclass
+  class Code:
+  	tag: str
+  	text: str
+
+  	def __str__(self):
+  		return f"{self.tag}{self.text}{self.tag}"
+
+  @dataclass
+  class Error:
+  	s: str
+
+  	def __str__(self):
+  		return self.s
+  ```
+}
+
+#py brashtag: parsing{
+  The parser is a set of mutually recursive functions over a string, each returning what is left
+  and what it parsed or an error.
+
+  ```
+  def parse_bag(s: str) -> tuple[str, Bag|Error]:
+  	if len(s) == 0:
+  		return s, Error('empty input')
+  	if s[0] != '#':
+  		return s, Error('expected #')
+  	i = 0
+  	while i < len(s) and s[i] != '{':
+  		i += 1
+
+  	if i >= len(s) or s[i] != '{':
+  		return s, Error('unopened bag')
+
+  	root = Bag(s[1:i], [])
+
+  	s = s[i+1:]
+  	while len(s) > 0:
+  		x : Bag | Blob | Code | Error
+  		if s[0] == '#':
+  			s, x = parse_bag(s)
+  			if isinstance(x, Error):
+  				return s, x
+  			root.kids.append(x)
+  		elif s[0] == '`':
+  			s, x = parse_code(s)
+  			if isinstance(x, Error):
+  				return s, x
+  			root.kids.append(x)
+  		elif s[0] == '}':
+  			s = s[1:]
+  			return s, root
+  		else:
+  			s, x = parse_blob(s)
+  			if isinstance(x, Error):
+  				return s, x
+  			root.kids.append(x)
+
+
+  	return s, Error('bag not closed')
+
+  def parse_blob(s: str) -> tuple[str, Blob|Error]:
+  	if len(s) == 0:
+  		return s, Error('empty input')
+  	i = 0
+  	while i < len(s) and s[i] != '#' and s[i] != '`' and s[i] != '}':
+  		i += 1
+  	if i == 0:
+  		return s, Error('empty blob')
+  	rest = s[i:]
+  	blob = Blob(s[:i])
+  	return rest, blob
+
+
+  def parse_code(s: str) -> tuple[str, Code|Error]:
+  	if len(s) == 0:
+  		return s, Error('empty input')
+  	i = 0
+  	while i < len(s) and s[i] == '`':
+  		i+=1
+  	tag = s[:i]
+  	k = len(tag)
+  	codeStart = i
+  	while i < len(s) - k and s[i:i+k] != tag:
+  		i += 1
+  	if s[i:i+k] == tag:
+  		return s[i+k:], Code(tag, s[codeStart:i])
+  	return s[codeStart:], Error(f'no end tag "{tag}"')
+
+  def parse(text :str) -> Bag|Error:
+  	rest, x = parse_bag(str(text))
+  	if isinstance(x, Error):
+  		n = min(100, len(rest))
+  		return Error(f'{x}: {rest[:n]}')
+  	return x
+  ```
+}
+
+#py brashtag: tests{
+  A few built-in cases run when the file is executed directly.
+
+  ````
+  def run_tests():
+  	def run(f, text, expected):
+  		assert f(text) == expected, f(text)
+
+  	run(
+  		parse_bag,
+  		'#foo{bar}',
+  		('', Bag(tag='foo', kids=[Blob(text='bar')])),
+  	)
+
+  	run(
+  		parse_blob,
+  		'hello world!!`code`',
+  		('`code`', Blob(text='hello world!!')),
+  	)
+
+  	run(
+  		parse_blob,
+  		'#{This is not just a blob.}',
+  		('#{This is not just a blob.}', Error('empty blob')),
+  	)
+
+
+  	text = '''```
+  		Code looks like `code`.
+  	```the rest of it'''
+  	run(
+  		parse_code,
+  		text,
+  		('the rest of it', Code(tag='```', text='''
+  		Code looks like `code`.
+  	''')),
+  	)
+
+
+  	run(
+  		parse_code,
+  		'``This is unterminated code. Should error.`',
+  		('This is unterminated code. Should error.`', Error('no end tag "``"')),
+  	)
+
+  	run(
+  		parse_bag,
+  		'#my tag {is in my bag #of{another bag `code`} and the code is ``123``.}',
+  		('',
+  			Bag(tag="my tag ",
+  				kids = [
+  					Blob(text="is in my bag "),
+  					Bag(tag="of",
+  						kids = [
+  							Blob(text="another bag "),
+  							Code(tag="`", text="code"),
+  						],
+  					),
+  					Blob(text=" and the code is "),
+  					Code(tag="``", text="123"),
+  					Blob(text=".")
+  				],
+  			)
+  		),
+  	)
+
+
+  if __name__ == '__main__':
+  	if sys.argv[1] == 'test':
+  		run_tests()
+  	elif sys.argv[1] == 'parse':
+  		print(repr(parse(sys.stdin.read())))
+  ````
+}
+
+#internal/skill/files/scripts/_brashtag.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py brashtag: data types>>>
+
+  <<<py brashtag: parsing>>>
+
+  <<<py brashtag: tests>>>
+  ```
+}
+
+#h2{License of the parser}
+
+The parser is copied under its own license, which is the one the Go program carries too.
+
+#internal/skill/files/scripts/LICENSE.brashtag{
+  The license of the bundled parser.
+
+  ```
+  MIT License
+
+  Copyright (c) 2021 Pratik Deoghare
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+  ```
+}

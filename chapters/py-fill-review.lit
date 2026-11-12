@@ -1,0 +1,1200 @@
+#h1{The skill's own tools: fill and review in Python}
+
+An assistant that is handed this skill runs Python more readily than it installs a program, and
+the whole of Python's standard library is already there. So the skill carries the tools as
+scripts, and this chapter is the two that matter most to an assistant, fill and review, written
+again in Python. They follow the Go program's design closely and talk to it through the same
+files, and what follows is how they differ, and how they are tested.
+
+#h2{fill.py}
+
+Fill finds each `agent-fill-in` hint in a document, builds the context from the document, asks
+an assistant for the code, checks the answer, writes it into the document and records it.
+
+#py fill: header and the prompt text{
+  The docstring is the manual. The system text tells the assistant what it is looking at, in what
+  form to answer, and what not to do; it is the only place where the contract between the script
+  and the assistant is written down, and it is the same contract as the Go program's.
+
+  ```
+  #!/usr/bin/env python3
+  """Let an assistant fill the gaps a literate program leaves for it.
+
+      python fill.py prog.lit --list
+      python fill.py prog.lit --dry-run [--only N]          # print the prompt for hint N, call nobody
+      python fill.py prog.lit --agent anthropic --check 'go vet ./...'
+      python fill.py prog.lit --agent 'claude -p'
+
+  A gap is a bag with the reserved tag `agent-fill-in`, written inside a chunk:
+
+      #read the words{
+        #agent-fill-in{count the words of standard input into counts}
+      }
+
+  Tangle leaves the gap out.  For each gap this script gathers the context the way a person would read it
+  (the headings above it, the prose of its section, the chunk with the gap marked, the chunks that use it up
+  to the files, the chunks it uses or the hint names, the tangled file around it), asks an agent for the code,
+  checks the answer, writes it into the .lit (keeping the hint's words as prose) and records it in
+  PROG.lit.fills.jsonl for review.py.
+
+  Agents:  --agent anthropic[:MODEL]   the Anthropic Messages API (ANTHROPIC_API_KEY, optional ANTHROPIC_BASE_URL)
+           --agent 'COMMAND'           a shell command that reads the prompt on stdin and prints the reply
+           default: $LIT_AGENT, else the API when ANTHROPIC_API_KEY is set.
+
+  Checks before anything is written: the program must still parse and tangle, generated .py/.json/.go files
+  must be syntactically valid (.go only when `gofmt` is installed), the code must not hold placeholders, and
+  --check 'CMD' (run in a scratch copy of the tangled program) must pass.  A fill that fails is retried once
+  with the error.
+  """
+  import argparse
+  import hashlib
+  import json
+  import os
+  import re
+  import shutil
+  import subprocess
+  import sys
+  import tempfile
+  import time
+  import urllib.error
+  import urllib.request
+
+  sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+  from tangle import HINT, RESERVED, FILE, REF, Bag, Blob, Code, Source, collect, expand, is_fence, fence_text  # noqa: E402
+
+  HOLE = re.compile(r"^(\s*)\x00hole:(\d+)$")
+  FENCE_OPEN = re.compile(r"^\s*(`{3,})[^`]*$")
+  CANNOT = re.compile(r"^\s*CANNOT:\s*(.*)$", re.M)
+  PLACEHOLDER = re.compile(r"\b(TODO|FIXME|XXX)\b|not implemented|unimplemented|implement me|your code here|\.\.\.\s*$|^\s*pass\s*(#.*)?$", re.I)
+
+  SYSTEM = """You fill in one gap in a literate program written in brashtag notation.
+
+  The program is prose interleaved with named code chunks. A line of code that consists only of <<<name>>> expands to the code of the chunk of that name, indented as the reference is; a line written \\<<<name>>> is literal text. Chunks are concatenated into source files by a tool called tangle. A gap is marked by the author with an agent-fill-in hint; you write the code lines that belong there.
+
+  Rules:
+  - Reply with exactly one fenced code block holding the lines to insert, and nothing else. Use a fence of three backticks (more if your code contains three).
+  - The lines are inserted verbatim as code lines of the chunk at the marked place. Keep the indentation that the neighbouring lines of the chunk call for; do not add indentation for the place where the chunk will be expanded (tangle adds that).
+  - Follow the language, naming, error handling and style of the surrounding code. Use only identifiers that exist in the context shown or in the language's standard library, and say nothing about imports unless the chunk is the place for them.
+  - Do not repeat code that is already there, do not leave placeholders, TODOs or ellipses, and do not write the code of other chunks. A <<<name>>> line is allowed only for a chunk that exists.
+  - If the hint cannot be satisfied from what you are shown, reply with a single line that starts with CANNOT: and gives the reason."""
+
+
+  # ---------------------------------------------------------------- the document as a flow of events
+  ```
+}
+
+#py fill: hints and chunks{
+  A hint remembers where it stands in the flattened text, which is what the insertion needs, and
+  the line it is on in whichever chapter file it came from, which is what a person needs. A chunk
+  is a list of items in document order: prose, code lines, hints, and the chunks nested in it.
+
+  ```
+  class Hint:
+      def __init__(self, index, chunk, start, end, raw, file, line):
+          self.index, self.chunk, self.start, self.end, self.raw, self.file, self.line = index, chunk, start, end, raw, file, line
+          self.text = " ".join(raw.split())
+
+      def describe(self):
+          return "%s:%d  «%s»  %s" % (self.file, self.line, self.chunk, trunc(self.text or "(no description)", 80))
+
+
+  class Chunk:
+      def __init__(self, name, parent):
+          self.name, self.parent, self.items = name, parent, []   # items: ("prose", text) ("code", lines) ("hint", Hint) ("chunk", Chunk)
+  ```
+}
+
+#py fill: reading the document with offsets{
+  The parser reports no positions, but its tree is lossless, so the offset of any bag is the sum
+  of the lengths of what comes before it. One walk over the tree yields the chunks with their
+  items, the hints with their offsets, the headings and prose in order, and for every chunk the
+  places that use it. A hint counts only when it stands inside a chunk; one at the top level is
+  ordinary prose.
+
+  ```
+  class Doc:
+      """What the context builder needs: hints with offsets, chunks with their items, headings and prose in order."""
+
+      def __init__(self, src, root):
+          self.src, self.hints, self.defs, self.events = src, [], {}, []
+          self.top = Chunk("", None)
+          self._walk(root, 0, [], self.top, root=True)
+          self.uses = {}
+          for name, defs in self.defs.items():
+              for c in defs:
+                  for it in c.items:
+                      if it[0] == "code":
+                          for l in it[1]:
+                              m = REF.match(l)
+                              if m:
+                                  self.uses.setdefault(m.group(2).strip(), [])
+                                  if c not in self.uses[m.group(2).strip()]:
+                                      self.uses[m.group(2).strip()].append(c)
+
+      def _walk(self, bag, pos, chain, chunk, root=False):
+          """Walk a bag whose text starts at offset pos of the program text; returns the offset after it."""
+          pos += 0 if root else len(bag.tag) + 2
+          for k in bag.kids:
+              if isinstance(k, Blob):
+                  if k.text.strip():
+                      chunk.items.append(("prose", k.text))
+                      self.events.append(("prose", k.text, chunk))
+                  pos += len(k.text)
+              elif isinstance(k, Code):
+                  if is_fence(k):
+                      chunk.items.append(("code", fence_text(k)))
+                  else:
+                      chunk.items.append(("prose", "`" + k.text + "`"))
+                  pos += 2 * len(k.tag) + len(k.text)
+              else:
+                  start = pos
+                  name = k.tag.strip()
+                  if k.tag == HINT and chain and all(c.strip() not in RESERVED for c in chain):
+                      raw = "".join(x.text if isinstance(x, (Blob, Code)) else str(x) for x in k.kids)
+                      f, line, _ = self.src.locate(start)
+                      h = Hint(len(self.hints), chunk.name, start, start + len(str(k)), raw, f, line)
+                      self.hints.append(h)
+                      chunk.items.append(("hint", h))
+                      self.events.append(("hint", h, chunk))
+                      pos += len(str(k))
+                  elif name in RESERVED:
+                      if name[:1] == "h" and name[1:].isdigit():
+                          self.events.append(("head", int(name[1:]), prose_of(k.kids)))
+                      pos += len(str(k))
+                  else:
+                      c = Chunk(name, chunk if chunk.name else None)
+                      self.defs.setdefault(name, []).append(c)
+                      chunk.items.append(("chunk", c))
+                      pos = self._walk(k, pos, chain + [name], c)
+                      continue
+          return pos if root else pos + 1
+
+
+  def prose_of(kids):
+      out = []
+      for k in kids:
+          if isinstance(k, Blob):
+              out.append(k.text)
+          elif isinstance(k, Code):
+              out.append("`" + k.text + "`" if len(k.tag) < 3 else "")
+          elif k.tag == "cite":
+              continue
+          else:
+              out.append(prose_of(k.kids))
+      return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+\n", "\n", "".join(out))).strip()
+
+
+  def trunc(s, n):
+      return s if len(s) <= n else s[:n - 1].rstrip() + "…"
+
+
+  def find_hints(src):
+      root = src.parse()
+      return Doc(src, root).hints
+  ```
+}
+
+#py fill: small helpers for the prompt{
+  Showing the code around a use site, the prose of a chunk, and the chunk as the assistant should
+  see it, with the gap marked and the other open gaps named so that it does not try to fill them.
+  The chain of uses is followed upward, a breadth-first walk from the chunk to the files, because
+  the first use shows how the chunk is called and the last shows where it ends up.
+
+  ```
+  def window(lines, at, before, after):
+      lo, hi = max(0, at - before), min(len(lines), at + after + 1)
+      return "\n".join((["…"] if lo else []) + lines[lo:hi] + (["…"] if hi < len(lines) else []))
+
+
+  def indent_block(text, pad):
+      return "\n".join(pad + l if l else l for l in text.split("\n"))
+
+
+  def chunk_prose(c):
+      return "\n\n".join(prose_of([Blob(it[1])]) for it in c.items if it[0] == "prose" and it[1].strip()).strip()
+
+
+  def code_lines(c):
+      return [l for it in c.items if it[0] == "code" for l in it[1]]
+
+
+  def chunk_text(c, mark):
+      out = []
+      for it in c.items:
+          if it[0] == "prose" and it[1].strip():
+              out.append(it[1].strip())
+          elif it[0] == "code":
+              out.append("\n".join(it[1]))
+          elif it[0] == "hint":
+              out.append(("⟦ FILL IN HERE: %s ⟧" if it[1] is mark else "⟦ another unfilled hint: %s ⟧") % it[1].text)
+          elif it[0] == "chunk":
+              out.append("(nested chunk «%s»)" % it[1].name)
+      return "\n\n".join(out)
+
+
+  def use_chain(doc, name, max_depth=4, max_sites=8):
+      out, seen, queue = [], set(), [(name, 1)]
+      while queue and len(out) < max_sites:
+          q, depth = queue.pop(0)
+          for u in doc.uses.get(q, []):
+              if id(u) in seen or len(out) >= max_sites:
+                  continue
+              seen.add(id(u))
+              line = next((i for i, l in enumerate(code_lines(u)) if (m := REF.match(l)) and m.group(2).strip() == q), -1)
+              out.append((u, depth, line, q))
+              if depth < max_depth and u.name and not FILE.search(u.name):
+                  queue.append((u.name, depth + 1))
+      return out
+
+
+  # ---------------------------------------------------------------- the prompt
+  ```
+}
+
+#py fill: building the prompt{
+  The prompt is a list of sections, each with a priority. The task is never dropped. When the
+  budget in characters is exceeded the sections are kept in order of importance: the chunk with
+  its gap, the headings and the tangled file first, then where the chunk is used and the prose of
+  its section, then the chunks around it and the chunks it mentions, and the program's
+  introduction last. The tangled file around the gap is there because it shows the real
+  indentation and the neighbours, which no amount of prose can.
+
+  ```
+  def build_prompt(src, k, budget=24000):
+      root = src.parse()
+      doc = Doc(src, root)
+      if not 0 <= k < len(doc.hints):
+          raise ValueError("no hint number %d (the program has %d)" % (k, len(doc.hints)))
+      site = doc.hints[k]
+      holder = next(c for c in sum(doc.defs.values(), []) if any(it[0] == "hint" and it[1] is site for it in c.items))
+      heads, crumbs, section, found = {}, [], [], False
+      for ev in doc.events:
+          if ev[0] == "head":
+              if found:
+                  break
+              heads[ev[1]] = ev[2]
+              heads = {l: t for l, t in heads.items() if l <= ev[1]}
+              section = []
+          elif ev[0] == "prose":
+              section.append(ev[1])
+          elif ev[0] == "hint" and ev[1] is site:
+              found, crumbs = True, [heads[l] for l in sorted(heads) if heads[l]]
+      chunks = collect(root, True)
+      files = part_of(doc, holder.name)
+      if FILE.search(holder.name):
+          files = [holder.name] + files
+      lang = os.path.splitext(files[0])[1].lstrip(".") if files else ""
+
+      secs = []
+      task = "Hint (%s line %d): %s\nChunk to fill: «%s»" % (site.file, site.line, site.text or "(none)", holder.name)
+      task += ("\nEnds up in: " + ", ".join(files)) if files else "\nThis chunk is not expanded into any file yet."
+      task += ("\nLanguage: " + lang) if lang else ""
+      secs.append(("task", task, 0))
+      if crumbs:
+          secs.append(("where in the document", " › ".join(crumbs), 1))
+      intro = []
+      for ev in doc.events:
+          if ev[0] == "head" and ev[1] >= 2 or ev[0] == "hint" or ev[0] == "prose" and ev[2].name:
+              break
+          if ev[0] == "prose":
+              intro.append(ev[1].strip())
+      if intro:
+          secs.append(("what the program is", trunc(prose_of([Blob("\n\n".join(intro))]), 1800), 4))
+      anc, p = [], holder.parent
+      while p is not None and p.name:
+          if chunk_prose(p):
+              anc.insert(0, "«%s»: %s" % (p.name, trunc(chunk_prose(p), 800)))
+          p = p.parent
+      if anc:
+          secs.append(("the chunks around this one", "\n\n".join(anc), 3))
+      sp = prose_of([Blob("\n\n".join(t for t in section))])
+      if sp:
+          secs.append(("prose of this section", trunc(sp, 2500), 2))
+      uses = []
+      for u, depth, line, via in use_chain(doc, holder.name):
+          who = "«%s»" % u.name if u.name else "the document"
+          head = "%s«%s» is expanded in %s:" % ("  " * (depth - 1), via, who)
+          if depth == 1 and chunk_prose(u):
+              head += "\n(" + trunc(chunk_prose(u), 400) + ")"
+          body = window(code_lines(u), line, 5, 5) if line >= 0 else ""
+          uses.append(head + "\n" + indent_block(body, "  " * (depth - 1)))
+      if uses:
+          secs.append(("where this chunk is used", "\n\n".join(uses), 2))
+      want = []
+
+      def add_want(n):
+          n = n.strip()
+          if n in doc.defs and n != holder.name and n not in want:
+              want.append(n)
+      for l in code_lines(holder):
+          m = REF.match(l)
+          if m:
+              add_want(m.group(2))
+      for m in re.finditer("<<<([^>]+)>>>|«([^»]+)»|`([^`]+)`", site.text + " " + site.raw):
+          add_want("".join(g or "" for g in m.groups()))
+      refs = []
+      for n in want:
+          parts = []
+          for c in doc.defs[n]:
+              if chunk_prose(c):
+                  parts.append(trunc(chunk_prose(c), 300))
+              parts.append(trunc("\n".join(code_lines(c)), 1200))
+          refs.append("«%s»:\n%s" % (n, "\n".join(parts)))
+      if refs:
+          secs.append(("chunks this one expands or the hint mentions", "\n\n".join(refs), 3))
+      secs.append(("the chunk, with the gap marked", chunk_text(holder, site), 1))
+      if files and files[0] in chunks:
+          lines = expand(files[0], chunks)
+          at = next((i for i, l in enumerate(lines) if (m := HOLE.match(l)) and int(m.group(2)) == k), -1)
+          if at >= 0:
+              shown = []
+              for l in lines:
+                  m = HOLE.match(l)
+                  shown.append(m.group(1) + ("⟦ FILL IN HERE ⟧" if int(m.group(2)) == k else "⟦ another unfilled hint ⟧") if m else l)
+              secs.append(("the tangled file around the gap", "%s (line %d):\n%s" % (files[0], at + 1, window(shown, at, 12, 12)), 1))
+      keep = sorted(range(len(secs)), key=lambda i: (secs[i][2], i))
+      used, chosen = 0, set()
+      for i in keep:
+          cost = len(secs[i][1]) + len(secs[i][0]) + 8
+          if used + cost <= budget or secs[i][2] == 0:
+              chosen.add(i)
+              used += cost
+      shown = [secs[i] for i in range(len(secs)) if i in chosen]
+      user = "\n\n".join("=== %s ===\n%s" % (t, b) for t, b, _ in shown)
+      user += "\n\nWrite the code lines that replace the gap marked FILL IN HERE."
+      return SYSTEM, user, [t for t, _, _ in shown], site
+  ```
+}
+
+#py fill: which files a chunk ends up in{
+  A chunk ends up in every file that expands it, directly or through other chunks. Knowing the
+  file gives the language, and so the style of the reply.
+
+  ```
+  def part_of(doc, name):
+      """The file chunks that, through any chain of references, expand the chunk."""
+      out, seen, queue = [], {name}, [name]
+      while queue:
+          n = queue.pop(0)
+          for u in doc.uses.get(n, []):
+              if u.name and u.name not in seen:
+                  seen.add(u.name)
+                  if FILE.search(u.name):
+                      out.append(u.name)
+                  else:
+                      queue.append(u.name)
+      return out
+
+
+  # ---------------------------------------------------------------- agents
+  ```
+}
+
+#py fill: agents{
+  An agent is a function from the system text and the prompt to a reply. There are two kinds. A
+  command reads the prompt on standard input and prints the reply, which covers every assistant
+  that has a command line, and the Anthropic API is called with the standard library's `urllib`,
+  so that the script needs no package. The choice comes from `--agent`, then `LIT_AGENT`, then the
+  presence of an API key.
+
+  ```
+  def make_agent(spec, model=""):
+      """-> (name, ask(system, user) -> reply text)"""
+      spec = spec or os.environ.get("LIT_AGENT", "")
+      if not spec and os.environ.get("ANTHROPIC_API_KEY"):
+          spec = "anthropic"
+      if not spec:
+          sys.exit("fill: no agent. Use --agent anthropic (with ANTHROPIC_API_KEY set) or --agent 'COMMAND', or set LIT_AGENT.")
+      if spec == "anthropic" or spec.startswith("anthropic:"):
+          key = os.environ.get("ANTHROPIC_API_KEY")
+          if not key:
+              sys.exit("fill: ANTHROPIC_API_KEY is not set")
+          mdl = model or spec.partition(":")[2] or os.environ.get("LIT_MODEL", "") or "claude-sonnet-4-5"
+          base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+
+          def ask(system, user, timeout=300):
+              body = json.dumps({"model": mdl, "max_tokens": 4096, "system": system,
+                                 "messages": [{"role": "user", "content": user}]}).encode()
+              req = urllib.request.Request(base + "/v1/messages", body, {
+                  "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"})
+              try:
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      data = json.load(r)
+              except urllib.error.HTTPError as e:
+                  raise RuntimeError("the API answered %d: %s" % (e.code, e.read()[:300].decode("utf-8", "replace")))
+              except OSError as e:
+                  raise RuntimeError("cannot reach the API: %s" % e)
+              return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+          return "anthropic:" + mdl, ask
+
+      def ask(system, user, timeout=300):
+          p = subprocess.run(spec, shell=True, input=system + "\n\n" + user, capture_output=True, text=True, timeout=timeout)
+          if p.returncode:
+              raise RuntimeError("the agent command failed (%d): %s" % (p.returncode, p.stderr.strip()[:300]))
+          return p.stdout
+      return "command: " + spec, ask
+
+
+  # ---------------------------------------------------------------- reading the reply, checking, inserting
+  ```
+}
+
+#py fill: reading the reply and writing it into the document{
+  The reply must be one fenced block, or the single line `CANNOT:` with a reason. Whatever is not
+  recognisable is an error that the assistant is told about. The insertion keeps the author's
+  words as prose, followed by the code in a fence one backtick longer than any run of backticks in
+  the code, so that the fence cannot be closed by the code itself.
+
+  ```
+  def extract_code(reply):
+      """-> (code lines, cannot reason) ; raises ValueError for an unusable reply."""
+      lines = reply.replace("\r\n", "\n").split("\n")
+      for i, l in enumerate(lines):
+          m = FENCE_OPEN.match(l)
+          if m:
+              close = re.compile(r"^\s*`{%d,}\s*$" % len(m.group(1)))
+              for j in range(i + 1, len(lines)):
+                  if close.match(lines[j]):
+                      return trim_blank(lines[i + 1:j]), ""
+              raise ValueError("the reply opens a code fence but never closes it")
+      m = CANNOT.search(reply)
+      if m and len(reply.strip()) == len(m.group(0).strip()):
+          return None, m.group(1).strip()
+      if not reply.strip():
+          raise ValueError("the reply is empty")
+      return trim_blank(lines), ""
+
+
+  def trim_blank(lines):
+      while lines and not lines[0].strip():
+          lines = lines[1:]
+      while lines and not lines[-1].strip():
+          lines = lines[:-1]
+      return [l.rstrip(" \t\r") for l in lines]
+
+
+  def insertion(text, site, code, drop_hint=False):
+      n = max([3] + [len(r) + 1 for l in code for r in re.findall("`+", l)])
+      fence = "`" * n
+      out = ""
+      if site.start > 0 and text[site.start - 1] != "\n":
+          out += "\n"
+      if site.raw.strip() and not drop_hint:
+          out += site.raw.strip() + "\n\n"
+      out += fence + "\n" + "\n".join(code) + "\n" + fence
+      if site.end < len(text) and text[site.end] != "\n":
+          out += "\n"
+      return out
+  ```
+}
+
+#py fill: checks before anything is written{
+  Nothing is written until the program as it would be is checked: it parses and tangles, the
+  generated Python and JSON are valid, Go is checked when `gofmt` is installed, the lines are not
+  placeholders, and, if the author gave a command, the tangled program passes it in a scratch
+  directory. A check that cannot run is not a check that passed, so a missing tool is skipped
+  silently and never reported as success.
+
+  ```
+  def check_code(code):
+      """Findings for the lines of one filled gap on their own: [(level, message)]"""
+      if not "".join(code).strip():
+          return [("error", "the filled code is empty")]
+      out = [("error", "line %d looks like a placeholder: %s" % (i + 1, l.strip())) for i, l in enumerate(code) if PLACEHOLDER.search(l)]
+      if any("\x00" in l for l in code):
+          out.append(("error", "the code contains a NUL character"))
+      if len(code) > 80:
+          out.append(("warn", "%d lines for one gap; consider splitting it into named chunks with prose" % len(code)))
+      if any(l.startswith("\t") for l in code) and any(l.startswith("  ") for l in code):
+          out.append(("warn", "the code mixes tab and space indentation"))
+      return out
+
+
+  def tangle_text(text, where="program text"):
+      """-> {file: body}, parsing text as a program; SystemExit becomes ValueError."""
+      from tangle import parse_text
+      try:
+          root = parse_text(text, lambda off: "%s line %d" % (where, text.count("\n", 0, off) + 1))
+          chunks = collect(root)
+          return {n: "\n".join(expand(n, chunks)) + "\n" for n in chunks if FILE.search(n)}
+      except SystemExit as e:
+          raise ValueError(str(e.code))
+
+
+  def check_program(text):
+      """The checks that need no model: the program parses and tangles, generated files are valid."""
+      try:
+          files = tangle_text(text)
+      except ValueError as e:
+          return [("error", "the program no longer parses or tangles: %s" % e)]
+      out = []
+      for name, body in files.items():
+          ext = os.path.splitext(name)[1].lower()
+          try:
+              if ext == ".py":
+                  compile(body, name, "exec")
+              elif ext == ".json":
+                  json.loads(body)
+              elif ext == ".go" and shutil.which("gofmt"):
+                  p = subprocess.run(["gofmt", "-e"], input=body, capture_output=True, text=True)
+                  if p.returncode:
+                      out.append(("error", "%s: syntax error: %s" % (name, p.stderr.strip().split("\n")[0])))
+          except SyntaxError as e:
+              out.append(("error", "%s:%s: syntax error: %s" % (name, e.lineno, e.msg)))
+          except ValueError as e:
+              out.append(("error", "%s: invalid JSON: %s" % (name, e)))
+          for i, l in enumerate(body.split("\n")):
+              if "\x00hole" in l:
+                  out.append(("error", "%s:%d: a gap marker leaked into the generated file" % (name, i + 1)))
+      return out
+
+
+  def run_check(text, command, timeout=300):
+      """Tangle the program into a scratch directory and run `command` there; -> findings."""
+      try:
+          files = tangle_text(text)
+      except ValueError as e:
+          return [("error", str(e))]
+      with tempfile.TemporaryDirectory() as d:
+          for name, body in files.items():
+              path = os.path.join(d, name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(body)
+          try:
+              p = subprocess.run(command, shell=True, cwd=d, capture_output=True, text=True, timeout=timeout)
+          except subprocess.TimeoutExpired:
+              return [("error", "--check %r timed out" % command)]
+      if p.returncode:
+          return [("error", "--check %r failed (exit %d):\n%s" % (command, p.returncode, trunc((p.stdout + p.stderr).strip(), 1500)))]
+      return []
+
+
+  # ---------------------------------------------------------------- the record: PROG.lit.fills.jsonl
+  ```
+}
+
+#py fill: the record{
+  Every fill is one line of JSON next to the document, with the text before and after, which is
+  all that review needs to show it, approve it, or put the hint back. Status changes are further
+  lines, so the file is only ever appended to.
+
+  ```
+  def fills_path(src):
+      return os.path.join(src.base, os.path.basename(src.root) + ".fills.jsonl")
+
+
+  def append_event(src, ev):
+      with open(fills_path(src), "a", encoding="utf-8") as f:
+          f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+
+  def load_fills(src):
+      order, by_id = [], {}
+      try:
+          lines = open(fills_path(src), encoding="utf-8").read().split("\n")
+      except OSError:
+          return []
+      for l in lines:
+          try:
+              ev = json.loads(l)
+          except ValueError:
+              continue
+          if ev.get("event") == "fill":
+              by_id[ev["id"]] = ev
+              order.append(ev)
+          elif ev.get("event") == "status" and ev.get("id") in by_id:
+              f = by_id[ev["id"]]
+              f["status"] = ev.get("status") or f["status"]
+              f["verdict"] = ev.get("verdict") or f.get("verdict", "")
+              f["notes"] = f.get("notes", []) + ev.get("notes", [])
+      return order
+
+
+  def record_status(src, fid, status, verdict="", notes=()):
+      append_event(src, {"event": "status", "id": fid, "status": status, "t": time.time(), "verdict": verdict, "notes": list(notes)})
+
+
+  # ---------------------------------------------------------------- filling
+  ```
+}
+
+#py fill: filling one hint{
+  One hint is a loop: ask, read the reply, check the program that would result, and on failure ask
+  again with the error and the rejected code, up to the number of retries. Only a fill that passes
+  is written, and only then is it recorded.
+
+  ````
+  def fill_one(ask, agent_name, src, k, budget, retries, check, drop_hint, out=print):
+      system, user0, _, site = build_prompt(src, k, budget)
+      user, last, notes = user0, "", []
+      for attempt in range(1, retries + 2):
+          reply = ask(system, user)
+          try:
+              code, cannot = extract_code(reply)
+          except ValueError as e:
+              last = str(e)
+              user = user0 + "\n\nYour previous answer could not be used: " + last + "\nFollow the reply format exactly."
+              continue
+          if cannot:
+              raise RuntimeError("the agent could not do it: " + cannot)
+          ins = insertion(src.text, site, code, drop_hint)
+          new_text = src.text[:site.start] + ins + src.text[site.end:]
+          fs = check_code(code) + check_program(new_text)
+          if check and not any(l == "error" for l, _ in fs):
+              fs += run_check(new_text, check)
+          errors = [m for l, m in fs if l == "error"]
+          if not errors:
+              notes = [m for l, m in fs if l == "warn"]
+              orig = src.text[site.start:site.end]
+              src.write_back(new_text)
+              fid = "f-" + hashlib.sha256(("%s\0%s\0%s\0%s" % (site.chunk, site.text, "\n".join(code), time.time_ns())).encode()).hexdigest()[:6]
+              rec = {"event": "fill", "id": fid, "status": "pending", "t": time.time(), "chunk": site.chunk, "file": site.file,
+                     "line": site.line, "hint": site.text, "orig": orig, "inserted": ins, "code": "\n".join(code),
+                     "agent": agent_name, "attempts": attempt, "notes": notes}
+              append_event(src, rec)
+              return rec, notes
+          last = "\n".join(errors)
+          out("  attempt %d failed its checks:\n    %s" % (attempt, trunc(last, 600).replace("\n", "\n    ")))
+          user = (user0 + "\n\nYour previous answer was rejected:\n" + last + "\n\nYour previous code was:\n```\n" +
+                  "\n".join(code) + "\n```\nWrite the corrected code for the gap.")
+      raise RuntimeError("after %d attempt(s): %s" % (retries + 1, last.split("\n")[0]))
+  ````
+}
+
+#py fill: command line{
+  The loop over the hints reads the document again before each one, because what one fill adds is
+  context for the next. A hint that fails is skipped, not retried forever, and the exit status
+  says whether anything failed.
+
+  ```
+  def main(argv=None):
+      ap = argparse.ArgumentParser(prog="fill.py", description="Fill the #agent-fill-in{} hints of a literate program.")
+      ap.add_argument("source")
+      ap.add_argument("--list", action="store_true", help="show the hints and stop")
+      ap.add_argument("--dry-run", action="store_true", help="print the prompt for hint --only (default 0) and stop")
+      ap.add_argument("--show-context", action="store_true", help="with --dry-run: only the sections and the size")
+      ap.add_argument("--agent", default="", help='"anthropic[:MODEL]" or a shell command; default $LIT_AGENT')
+      ap.add_argument("--model", default="")
+      ap.add_argument("--check", default="", help="a command to run on the tangled program when the last hint is filled")
+      ap.add_argument("--check-each", action="store_true", help="run --check after every fill")
+      ap.add_argument("--retries", type=int, default=1)
+      ap.add_argument("--only", type=int, default=None, help="fill just this hint number")
+      ap.add_argument("--chunk", default="", help="only hints inside this chunk")
+      ap.add_argument("--limit", type=int, default=1 << 30)
+      ap.add_argument("--budget", type=int, default=24000, help="size of the prompt in characters")
+      ap.add_argument("--drop-hint", action="store_true", help="do not keep the hint's words as prose above the code")
+      a = ap.parse_args(argv)
+
+      src = Source.read(a.source)
+      sites = find_hints(src)
+      if a.list:
+          print("no #agent-fill-in hints" if not sites else "\n".join("%3d  %s" % (s.index, s.describe()) for s in sites))
+          return 0
+      if not sites:
+          print("no #agent-fill-in hints to fill")
+          return 0
+      if a.dry_run or a.show_context:
+          k = a.only or 0
+          try:
+              system, user, titles, site = build_prompt(src, k, a.budget)
+          except ValueError as e:
+              print("fill: %s" % e, file=sys.stderr)
+              return 2
+          if a.show_context:
+              print("hint %d: %s\nsections: %s\nprompt: %d characters" % (k, site.describe(), "; ".join(titles), len(user)))
+          else:
+              print("--- system ---\n%s\n--- prompt ---\n%s" % (system, user))
+          return 0
+      if a.only is not None and not 0 <= a.only < len(sites):
+          print("fill: no hint number %d; fill.py --list shows them" % a.only, file=sys.stderr)
+          return 2
+      name, ask = make_agent(a.agent, a.model)
+      filled = failed = 0
+      skip, first = set(), a.only
+      key = lambda s: (s.chunk, s.raw, s.line)
+      while filled + failed < a.limit:
+          src = Source.read(a.source)       # read again each time: what one fill adds is context for the next
+          sites = find_hints(src)
+          pick = next((s for s in sites if (first is None or s.index == first) and (not a.chunk or s.chunk == a.chunk) and key(s) not in skip), None)
+          if pick is None:
+              break
+          first = None
+          print("filling " + pick.describe())
+          check = a.check if (a.check_each or len(sites) <= 1) else ""
+          try:
+              rec, notes = fill_one(ask, name, src, pick.index, a.budget, a.retries, check, a.drop_hint)
+          except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as e:
+              print("  not filled: %s" % e, file=sys.stderr)
+              skip.add(key(pick))
+              failed += 1
+              if a.only is not None:
+                  break
+              continue
+          for n in notes:
+              print("  warning: " + n)
+          print("  filled as %s (%d line(s)); review.py shows it" % (rec["id"], rec["code"].count("\n") + 1))
+          filled += 1
+          if a.only is not None:
+              break
+      print("%d filled, %d failed, %d hint(s) still open" % (filled, failed, len(find_hints(Source.read(a.source)))))
+      return 1 if failed else 0
+
+
+  if __name__ == "__main__":
+      sys.exit(main())
+  ```
+}
+
+#internal/skill/files/scripts/fill.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py fill: header and the prompt text>>>
+
+  <<<py fill: hints and chunks>>>
+
+
+  <<<py fill: reading the document with offsets>>>
+
+
+  <<<py fill: small helpers for the prompt>>>
+
+  <<<py fill: building the prompt>>>
+
+
+  <<<py fill: which files a chunk ends up in>>>
+
+  <<<py fill: agents>>>
+
+  <<<py fill: reading the reply and writing it into the document>>>
+
+
+  <<<py fill: checks before anything is written>>>
+
+  <<<py fill: the record>>>
+
+  <<<py fill: filling one hint>>>
+
+
+  <<<py fill: command line>>>
+  ```
+}
+
+#h2{review.py}
+
+Review shows what was filled, checks it again, asks for a second opinion if wanted, and lets the
+author approve each fill or put its hint back.
+
+#py review: header and the second-opinion prompt{
+  Review is the other half of fill: the author returns to a program that was filled in and wants
+  to see what happened. The system text for the second opinion asks for a verdict in a fixed form,
+  so that the answer can be parsed and the exit status can depend on it.
+
+  ```
+  #!/usr/bin/env python3
+  """Review what fill.py wrote into a literate program.
+
+      python review.py prog.lit                    # the fills waiting for review, with automatic checks
+      python review.py prog.lit --all --full       # every fill ever made, with its code
+      python review.py prog.lit --check 'go vet ./...' --ai --agent 'claude -p'
+      python review.py prog.lit --approve f-3142cc | --approve-all | --reject f-3142cc
+
+  Each fill is checked without a model: its code is still in the program, has no placeholders, the program
+  still parses and tangles, generated .py/.json/.go files are valid, and --check CMD passes on the tangled
+  program.  --ai asks an agent for a second opinion (VERDICT: ok / concerns / reject) from the same context
+  fill.py used.  --reject puts the original hint back, so the gap is open again.
+  """
+  import argparse
+  import json
+  import sys
+  import os
+
+  sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+  from tangle import Source  # noqa: E402
+  from fill import (check_code, check_program, find_hints, load_fills, make_agent,  # noqa: E402
+                    record_status, run_check, trunc)
+
+  REVIEW_SYSTEM = """You review code that an assistant wrote to fill one gap in a literate program (prose interleaved with named code chunks).
+  You are shown the context, the hint the author left, and the code that was inserted. Judge whether the code does what the hint and the surrounding prose ask, fits the code around it (names, types, errors, style), and could be wrong in a way a compiler or a quick test would not catch.
+  Answer in this exact form:
+  VERDICT: ok | concerns | reject
+  then at most six short lines of reasons, one issue per line, each starting with "- "."""
+  ```
+}
+
+#py review: checking a fill{
+  A fill is checked again, not trusted from the moment it was written. Is its text still in the
+  document, once? Does the code pass the checks of fill? Does the program still tangle? Does the
+  author's command still pass? The answer is a list of findings, each an error or a warning.
+
+  ```
+  def where_is(src, fill):
+      """Does the inserted text still stand in the program, exactly once?"""
+      n = src.text.count(fill["inserted"])
+      return n
+
+
+  def assess(src, fill, check="", agent=None, budget=24000):
+      """-> (findings [(level, text)], ai verdict or '')"""
+      fs = []
+      n = where_is(src, fill)
+      if n == 0:
+          fs.append(("warn", "the inserted text is no longer in the program (edited since, or reverted)"))
+      elif n > 1:
+          fs.append(("warn", "the inserted text occurs %d times; --reject cannot tell which is the fill" % n))
+      fs += check_code(fill["code"].split("\n"))
+      fs += check_program(src.text)
+      if check and not any(l == "error" for l, _ in fs):
+          fs += run_check(src.text, check)
+      verdict = ""
+      if agent:
+          verdict = ai_review(agent, src, fill, budget)
+      return fs, verdict
+  ```
+}
+
+#py review: the second opinion{
+  A second assistant is asked to judge the code against the hint and the text around it. Its
+  verdict is one of three words, and an unreadable answer counts as concerns, not as approval. It
+  never replaces reading the code.
+
+  ````
+  def ai_review(ask, src, fill, budget):
+      ctx = "Chunk: «%s» (%s line %d)\nHint: %s\n\nProse and code around the gap now:\n" % (
+          fill["chunk"], fill["file"], fill["line"], fill["hint"] or "(none)")
+      at = src.text.find(fill["inserted"])
+      if at >= 0:
+          ctx += src.text[max(0, at - budget // 4):at + len(fill["inserted"]) + budget // 8]
+      user = ctx + "\n\nInserted code:\n```\n" + fill["code"] + "\n```\n\nGive your verdict."
+      reply = ask(REVIEW_SYSTEM, user)
+      first = next((l for l in reply.split("\n") if l.strip().upper().startswith("VERDICT")), "")
+      word = first.partition(":")[2].strip().lower().split(" ")[0] if first else ""
+      return word if word in ("ok", "concerns", "reject") else "concerns"
+  ````
+}
+
+#py review: putting a hint back{
+  Rejecting restores the original hint in the place of the inserted text. It is refused when the
+  inserted text is no longer there exactly once, because then it cannot be told which part of the
+  document is the fill.
+
+  ```
+  def reject(src, fill):
+      n = where_is(src, fill)
+      if n != 1:
+          raise ValueError("cannot reject %s: its text %s" % (fill["id"], "is not in the program any more" if not n else "occurs %d times" % n))
+      at = src.text.find(fill["inserted"])
+      src.write_back(src.text[:at] + fill["orig"] + src.text[at + len(fill["inserted"]):])
+  ```
+}
+
+#py review: command line{
+  The default is to show the fills that wait for a decision, with their findings. Approving only
+  records that somebody read the code; rejecting changes the document.
+
+  ```
+  def main(argv=None):
+      ap = argparse.ArgumentParser(prog="review.py", description="Review the fills fill.py made.")
+      ap.add_argument("source")
+      ap.add_argument("--all", action="store_true", help="include approved and rejected fills")
+      ap.add_argument("--check", default="", help="run this command on the tangled program")
+      ap.add_argument("--ai", action="store_true", help="ask an agent for a second opinion")
+      ap.add_argument("--agent", default="")
+      ap.add_argument("--model", default="")
+      ap.add_argument("--approve", metavar="ID", nargs="+")
+      ap.add_argument("--approve-all", action="store_true")
+      ap.add_argument("--reject", metavar="ID", nargs="+")
+      ap.add_argument("--json", action="store_true")
+      ap.add_argument("--full", action="store_true", help="show the inserted code")
+      a = ap.parse_args(argv)
+
+      src = Source.read(a.source)
+      fills = load_fills(src)
+      byid = {f["id"]: f for f in fills}
+
+      if a.reject:
+          code = 0
+          for fid in a.reject:
+              f = byid.get(fid)
+              if not f:
+                  print("review: no fill %s" % fid, file=sys.stderr)
+                  code = 2
+                  continue
+              src = Source.read(a.source)
+              try:
+                  reject(src, f)
+              except ValueError as e:
+                  print("review: %s" % e, file=sys.stderr)
+                  code = code or 1
+                  continue
+              record_status(src, f["id"], "rejected")
+              print("%s rejected: the hint is back in the program" % f["id"])
+          return code
+      if a.approve or a.approve_all:
+          todo = [f for f in fills if f["status"] == "pending"] if a.approve_all else [byid.get(i) for i in a.approve]
+          if None in todo:
+              print("review: no such fill among %s" % " ".join(a.approve), file=sys.stderr)
+              return 2
+          for f in todo:
+              record_status(src, f["id"], "approved")
+              print("%s approved" % f["id"])
+          return 0
+
+      shown = [f for f in fills if a.all or f["status"] == "pending"]
+      ask = make_agent(a.agent, a.model)[1] if a.ai else None
+      results, bad = [], 0
+      for f in shown:
+          fs, verdict = assess(src, f, a.check, ask) if f["status"] == "pending" else ([], "")
+          if verdict:
+              record_status(src, f["id"], f["status"], verdict)
+          bad += any(l == "error" for l, _ in fs) or verdict == "reject"
+          results.append((f, fs, verdict))
+      if a.json:
+          print(json.dumps([{**{k: f[k] for k in ("id", "status", "chunk", "file", "line", "hint", "agent", "attempts")},
+                             "code": f["code"], "findings": [{"level": l, "message": m} for l, m in fs], "verdict": v or f.get("verdict", "")}
+                            for f, fs, v in results], indent=2, ensure_ascii=False))
+          return 1 if bad else 0
+      if not results:
+          print("nothing to review" + ("" if a.all else " (--all shows approved and rejected fills too)"))
+          return 0
+      for f, fs, verdict in results:
+          print("%s  %s  «%s»  %s:%d  [%s]" % (f["id"], f["status"], f["chunk"], f["file"], f["line"], f["agent"]))
+          if f["hint"]:
+              print("    hint: " + trunc(f["hint"], 100))
+          if a.full:
+              print("    " + f["code"].replace("\n", "\n    "))
+          else:
+              print("    %d line(s)" % (f["code"].count("\n") + 1))
+          for l, m in fs:
+              print("    %s: %s" % (l, m.replace("\n", "\n        ")))
+          if verdict:
+              print("    ai verdict: " + verdict)
+          if not fs and verdict in ("", "ok"):
+              print("    checks passed")
+      print("%d fill(s) shown%s" % (len(results), "; some need attention" if bad else ""))
+      return 1 if bad else 0
+
+
+  if __name__ == "__main__":
+      sys.exit(main())
+  ```
+}
+
+#internal/skill/files/scripts/review.py{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<py review: header and the second-opinion prompt>>>
+
+
+  <<<py review: checking a fill>>>
+
+
+  <<<py review: the second opinion>>>
+
+
+  <<<py review: putting a hint back>>>
+
+
+  <<<py review: command line>>>
+  ```
+}
+
+#h2{Why a second implementation}
+
+The Go program is for people: one binary to install, fast, with a test suite. The scripts are
+for assistants, and an assistant works in an environment where Python is present and a Go
+toolchain or a downloaded binary may not be. Two implementations can drift apart, so the build
+checks the part that is easiest to check, that the scripts and the program tangle the book into
+the same files and that lint agrees with lint, and the scripts have tests of their own. They
+read and write the same documents and the same `fills.jsonl`, so a document filled by one can be
+reviewed by the other. What the two do not share is the sourcemap, which counts characters in
+one and bytes in the other.
+
+#h2{Testing the scripts}
+
+The tests run the scripts as an assistant would, from the command line, with fake assistants:
+small programs that read the prompt on standard input and print a fixed reply, or a reply that
+depends on whether the prompt says an earlier answer was rejected. They cover the prompt, a fill
+that works, one that is rejected for a placeholder and retried with the error, one with a syntax
+error that must never be written, a refusal, a check command that vetoes, review, approval and
+rejection, and the notes that tangle and weave give about open hints.
+
+#internal/skill/pytests/test_fill_review.py{
+  The file is the tests, in the order described above.
+
+  ````
+  #!/usr/bin/env python3
+  """Tests of fill.py and review.py with fake agents (small scripts that read the prompt on stdin).
+
+      python test_fill_review.py [SCRIPTS_DIR]
+  """
+  import json
+  import os
+  import subprocess
+  import sys
+  import tempfile
+  import unittest
+
+  HERE = os.path.dirname(os.path.abspath(__file__))
+  SCRIPTS = os.path.abspath(sys.argv.pop(1)) if len(sys.argv) > 1 else os.path.join(HERE, "..", "files", "scripts")
+
+  PROG = """#h1{Counter}
+  Counts up to a limit.
+
+  #count.py{
+    ```
+    def count(n):
+        \<<<loop>>>
+
+    print(count(3))
+    ```
+  }
+
+  #loop{
+    Add the numbers one by one.
+    #agent-fill-in{ return the sum of 1..n with a for loop }
+  }
+
+  #extra{
+    Second gap, in a chunk nobody asked about.
+    #agent-fill-in{ say hello }
+  }
+  """
+
+  FENCE = "`" * 3
+  GOOD = FENCE + "\ntotal = 0\nfor i in range(1, n + 1):\n    total += i\nreturn total\n" + FENCE
+  _n = [0]
+
+
+  def agent(body):
+      """A fake agent: a command whose python source `body` sees the prompt as `p` and prints the reply."""
+      _n[0] += 1
+      path = os.path.join(tempfile.gettempdir(), "fake_agent_%d_%d.py" % (os.getpid(), _n[0]))
+      with open(path, "w") as f:
+          f.write("import sys\np = sys.stdin.read()\n" + body + "\n")
+      return "%s %s" % (sys.executable, path)
+
+
+  def rd(*parts):
+      with open(os.path.join(*parts), encoding="utf-8") as f:
+          return f.read()
+
+
+  def say(text):
+      return "print(%r)" % text
+
+
+  def run(name, *args, cwd):
+      p = subprocess.run([sys.executable, os.path.join(SCRIPTS, name + ".py"), *args], cwd=cwd, capture_output=True, text=True)
+      return p.returncode, p.stdout + p.stderr
+
+
+  class FillReview(unittest.TestCase):
+      def setUp(self):
+          self.tmp = tempfile.TemporaryDirectory()
+          self.d = self.tmp.name
+          with open(os.path.join(self.d, "p.lit"), "w", encoding="utf-8") as f:
+              f.write(PROG)
+
+      def tearDown(self):
+          self.tmp.cleanup()
+
+      def lit(self):
+          return rd(self.d, "p.lit")
+
+      def test_list_numbers_the_hints_in_document_order(self):
+          code, out = run("fill", "p.lit", "--list", cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertIn("«loop»", out.split("\n")[0])
+          self.assertIn("«extra»", out.split("\n")[1])
+
+      def test_the_prompt_shows_prose_use_site_and_tangled_file_with_the_gap_marked(self):
+          code, out = run("fill", "p.lit", "--dry-run", cwd=self.d)
+          self.assertEqual(code, 0, out)
+          for want in ("Add the numbers one by one", "def count(n):", "FILL IN HERE", "Ends up in: count.py", "Language: py"):
+              self.assertIn(want, out)
+          self.assertNotIn("say hello", out.split("=== the chunk")[1].split("=== the tangled")[0])
+
+      def test_fill_inserts_code_keeps_the_hint_as_prose_and_the_program_tangles(self):
+          code, out = run("fill", "p.lit", "--only", "0", "--agent", agent(say(GOOD)), cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertIn("return the sum of 1..n with a for loop", self.lit())
+          self.assertEqual(self.lit().count("#agent-fill-in"), 1)
+          code, out = run("tangle", "p.lit", "out", cwd=self.d)
+          self.assertEqual(code, 0, out)
+          ns = subprocess.run([sys.executable, os.path.join(self.d, "out", "count.py")], capture_output=True, text=True)
+          self.assertEqual(ns.stdout.strip(), "6", ns.stdout + ns.stderr)
+
+      def test_a_placeholder_is_rejected_and_the_agent_gets_the_error_on_retry(self):
+          body = "print(%r if 'rejected' not in p else %r)" % (FENCE + "\n# TODO\n" + FENCE, GOOD)
+          code, out = run("fill", "p.lit", "--only", "0", "--agent", agent(body), cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertIn("attempt 1 failed", out)
+          self.assertNotIn("TODO", self.lit())
+
+      def test_a_syntax_error_is_never_written(self):
+          code, out = run("fill", "p.lit", "--only", "0", "--retries", "0", "--agent", agent(say(FENCE + "\nreturn (\n" + FENCE)), cwd=self.d)
+          self.assertNotEqual(code, 0)
+          self.assertEqual(self.lit(), PROG)
+
+      def test_cannot_leaves_the_program_alone(self):
+          code, out = run("fill", "p.lit", "--only", "0", "--agent", agent(say("CANNOT: no idea")), cwd=self.d)
+          self.assertNotEqual(code, 0)
+          self.assertIn("no idea", out)
+          self.assertEqual(self.lit(), PROG)
+
+      def test_check_command_runs_on_the_tangled_program_and_can_veto(self):
+          body = say(GOOD)
+          code, out = run("fill", "p.lit", "--only", "0", "--retries", "0", "--check-each", "--check", "false", "--agent", agent(body), cwd=self.d)
+          self.assertNotEqual(code, 0)
+          self.assertEqual(self.lit(), PROG)
+          code, out = run("fill", "p.lit", "--only", "0", "--check-each", "--check", "python3 count.py | grep -q 6", "--agent", agent(body), cwd=self.d)
+          self.assertEqual(code, 0, out)
+
+      def test_all_hints_filled_in_order_and_each_fill_sees_the_previous(self):
+          body = "print('```\\nreturn 1\\n```' if 'say hello' not in p else '```\\nprint(\"hello\")\\n```')"
+          code, out = run("fill", "p.lit", "--agent", agent(body), cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertIn("0 hint(s) still open", out)
+
+      def test_review_lists_approves_and_rejects(self):
+          body = say(GOOD)
+          run("fill", "p.lit", "--only", "0", "--agent", agent(body), cwd=self.d)
+          code, out = run("review", "p.lit", "--full", "--check", "python3 count.py", cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertIn("pending", out)
+          self.assertIn("checks passed", out)
+          fid = json.loads(rd(self.d, "p.lit.fills.jsonl").split("\n")[0])["id"]
+          code, out = run("review", "p.lit", "--ai", "--agent", agent(say("VERDICT: reject\n- wrong")), cwd=self.d)
+          self.assertEqual(code, 1, out)
+          code, out = run("review", "p.lit", "--reject", fid, cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertEqual(self.lit().count("#agent-fill-in"), 2)
+          self.assertEqual(self.lit(), PROG.replace("{ return the sum", "{ return the sum"))
+          code, out = run("review", "p.lit", cwd=self.d)
+          self.assertIn("nothing to review", out)
+
+      def test_approve_all_marks_pending_fills(self):
+          body = say(FENCE + "\nreturn 1\n" + FENCE)
+          run("fill", "p.lit", "--agent", agent(body), cwd=self.d)
+          code, out = run("review", "p.lit", "--approve-all", cwd=self.d)
+          self.assertEqual(code, 0, out)
+          code, out = run("review", "p.lit", "--json", cwd=self.d)
+          self.assertEqual(json.loads(out), [])
+          code, out = run("review", "p.lit", "--all", "--json", cwd=self.d)
+          self.assertEqual([f["status"] for f in json.loads(out)], ["approved", "approved"])
+
+      def test_tangle_and_weave_leave_hints_out_and_say_so(self):
+          code, out = run("tangle", "p.lit", "out", cwd=self.d)
+          self.assertIn("2 #agent-fill-in hint(s) still open", out)
+          code, out = run("weave", "p.lit", "-o", "w", "--only", "html", cwd=self.d)
+          self.assertEqual(code, 0, out)
+          self.assertIn("to be filled in by an agent", rd(self.d, "w", "p.html"))
+
+
+  if __name__ == "__main__":
+      unittest.main(verbosity=1)
+  ````
+}

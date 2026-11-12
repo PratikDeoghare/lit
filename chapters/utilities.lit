@@ -1,0 +1,210 @@
+#h1{Appendix: small utilities}
+
+Small functions that a reader could write from their names, each defined here and used in the
+chapter named above it.
+
+#h2{From: Rendering: weave}
+
+#weave: the command{
+  The command parses the whole program, builds the document, and writes `NAME.html` and `NAME.tex`
+  beside each other, or only one with `--only`. The old `--highlight` flag is accepted and
+  ignored: the output is plain text so that it stays readable as source.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"os"
+  	"path/filepath"
+  	"strings"
+  )
+
+  var weaveSpec = Spec{
+  	Opts:  map[string]bool{"outdir": true, "only": true, "mathjax": true, "highlight": false},
+  	Short: map[string]string{"o": "outdir"},
+  }
+
+  // Weave turns a program into interlinked HTML (MathJax) and LaTeX.
+  func Weave(argv []string, io IO) int {
+  	a, err := ParseArgs(argv, weaveSpec)
+  	if err != nil || len(a.Pos) != 1 {
+  		fmt.Fprintln(io.Err, "usage: lit weave SOURCE.lit [-o OUTDIR] [--only html|tex] [--mathjax URL]")
+  		return 2
+  	}
+  	only := a.Get("only", "")
+  	if only != "" && only != "html" && only != "tex" {
+  		fmt.Fprintln(io.Err, "weave: --only is html or tex")
+  		return 2
+  	}
+  	src, err := ReadSource(a.Pos[0])
+  	if err != nil {
+  		fmt.Fprintln(io.Err, "weave: "+err.Error())
+  		return 2
+  	}
+  	root, err := src.Parse()
+  	if err != nil {
+  		fmt.Fprintln(io.Err, "weave: "+err.Error())
+  		return 2
+  	}
+  	name := filepath.Base(a.Pos[0])
+  	doc := NewDoc(root, name, src.Base, io.Err)
+  	outdir := a.Get("outdir", ".")
+  	if err := os.MkdirAll(outdir, 0o755); err != nil {
+  		fmt.Fprintln(io.Err, "weave: "+err.Error())
+  		return 2
+  	}
+  	stem := filepath.Join(outdir, strings.TrimSuffix(name, filepath.Ext(name)))
+  	if only != "tex" {
+  		w := &htmlWeaver{doc, a.Get("mathjax", mathJax)}
+  		if err := os.WriteFile(stem+".html", []byte(w.render()), 0o644); err != nil {
+  			fmt.Fprintln(io.Err, "weave: "+err.Error())
+  			return 2
+  		}
+  		fmt.Fprintf(io.Out, "wrote %s.html  (%d chunks, %d citations)\n", stem, len(doc.defs), len(doc.citeNo))
+  	}
+  	if only != "html" {
+  		w := newTexWeaver(doc, outdir, func(s string) { fmt.Fprint(io.Err, s) })
+  		if err := os.WriteFile(stem+".tex", []byte(w.render()), 0o644); err != nil {
+  			fmt.Fprintln(io.Err, "weave: "+err.Error())
+  			return 2
+  		}
+  		fmt.Fprintf(io.Out, "wrote %s.tex   -> compile with:  xelatex %s.tex   (twice; pdflatex cannot read all of Unicode)\n", stem, filepath.Base(stem))
+  	}
+  	return 0
+  }
+  ```
+}
+
+#h2{From: Gaps for the assistant: hints and agents}
+
+#hints: describing a gap{
+  A gap is shown as its number, its chunk and its words, which is all a person needs to choose one
+  to fill.
+
+  ```
+  // Describe is the hint as one line for lists.
+  func (h HintSite) Describe() string {
+  	t := h.Text
+  	if t == "" {
+  		t = "(no description)"
+  	}
+  	return fmt.Sprintf("%s:%d  «%s»  %s", h.File, h.Line, h.Chunk, trunc(t, 80))
+  }
+  ```
+}
+
+#h2{From: Gaps for the assistant: the context}
+
+#context: small helpers{
+  Helpers that indent a block, fall back to a word for an empty section and return the
+  introduction and the prose of the section that holds a gap.
+
+  ```
+  func orNone(s string) string {
+  	if s == "" {
+  		return "(the author gave no description; infer it from the surroundings)"
+  	}
+  	return s
+  }
+
+  func indentBlock(s, ind string) string {
+  	if ind == "" || s == "" {
+  		return s
+  	}
+  	return ind + strings.ReplaceAll(s, "\n", "\n"+ind)
+  }
+
+  // introText is the prose before the first chunk of the document, or of its first section.
+  func (d *Doc) introText() string {
+  	var out []string
+  	for _, it := range d.root.items {
+  		if it.kind == "chunk" {
+  			break
+  		}
+  		if it.kind == "prose" {
+  			out = append(out, d.proseOf(&chunk{items: []*item{it}}))
+  		}
+  	}
+  	return strings.Join(out, "\n\n")
+  }
+
+  // sectionProse is the prose of the document-level section the hint falls in (up to the next heading).
+  func (d *Doc) sectionProse(target *item) string {
+  	var cur []string
+  	var all []pair = walk(d.root)
+  	for _, p := range all {
+  		switch {
+  		case p.it.kind == "head":
+  			cur = nil
+  		case p.it.kind == "prose" && p.c == d.root:
+  			cur = append(cur, d.proseOf(&chunk{items: []*item{p.it}}))
+  		case p.it == target:
+  			return strings.Join(cur, "\n\n")
+  		}
+  	}
+  	return ""
+  }
+  ```
+}
+
+#h2{From: Gaps for the assistant: sanity checks}
+
+#check: findings{
+  A check returns findings, each an error or a warning with a message. A program is rejected on an
+  error and passes on warnings, which are for people to read.
+
+  ```
+  package lit
+
+  import (
+  	"bytes"
+  	"encoding/json"
+  	"fmt"
+  	"go/parser"
+  	"go/scanner"
+  	"go/token"
+  	"os"
+  	"os/exec"
+  	"path/filepath"
+  	"regexp"
+  	"runtime"
+  	"sort"
+  	"strings"
+  	"time"
+  )
+
+  // A Finding is one result of a check. Level is "error" (the program is broken), "warn" (look at it) or "ok".
+  type Finding struct {
+  	Level string
+  	Msg   string
+  }
+
+  func (f Finding) String() string { return f.Level + ": " + f.Msg }
+
+  func hasError(fs []Finding) bool {
+  	for _, f := range fs {
+  		if f.Level == "error" {
+  			return true
+  		}
+  	}
+  	return false
+  }
+
+  // spotOf says where a line of a generated file comes from: "file:line" of the program, or "program line N"
+  // when the text being checked is not on disk.
+  func spotOf(src *Source, text string, m *Map, file string, line int) string {
+  	e, ok := m.Files[file]
+  	org := e.Origins()
+  	if !ok || line < 1 || line > len(org) {
+  		return fmt.Sprintf("%s:%d", file, line)
+  	}
+  	o := org[line-1]
+  	off := m.Blocks[o.Block].Lines[o.Line][0]
+  	if src != nil && src.Text == text {
+  		return fmt.Sprintf("%s (%s)", src.Where(off), file+":"+fmt.Sprint(line))
+  	}
+  	return fmt.Sprintf("program line %d (%s:%d)", strings.Count(text[:min(off, len(text))], "\n")+1, file, line)
+  }
+  ```
+}

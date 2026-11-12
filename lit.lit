@@ -1,0 +1,79 @@
+#h1{lit: a literate program that tangles itself}
+
+This document is the source of `lit`, the one program that reads, writes and maintains documents
+like it. It is a literate program in brashtag notation, the notation it implements: tangling it
+produces the Go sources, the skill that teaches an assistant to use them, the tests and a build
+script; weaving it produces the document you are reading. A program that tangles itself needs a
+place to start, and that is the bootstrap described in the chapter on the build. The document is
+long, so it is split over files, one chapter for each tool or subsystem, with this file as the
+root that introduces them.
+
+The design follows from one decision about what a literate source is. A tangled file is a
+function of the document, so the document is the source of truth, but people edit generated
+files all the time. The tools therefore treat the pair (document, generated files) as one thing
+that can be edited at either end. Everything after tangle exists to keep that honest: a
+sourcemap, so that a place in one is a place in the other; absorb, which folds an edit of a
+generated file back into the document; and a three-way merge, which reconciles edits made on
+both sides.
+
+Two consequences shape how the tools are meant to be used, and they are the reason the toolkit
+exists in this form. First, the only thing that has to be agreed upon is the tangled output. The
+narrative is a matter of taste, and with an assistant to write it, anybody can make a literate
+fork of an existing codebase, organised the way they like to read it, without asking the project
+to change anything. Making an existing codebase literate is therefore a job for the assistant,
+and the document is a personal view of the code. Second, not everybody wants to work literate,
+and nobody has to: a teammate keeps editing the generated files in their own editor, and absorb
+carries those edits into the fork. The fork follows the project; the project does not follow the
+fork.
+
+A third idea closes the loop: the author can leave a gap in a chunk, marked
+`#agent-fill-in{...}` with a sentence on what the code must do, and the toolkit gathers the
+context of the gap from the whole document, asks an assistant for the code, checks it, writes it
+in and records it for review. The ideas come from the literature on literate programming
+#cite{knuth1984lp}, in particular its minimal, language-independent descendants
+#cite{ramsey1994lp}, from the diff and merge literature #cite{myers1986diff}
+#cite{khanna2007diff3}, and from the reason a CRDT was considered and rejected for the
+synchronisation #cite{shapiro2011crdt}.
+
+The program is a single binary written in Go, using only the standard library and the brashtag
+parser, which is compiled in. There is nothing to install but the binary, and nothing that has
+to be running on the machine but the operating system. The skill that teaches an assistant the
+notation carries the same tools a second time, as Python scripts that use only Python's standard
+library, because an assistant finds Python already present and a binary it would have to fetch;
+the Go program is for people, the scripts are for assistants, and the build checks that they
+agree.
+
+This file is the root. Each chapter is a file of its own, listed here in the order in which it
+is best read: the ideas and the tools first, the plain details in an appendix at the end. A tool
+that is given this file reads them all as one text.
+
+#include{chapters/overview.lit}
+#include{chapters/history.lit}
+#include{chapters/notation.lit}
+#include{chapters/source.lit}
+#include{chapters/tangle.lit}
+#include{chapters/sourcemap.lit}
+#include{chapters/absorb.lit}
+#include{chapters/addr.lit}
+#include{chapters/sync-library.lit}
+#include{chapters/sync.lit}
+#include{chapters/watch.lit}
+#include{chapters/weave.lit}
+#include{chapters/lint.lit}
+#include{chapters/hints.lit}
+#include{chapters/context.lit}
+#include{chapters/check.lit}
+#include{chapters/fill.lit}
+#include{chapters/review.lit}
+#include{chapters/py-fill-review.lit}
+#include{chapters/tests.lit}
+#include{chapters/build.lit}
+#include{chapters/appendix.lit}
+#include{chapters/details.lit}
+#include{chapters/install-cli.lit}
+#include{chapters/parser.lit}
+#include{chapters/py-scripts.lit}
+#include{chapters/skill.lit}
+#include{chapters/landing-page.lit}
+#include{chapters/utilities.lit}
+#include{chapters/references.lit}

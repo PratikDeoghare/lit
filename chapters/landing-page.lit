@@ -1,0 +1,3391 @@
+#h1{Appendix: the landing page}
+
+The page that introduces these tools is a program too: one self-contained HTML file with its
+style, its script, its examples and the recorded output of the tools, and it is built from this
+chapter. Tangling the document writes the pieces under `web/`; the page builder in this chapter,
+a small Go program, glues them into `landing.html`. So the document that explains the tools also
+explains, and produces, the page that explains the document.
+
+The page has a live half. A small JavaScript port of the same rules (the core below) runs in the
+reader's browser on the JavaScript build of the brashtag parser, so the editors on the page
+tangle, trace, absorb and merge as the Go tools do. The port covers one text at a time, so the
+live editors do not follow `#include`; chapters are explained on the page, and demonstrated with
+real output from the Python tools.
+
+The build needs the brashtag parser as a JavaScript module. The builder copies it into the page
+inline, so the page makes no request other than for fonts and, after first paint, for MathJax.
+
+#h2{Assembling the page}
+
+The builder is a small Go program, built next to `lit`. It reads the pieces, runs the
+transcripts through a small parser, replaces the placeholders in the body, and writes one file.
+
+#page build: transcripts{
+  The recorded runs, t1 to t8, are plain text: a line that starts with a dollar sign begins a
+  command, the lines after it are its output, and a line `[exit N]` ends it. The home directory is
+  replaced by a tilde, so that the recordings do not say where they were made.
+
+  ```
+  // Command mkpage builds the landing page, one self-contained HTML file, from the pieces tangled into web/.
+  //
+  //	cd web && BRASHTAG_JS=path/to/parser.js LIT_STATS="$(lit lint ../book.lit | tail -n 1)" mkpage > landing.html
+  //
+  // It needs nothing but the standard library.
+  package main
+
+  import (
+  	"fmt"
+  	"html"
+  	"os"
+  	"path/filepath"
+  	"regexp"
+  	"strconv"
+  	"strings"
+  )
+
+  var (
+  	escText = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+  	escAttr = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#x27;")
+  )
+
+  func esc(s string) string { return escText.Replace(s) }
+
+  func read(path string) string {
+  	b, err := os.ReadFile(path)
+  	if err != nil {
+  		fatal("%v", err)
+  	}
+  	return string(b)
+  }
+
+  func fatal(f string, a ...any) {
+  	fmt.Fprintf(os.Stderr, "mkpage: "+f+"\n", a...)
+  	os.Exit(1)
+  }
+
+  // A run is one recorded command: what was typed, what it printed and how it ended.
+  type run struct {
+  	cmd  string
+  	out  []string
+  	code int
+  	has  bool
+  }
+
+  var (
+  	homeRe = regexp.MustCompile(`/[^\s'"]*/home\b`)
+  	exitRe = regexp.MustCompile(`^\[exit (\d+)\]$`)
+  )
+
+  // scrub: the recorded runs used a scratch home directory; show it as ~.
+  func scrub(s string) string { return homeRe.ReplaceAllString(s, "~") }
+
+  // transcripts reads t1.txt .. t9.txt: a line that starts with "$ " begins a command, the lines after it are its
+  // output, and a line "[exit N]" ends it. Lines that start with "# (" are comments for the reader of the file.
+  func transcripts() map[string]*run {
+  	T := map[string]*run{}
+  	for n := 1; n <= 9; n++ {
+  		var cur *run
+  		for _, line := range strings.Split(read(fmt.Sprintf("tut/t%d.txt", n)), "\n") {
+  			switch {
+  			case strings.HasPrefix(line, "$ "):
+  				cur = &run{cmd: line[2:]}
+  				T[fmt.Sprintf("t%d:%s", n, cur.cmd)] = cur
+  			case strings.HasPrefix(line, "# ("):
+  				cur = nil
+  			case cur != nil:
+  				if m := exitRe.FindStringSubmatch(line); m != nil {
+  					cur.code, _ = strconv.Atoi(m[1])
+  					cur.has = true
+  					cur = nil
+  				} else {
+  					cur.out = append(cur.out, line)
+  				}
+  			}
+  		}
+  	}
+  	return T
+  }
+
+  func trimTrailingBlank(l []string) []string {
+  	for len(l) > 0 && l[len(l)-1] == "" {
+  		l = l[:len(l)-1]
+  	}
+  	return l
+  }
+
+  func termBlock(cmd string, out string, badge string) string {
+  	s := fmt.Sprintf(`<div class="term"><button class="btn copy" data-copy="%s">Copy</button><pre><span class="p">$ </span><span class="c">%s</span>`, escAttr.Replace(cmd), esc(cmd))
+  	if out != "" {
+  		s += fmt.Sprintf("\n"+`<span class="o">%s</span>`, esc(scrub(out)))
+  	}
+  	return s + "</pre>" + badge + "</div>"
+  }
+
+  func term(T map[string]*run, key, shown string) string {
+  	r, ok := T[key]
+  	if !ok {
+  		fatal("no transcript %s", key)
+  	}
+  	out := trimTrailingBlank(append([]string(nil), r.out...))
+  	cmd := r.cmd
+  	if shown != "" {
+  		cmd = shown
+  	}
+  	badge := ""
+  	if r.code != 0 && strings.HasPrefix(cmd, "lit ") {
+  		badge = fmt.Sprintf(`<span class="exit">exit %d</span>`, r.code)
+  	}
+  	return termBlock(cmd, strings.Join(out, "\n"), badge)
+  }
+
+  func codefile(text, name string) string {
+  	n := len(strings.Split(strings.TrimRight(text, "\n"), "\n"))
+  	if strings.TrimSpace(text) == "" {
+  		n = 0
+  	}
+  	return fmt.Sprintf(`<div class="codefile"><div class="file-head"><span>%s</span><span>%d lines</span></div><pre>%s</pre></div>`, esc(name), n, esc(strings.TrimRight(text, "\n")))
+  }
+
+  // pick rebuilds the interactive session of `lit sync pick`: the recording ran without a terminal, so the answers
+  // the tutorial gives are put after the prompts, and the closing line comes from the run that wrote the files.
+  func pick(T map[string]*run) string {
+  	r, ok := T["t6:lit sync invoice.lit pick"]
+  	r2, ok2 := T["t7:lit sync invoice.lit pick"]
+  	if !ok || !ok2 {
+  		fatal("no transcripts of lit sync pick")
+  	}
+  	answers := []string{"y", "n"}
+  	var res []string
+  	for _, l := range r.out {
+  		switch {
+  		case strings.HasPrefix(l, "apply to the") && strings.HasSuffix(l, "> "):
+  			l += answers[0]
+  			answers = answers[1:]
+  		case strings.HasPrefix(l, "Write these changes? [y/n] > nothing written."):
+  			l = "Write these changes? [y/n] > y"
+  		}
+  		res = append(res, l)
+  	}
+  	last := ""
+  	for _, l := range r2.out {
+  		if strings.HasPrefix(l, "synced.") {
+  			last = l
+  			break
+  		}
+  	}
+  	res = trimTrailingBlank(append(res, "", last))
+  	return termBlock("lit sync invoice.lit pick", strings.Trim(strings.Join(res, "\n"), "\n"), "")
+  }
+
+  var (
+  	placeholder = regexp.MustCompile(`\[\[(.+?)\]\]`)
+  	prologRe    = regexp.MustCompile(`(?s)<\?xml.*?\?>|<!DOCTYPE.*?>`)
+  )
+  ```
+}
+
+#page build: placeholders{
+  The tutorial text and the chapters section of the body are written with placeholders in double
+  brackets: a figure with a caption, a terminal block showing a recorded run, a file block, and
+  the picker. The builder replaces them with the recorded output or the text of the file.
+
+  ```
+  func expand(T map[string]*run, t string) string {
+  	return placeholder.ReplaceAllStringFunc(t, func(m string) string {
+  		tok := m[2 : len(m)-2]
+  		if tok == "pick" {
+  			return pick(T)
+  		}
+  		kind, rest, _ := strings.Cut(tok, ":")
+  		switch kind {
+  		case "term":
+  			key, shown, _ := strings.Cut(rest, "|")
+  			return term(T, key, shown)
+  		case "svg":
+  			f, cap, ok := strings.Cut(rest, "|")
+  			if !ok {
+  				fatal("bad svg placeholder %s", tok)
+  			}
+  			s := strings.TrimSpace(prologRe.ReplaceAllString(read(f), ""))
+  			s = strings.Replace(s, "<svg", `<svg role="img" aria-label="`+html.EscapeString(cap)+`"`, 1)
+  			return fmt.Sprintf(`<figure class="diagram"><div class="scroll">%s</div><figcaption>%s</figcaption></figure>`, s, esc(cap))
+  		case "cmd":
+  			return termBlock(rest, "", "")
+  		case "code":
+  			p := strings.Split(rest, ":")
+  			if len(p) != 2 {
+  				fatal("bad code placeholder %s", tok)
+  			}
+  			return codefile(read("tut/"+p[0]), p[1])
+  		case "file":
+  			p := strings.Split(rest, ":")
+  			if len(p) != 4 {
+  				fatal("bad file placeholder %s", tok)
+  			}
+  			a, _ := strconv.Atoi(p[1])
+  			z, _ := strconv.Atoi(p[2])
+  			L := strings.Split(read("tut/"+p[0]), "\n")
+  			return codefile(strings.Join(L[a-1:z], "\n"), p[3]+" (excerpt)")
+  		}
+  		fatal("unknown placeholder %s", tok)
+  		return ""
+  	})
+  }
+  ```
+}
+
+#page build: numbers and parser{
+  The numbers about the program itself come from the linter's summary line, so the page states
+  what the document is, not what it was. The parser is inlined as plain script.
+
+  ```
+  var statsRe = regexp.MustCompile(`(\d+) chunks, (\d+) code lines, (\d+) words of prose.*?(\d+) error\(s\), (\d+) warning\(s\)`)
+
+  func commas(n int) string {
+  	s := strconv.Itoa(n)
+  	for i := len(s) - 3; i > 0; i -= 3 {
+  		s = s[:i] + "," + s[i:]
+  	}
+  	return s
+  }
+
+  // inlineParser makes the JavaScript build of the brashtag parser usable as plain script: the export keyword goes,
+  // and the parser's error for a stray opening brace gets the rest of the text, so the page can say where it is.
+  func inlineParser(path string) string {
+  	s := strings.ReplaceAll(read(path), "export ", "")
+  	old := "error: \"unexpected {\"\n        };"
+  	if !strings.Contains(s, old) {
+  		fatal("%s: the parser's error for an unexpected { has changed; update inlineParser", path)
+  	}
+  	return strings.Replace(s, old, "error: \"unexpected {\",\n          rest: text.slice(j)\n        };", 1)
+  }
+  ```
+}
+
+#page build: assembly{
+  Assembly puts the tutorial and the install text into the body, expands the placeholders, adds
+  the examples and writes one file to the standard output. With `--parser-only` it prints the
+  inlined parser, for the tests that run in Node.
+
+  ```
+  var presetNames = []struct{ id, name, file string }{
+  	{"merge", "Merge sort", "merge_sort.lit"}, {"twice", "Same name twice", "imports.lit"}, {"files", "One chunk, two files", "hello.lit"},
+  	{"escape", "Escape a reference", "notation.lit"}, {"math", "Math and a citation", "softmax.lit"}, {"oops", "Break it", "oops.lit"},
+  	{"lab", "lab", "tip.lit"},
+  }
+
+  func main() {
+  	css, body := read("page.css"), read("page.body.html")
+  	T := transcripts()
+  	body = strings.Replace(body, "[[TUTORIAL]]", read("tutorial.html"), 1)
+  	body = strings.Replace(body, "[[INSTALL]]", read("install.html"), 1)
+  	body = expand(T, body)
+  	// numbers about the program itself: the build passes the linter's summary line in LIT_STATS
+  	if m := statsRe.FindStringSubmatch(os.Getenv("LIT_STATS")); m != nil {
+  		n := make([]int, 5)
+  		for i := range n {
+  			n[i], _ = strconv.Atoi(m[i+1])
+  		}
+  		for _, kv := range [][2]string{{"__CHUNKS__", commas(n[0])}, {"__CODE__", commas(n[1])}, {"__PROSE__", commas(n[2])}, {"__LINT__", fmt.Sprintf("%d error(s), %d warning(s)", n[3], n[4])}} {
+  			body = strings.ReplaceAll(body, kv[0], kv[1])
+  		}
+  	} else {
+  		for _, k := range []string{"__CHUNKS__", "__CODE__", "__PROSE__", "__LINT__"} {
+  			body = strings.ReplaceAll(body, k, "…")
+  		}
+  	}
+  	var pre strings.Builder
+  	for _, p := range presetNames {
+  		t := read(filepath.Join("presets", p.id+".lit"))
+  		if strings.Contains(t, "</script") {
+  			fatal("preset %s contains </script", p.id)
+  		}
+  		fmt.Fprintf(&pre, "<script type=\"text/plain\" data-preset=\"%s\" data-id=\"%s\" data-file=\"%s\">\n%s</script>\n", p.name, p.id, p.file, t)
+  	}
+  	parser := os.Getenv("BRASHTAG_JS")
+  	if parser == "" {
+  		parser = "node_modules/brashtag/parser.js"
+  	}
+  	core := inlineParser(parser) + "\n" + read("core.js") + "\n" + read("ui.js")
+  	if len(os.Args) > 1 && os.Args[1] == "--parser-only" {
+  		fmt.Print(inlineParser(parser))
+  		return
+  	}
+  	fmt.Printf(`<title>Brashtag Literate</title>
+  <meta name="claude:viewport-fit-sides" content="cover">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=Young+Serif&display=swap">
+  <style>
+  %s
+  </style>
+  %s
+  %s
+  <script>
+  (function(){
+  "use strict";
+  %s
+  })();
+  </script>
+  `, css, body, pre.String(), core)
+  }
+  ```
+}
+
+#cmd/mkpage/main.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<page build: transcripts>>>
+
+  <<<page build: placeholders>>>
+
+  <<<page build: numbers and parser>>>
+
+  <<<page build: assembly>>>
+  ```
+}
+
+#h2{The page's text}
+
+The body is plain HTML in sections, with two placeholders that the builder fills in. Each
+section is a chunk, in reading order.
+
+#page: top bar and hero{
+  The top bar, the lamp that switches between light and dark, and the hero: the pitch, the install
+  line, and a sentence that says what runs in the browser.
+
+  ```
+  <header class="top wrap">
+    <a class="mark" href="#top" id="top"><b>#</b>brashtag<b>{</b>literate<b>}</b></a>
+    <nav aria-label="Sections"><a href="#understand">Why</a><a href="#agents">Gaps</a><a href="#notation">Notation</a><a href="#chapters">Chapters</a><a href="#scenario">Sync lab</a><a href="#tutorial">Tutorial</a><a href="#install">Install</a></nav>
+    <button class="lamp" id="lamp" aria-label="Switch the lamp: light or dark" title="Light or dark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/></svg>
+    </button>
+  </header>
+
+  <main class="wrap">
+    <section class="hero">
+      <span class="label">Brashtag · a notation for trees · a literate programming toolkit</span>
+      <h1>Write the story. The <em>code</em> falls out.</h1>
+      <p class="lede">Brashtag is a very small notation for writing trees: you surround text with hints that programs can use later. This page shows one thing built on it, literate programming, and the tools around it. You keep one document that explains the program, while your team goes on editing the code the ordinary way, in any editor. Everything is one program, <code>lit</code>: a single binary with nothing to install around it.</p>
+      <div class="install">
+        <div class="cmd"><code>lit install-skill</code><button class="btn" data-copy="lit install-skill">Copy</button></div>
+        <a class="btn primary" href="#tutorial" style="text-decoration:none;padding:.5rem 1rem">Follow the tutorial</a><a class="btn" href="#notation" style="text-decoration:none;padding:.5rem 1rem">See the notation</a>
+      </div>
+      <p class="small-note">Everything on this page runs in your browser, on the JavaScript build of the brashtag parser. The editors are live: what they print follows the same rules as the <code>lit</code> binary.</p>
+    </section>
+  ```
+}
+
+#page: what the tools add{
+  The four things the tools add to literate programming: absorb, sync, sourcemaps, and the
+  notation itself.
+
+  ```
+    <section class="block" id="new">
+      <div class="intro">
+        <h2>What the tools add</h2>
+        <p>Literate programming has a known weak spot: the moment someone edits the generated code, the document is out of date. These pieces are about that moment.</p>
+      </div>
+      <div class="feats">
+        <div class="feat"><h3>Your own literate fork</h3><p>Nobody has to agree on a narrative. With an assistant, anyone can turn a codebase into their own literate version, written the way they want to read it, and customise it as they like. The one thing that is shared is the tangled output: the code.</p><a href="#understand">How it works</a></div>
+        <div class="feat"><h3>Gaps for an assistant</h3><p>Leave <code>#agent-fill-in{what this must do}</code> inside a chunk. <code>lit fill</code> gathers the context from the whole document, asks an assistant for the code, checks it and writes it in. <code>lit review</code> checks it again.</p><a href="#agents">See a run</a></div>
+        <div class="feat"><h3>Not everyone has to be literate</h3><p>Be the literate programmer while your team works on the code in the traditional way: absorb. Their edits to a generated file are folded back into your document, into the right chunk, with the right indentation.</p><a href="#scenario">Try it in the lab</a></div>
+        <div class="feat"><h3>Sync</h3><p>Edit the document and the code on the same day. A three-way merge against the last agreed state brings every separate change across, both ways, and asks you only about real conflicts. Nothing is lost; replaced edits are kept.</p><a href="#scenario">Try it in the lab</a></div>
+        <div class="feat"><h3>Sourcemaps</h3><p>Tangle records where every generated line came from. Ask in either direction: this line of <code>app.py</code>, which line of the document wrote it? This line of the document, where does it end up? Absorb and sync are built on the same map.</p><a href="#try">Hover a line</a></div>
+        <div class="feat"><h3>A notation that goes further</h3><p>Brashtag is small enough to learn in a minute and powerful enough to write tools with. Literate programming is one use. The same trees drive flashcards, HTML pages and diagrams.</p><a href="#notation">See the notation</a></div>
+        <div class="feat"><h3>Any editor</h3><p>A document is plain text and the tools are one command-line program, so there is no plugin to install and no editor to switch to. Addresses come out as path, line and column, the form editors and grep already read.</p><a href="#tools">See the tools</a></div>
+      </div>
+    </section>
+  ```
+}
+
+#page: getting the understanding back{
+  The reason to convert a codebase, the four-step workflow that uses the skill, and a prompt that
+  works.
+
+  ```
+    <section class="block" id="understand">
+      <div class="intro">
+        <h2>Get the understanding back</h2>
+        <p>Agents write code faster than people read it, and old code outlives the people who understood it. Either way you end up owning a program you can run but cannot explain. Claude can read a codebase and write the explanation down, so make the explanation the program. This works on legacy code too: the tutorial below starts from a script with no comments worth the name.</p>
+        <p>It also means you do not have to adopt anyone else's explanation. A literate version is a <b>fork</b> that costs one prompt: you can have your own, in your own order and your own words, and a colleague can have a different one of the same code. Because tangling is a function of the document, every fork produces the same files, so the tangled output is the only thing that has to be agreed upon. And nobody is obliged to work in the document at all: a teammate who edits the generated code is folded in by absorb.</p>
+      </div>
+      <ol class="flow">
+        <li><h3>Install the skill</h3><p>The binary carries the skill inside it; one command puts it where Claude looks.</p><div class="cmd"><code>lit install-skill</code><button class="btn" data-copy="lit install-skill">Copy</button></div></li>
+        <li><h3>Ask Claude to literate it</h3><p>Point it at a file, a module or a whole codebase. It reads the code, plans a narrative, and cuts the code into named chunks without changing a line.</p></li>
+        <li><h3>Read it, and check it</h3><p>Weave gives you a page to read in the order that teaches the code. Tangle writes the code back, and a diff against the original comes out empty. The explanation is Claude's reading, so review it as you would a pull request. Where the code does not say why, the document lists an open question.</p></li>
+        <li><h3>Work in it</h3><p>Edit the document. Teammates and agents can keep editing the code the usual way. Absorb and sync carry changes across, so the document stays true.</p></li>
+      </ol>
+      <div class="prompt">
+        <span class="label">A prompt that works</span>
+        <p id="promptText">Use the brashtag-literate skill. Turn invoice.py into invoice.lit. Keep every line of code exactly as it is, explain what each part does and why, and list anything you could not tell from the code as an open question. Do not change behaviour.</p>
+        <button class="btn" data-copy="Use the brashtag-literate skill. Turn invoice.py into invoice.lit. Keep every line of code exactly as it is, explain what each part does and why, and list anything you could not tell from the code as an open question. Do not change behaviour.">Copy</button>
+      </div>
+    </section>
+  ```
+}
+
+#page: the notation{
+  Brashtag in its own terms: bag, blob and code, shown on a tree the reader can edit.
+
+  ```
+    <section class="block" id="notation">
+      <div class="intro">
+        <h2>Brashtag: a tree in plain text</h2>
+        <p>There are three kinds of node. A <b>blob</b> holds text. A <b>bag</b> holds blobs, codes and other bags, and can be tagged. A <b>code</b> holds text too, but is shielded: anything between its ticks is taken literally. Edit the text below and watch the tree it makes.</p>
+      </div>
+      <div class="kinds">
+        <div class="kind-card"><span class="nk blob">blob</span><p>Plain text. Any text except <code>#</code>, <code>{</code>, <code>}</code> and the tick character.</p></div>
+        <div class="kind-card"><span class="nk bag">bag</span><p>A hash, a tag, braces, and whatever is inside: <code>#card{ ... }</code>. Bags nest.</p></div>
+        <div class="kind-card"><span class="nk code">code</span><p>Text between runs of ticks, for anything that would otherwise be read as notation. Use more ticks than the longest run inside. Three is usually enough, but one or two or ten are all valid.</p></div>
+      </div>
+      <div class="chips" id="treeChips" role="group" aria-label="Tree examples"></div>
+      <div class="panes">
+        <div class="pane">
+          <div class="pane-head"><span>any text</span><span class="sp" id="treeStatus"></span></div>
+          <textarea id="treeSrc" class="plain" spellcheck="false" wrap="off" aria-label="Brashtag text"></textarea>
+        </div>
+        <div class="pane">
+          <div class="pane-head"><span>the tree</span></div>
+          <div class="outbody" id="treeOut" style="height:18rem"></div>
+        </div>
+      </div>
+      <p class="small-note" style="margin-top:.9rem">The parser is the one in the <a href="https://github.com/PratikDeoghare/brashtag">brashtag repository</a>; this page runs its JavaScript build. Programs written on it include a Markdown-like converter to HTML, a flashcard program and a tree-to-Graphviz tool. The repository also has an Emacs mode.</p>
+    </section>
+  ```
+}
+
+#page: the playground{
+  The live editor: a document on the left, the files it tangles to, the chunks, and the woven page
+  on the right, with tracing between the two.
+
+  ```
+    <section class="block" id="try">
+      <div class="intro">
+        <h2>Literate programming on top</h2>
+        <p>Now give the nodes meaning. In this toolkit a bag is a chunk of the program, a code node is program text, and a reference line pastes one chunk into another. Left is a <code>.lit</code> file. Right is what tangle writes. Hover a generated line and the line that produced it lights up in the document. Put your cursor in the document and its output lights up on the right. That two-way map is the sourcemap behind <code>addr.py</code> and <code>absorb.py</code>.</p>
+      </div>
+      <div class="chips" id="presets" role="group" aria-label="Examples"></div>
+      <div class="panes">
+        <div class="pane">
+          <div class="pane-head"><span id="srcName">merge_sort.lit</span><span class="sp" id="srcStatus"></span></div>
+          <div class="ed" id="ed">
+            <div class="gut"><div class="gut-in" id="gut"></div></div>
+            <div class="hl"><div class="hl-in" id="hl"></div></div>
+            <textarea id="src" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="Literate source"></textarea>
+          </div>
+          <div class="legend"><span><i class="c"></i>code node</span><span><i class="r"></i>reference</span><span><i class="h"></i>traced line</span></div>
+        </div>
+        <div class="pane">
+          <div class="tabs" role="tablist" id="tabs">
+            <button class="tab" role="tab" aria-selected="true" data-tab="tangled">Tangled</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="chunks">Chunks</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="woven">Woven</button>
+          </div>
+          <div class="outbody" id="out-tangled"></div>
+          <div class="outbody" id="out-chunks" hidden></div>
+          <div class="outbody woven" id="out-woven" hidden></div>
+        </div>
+      </div>
+      <div class="trace" id="trace" aria-live="polite"></div>
+    </section>
+  ```
+}
+
+#page: conventions{
+  The conventions the literate tools put on top of the notation, and the characters to keep out of
+  text.
+
+  ```
+    <section class="block" id="conventions">
+      <div class="intro">
+        <h2>Seven conventions for programs</h2>
+        <p>Brashtag only says what a tree looks like. These conventions are what the literate tools do with it. Press a button to load an example into the editor above.</p>
+      </div>
+      <div class="rules" id="rules"></div>
+      <div class="gotcha">
+        <h3>Four characters to keep out of blobs and tags</h3>
+        <ul>
+          <li>A <code>#</code>, <code>{</code>, <code>}</code> or tick in running text is read as notation. Put it in a code node.</li>
+          <li>Tangle reads the whole file as one document, so a stray brace on line 3 can hide an error on line 300. The message names the line it noticed.</li>
+          <li>Want to see one? <button class="btn" data-load="oops.lit">Load a broken document</button></li>
+        </ul>
+      </div>
+    </section>
+  ```
+}
+
+#page: chapters{
+  The chapter mechanism, shown with a small project in three files and the recorded output of the
+  tools on it. The placeholders are replaced by the builder with the files and with real runs.
+
+  ```
+    <section class="block" id="chapters">
+      <div class="intro">
+        <h2>Big programs: chapters</h2>
+        <p>A literate program can be spread over many files. <code>#include{pricing.lit}</code> in one file is replaced by the text of that file, so a large codebase can have a chapter for each module or subsystem, and the root file reads as the introduction. The tools are given the root and see one document: chunk names stay global, so one chapter can use a chunk written in another.</p>
+      </div>
+      <div>
+        [[code:shop/shop.lit:shop.lit (the root)]]
+        [[code:shop/pricing.lit:pricing.lit]]
+        [[code:shop/report.lit:report.lit]]
+      </div>
+      <p>Here is that project through the tools. Every message and every address names the chapter file and the line in it, and absorb writes only the chapter that changed. It does not touch the prose, which still says 12: after absorbing, the author reads the diff and fixes the sentence.</p>
+      [[term:t8:lit tangle shop.lit .]]
+      [[term:t8:lit addr shop.lit shop.py:3]]
+      [[term:t8:lit addr shop.lit report.lit:8]]
+      [[term:t8:lit absorb shop.lit]]
+      <div class="gotcha">
+        <h3>Rules for chapters</h3>
+        <ul>
+          <li>Each chapter must be balanced on its own: every <code>#tag{</code> is closed in the same file.</li>
+          <li>A file may be included once, and cycles are refused. A missing file is an error naming the file and the line of the directive.</li>
+          <li>In the woven page the first <code>h1</code> is the title and later ones are chapters. Weave and lint treat the whole as one document.</li>
+          <li>The live editors on this page read a single text, so they do not follow includes. The run above is real output of the <code>lit</code> binary.</li>
+        </ul>
+      </div>
+    </section>
+  ```
+}
+
+#page: the sync lab{
+  A small lab in which the document and a generated file are edited separately, and tangle, absorb
+  and merge are run on them.
+
+  ```
+    <section class="block" id="scenario">
+      <div class="intro">
+        <h2>The sync lab</h2>
+        <p>You keep the literate document. A teammate opens <code>tip.py</code> in their editor and fixes a line, without knowing the document exists. Meanwhile you changed the document. Used to be, whichever tool you ran first decided whose edit survived. Make edits on both sides with the buttons, or type your own, then use the tools.</p>
+      </div>
+      <div class="lab">
+        <div class="lab-grid">
+          <div class="pane"><div class="pane-head"><span>tip.lit</span><span class="tag" id="litState">in sync</span></div><textarea id="labLit" spellcheck="false" wrap="off" aria-label="Document"></textarea></div>
+          <div class="pane"><div class="pane-head"><span>tip.py</span><span class="tag" id="genState">in sync</span></div><textarea id="labGen" spellcheck="false" wrap="off" aria-label="Generated file"></textarea></div>
+        </div>
+        <div class="actions edits" id="edits"><span class="label">Make an edit</span></div>
+        <div class="actions">
+          <button class="btn primary" id="bMerge" title="lit sync merge">Merge both ways</button>
+          <button class="btn" id="bTangle" title="lit tangle">Tangle</button>
+          <button class="btn" id="bAbsorb" title="lit absorb">Absorb</button>
+          <span class="sep"></span>
+          <button class="btn" id="bReset">Start over</button>
+        </div>
+        <div class="lab-out">
+          <div class="panel"><h3>Waiting to be reconciled</h3><div id="pending"></div></div>
+          <div class="panel"><h3>What happened</h3><ul class="log" id="log"></ul><div class="backups" id="backups"></div></div>
+        </div>
+        <p class="small-note" style="margin-top:1rem"><b>Tangle</b> rewrites the file from the document and keeps a copy of any edit it replaces. <b>Absorb</b> folds file edits into the document, and refuses if the document changed too. <b>Merge</b> compares both sides with what they were at the last sync, brings every separate change across in both directions, and asks you about the rest.</p>
+      </div>
+    </section>
+
+    <section class="block" id="agents">
+      <div class="intro">
+        <h2>Leave gaps for an assistant</h2>
+        <p>Sometimes you know what a chunk must do and have not written it. Say so in the document: put a bag inside the chunk, <code>#agent-fill-in{what the code must do}</code>. Tangle ignores it, so the program still builds around the gap. <code>lit fill</code> then does what you would do before writing the code: it reads the section's prose, the headings above it, the chunks that use this one up to the files, the chunks it uses, the other gaps, and the generated file around the hole. It sends that to an assistant, checks what comes back, and writes it into the document.</p>
+      </div>
+      <div class="two">
+        <div class="panel">
+          <h3>The document, with two gaps</h3>
+          [[code:words.lit:words.lit]]
+        </div>
+        <div class="panel">
+          <h3>What the assistant is given</h3>
+          <p>Each gap becomes a prompt of ten sections, general first and specific last. When the document is large, the distant ones are trimmed first and the task and the chunk never are. Look at one without calling anybody:</p>
+          [[term:t9:lit fill words.lit --list]]
+          [[term:t9:lit fill words.lit --dry-run --show-context]]
+        </div>
+      </div>
+      <p>The assistant is anything that reads a prompt on standard input and prints a reply, or the Anthropic API when <code>ANTHROPIC_API_KEY</code> is set. In the run below it is a canned shell script, so that the example is reproducible; a model takes its place with <code>--agent anthropic</code> or <code>--agent 'claude -p'</code>. Each answer is checked before it is written: the whole program must still parse and tangle, generated Go and JSON files must be valid, and a reply with <code>TODO</code> in it is not an answer. A check of your own, such as <code>go vet</code>, runs on the tangled program in a scratch directory once the last gap is filled, and a failure goes back to the assistant with its error.</p>
+      [[term:t9:lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go']]
+      <p>The code is in the document now, with your words kept as prose above it, and every fill is recorded beside it. Review is for the person who comes back later. It checks again, optionally asks a second assistant, and lets you approve each fill, or reject it, which puts your original gap back.</p>
+      [[term:t9:lit review words.lit --ai --agent 'sh review.sh']]
+      [[term:t9:lit review words.lit --approve-all]]
+      [[term:t9:lit tangle words.lit .]]
+      [[term:t9:go run main.go < sample.txt]]
+      <div class="gotcha">
+        <h3>What this does and does not do</h3>
+        <ul>
+          <li>The assistant writes code for a gap. It never edits your prose, and it never touches code outside the gap.</li>
+          <li>A fill is not trusted because it passed checks. <code>lit review</code> exists so that a person looks at each one, and the second opinion is a model, which can be wrong.</li>
+          <li>The scripts in this demo are fakes. Against a real model the code, and the number of retries, will differ.</li>
+        </ul>
+      </div>
+    </section>
+
+  [[TUTORIAL]]
+  [[INSTALL]]
+  ```
+}
+
+#page: the toolbelt{
+  The seven tools: the figure of the overview chapter, which the builder takes from the tangled
+  `docs/tools.svg`, and a grid filled in by the interface script from a list.
+
+  ```
+    <section class="block" id="tools">
+      <div class="intro">
+        <h2>The toolbelt</h2>
+        <p>Each tool is a subcommand of one Go binary, <code>lit</code>, built from the standard library and the brashtag parser and nothing else. The skill that teaches an assistant the notation is inside the binary too, and it carries the same tools a second time as Python scripts that need only Python's standard library, so an assistant with just the skill folder can write literate programs and run every tool, including fill and review, with <code>python3</code>.</p>
+      </div>
+      [[svg:../internal/skill/files/docs/tools.svg|How the tools move text between the document, the generated files and the woven page.]]
+      <div class="tools" id="toolgrid"></div>
+    </section>
+  ```
+}
+
+#page: it tangles itself{
+  The claim that this page is itself part of what it describes, with the numbers from the linter
+  and the output of the build. The numbers are placeholders that the builder fills in from the
+  linter's summary line, so they are always the numbers of the document that produced the page.
+
+  ```
+    <section class="block" id="itself">
+      <div class="intro">
+        <h2>It tangles itself</h2>
+        <p>The tools are themselves a literate program, split into thirty-one files: a root and a chapter for each tool or subsystem, ordered by importance, with the plain details in an appendix at the end. Tangling it writes every Go source, the skill's files, the tests, the build script and this page: the page you are reading is one of the chapters. The build vets and tests the Go program, then tangles the document a second time with the binary it just built. The two outputs must be identical. Last, the build runs the tests of the Python scripts and checks that they tangle the document to the same files as the binary.</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>__CHUNKS__</b><span>chunks</span></div>
+        <div class="stat"><b>__CODE__</b><span>lines of code</span></div>
+        <div class="stat"><b>__PROSE__</b><span>words of prose</span></div>
+        <div class="stat"><b>29</b><span>files, one root and twenty-eight chapters</span></div>
+      </div>
+      <div class="build" aria-label="Output of build.sh"><span class="m">$</span> sh build.sh
+  <span class="m">== tangle</span>
+  <span class="m">== vet and test</span> <span class="g">go vet clean, go test ok</span>
+  <span class="m">== build</span>        bin/lit, bin/mkpage
+  <span class="m">== fixed point</span>  <span class="g">identical</span>
+  <span class="m">== lint</span>         __LINT__
+  <span class="m">== weave</span>        lit.html, lit.tex
+  <span class="m">== page</span>        <span class="g">15 JavaScript checks passed</span></div>
+      <p class="small-note">Counts are from the linter run on the root and its chapters.</p>
+    </section>
+  </main>
+
+  <footer><div class="wrap">
+    <span>Notation and parser: <a href="https://github.com/PratikDeoghare/brashtag">brashtag</a> by Pratik Deoghare, MIT license.</span>
+    <span>Ideas: Knuth, <i>Literate Programming</i>, 1984; Ramsey, <i>Literate Programming Simplified</i>, 1994.</span>
+  </div></footer>
+  ```
+}
+
+#web/page.body.html{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<page: top bar and hero>>>
+
+  <<<page: what the tools add>>>
+
+  <<<page: getting the understanding back>>>
+
+  <<<page: the notation>>>
+
+  <<<page: the playground>>>
+
+  <<<page: conventions>>>
+
+  <<<page: chapters>>>
+
+  <<<page: the sync lab>>>
+  <<<page: the toolbelt>>>
+
+  <<<page: it tangles itself>>>
+  ```
+}
+
+#web/tutorial.html{
+  The linear tutorial: one legacy script taken through every tool. Everything in double brackets
+  is replaced by the builder with recorded output or file text, so the commands shown are the
+  commands that were run.
+
+  ```
+    <section class="block" id="tutorial">
+      <div class="intro">
+        <h2>Tutorial: a legacy script, start to finish</h2>
+        <p>Read this top to bottom, no demos needed. It follows one small script, <code>invoice.py</code>, through every tool. Each command's output is what the installed <code>lit</code> printed when I ran it on this exact project, with the home directory shortened to <code>~</code>.</p>
+      </div>
+      <ol class="steps">
+        <li>
+          <h3>Install</h3>
+          <p>Put the binary on your path, then put the skill where Claude looks for skills.</p>
+          [[term:t1:lit install-skill]]
+        </li>
+        <li>
+          <h3>Start from code nobody wants to read</h3>
+          <p>This is the whole program: three functions and a demo. It works. It does not say why Oregon is special, where the tax rate comes from, or what happens at 100 units.</p>
+          [[code:invoice.orig.py:invoice.py]]
+          <p>Keep a copy of the original. You will compare against it in a moment.</p>
+          [[cmd:cp invoice.py ../invoice.orig.py]]
+        </li>
+        <li>
+          <h3>Ask Claude</h3>
+          <p>Open Claude in the project and give it the prompt from above. It reads the code, runs it, and writes <code>invoice.lit</code>. Here is the part of the document that covers pricing. The prose is new, and the code is the original, line for line.</p>
+          [[file:invoice.before-absorb.lit:12:35:invoice.lit]]
+          <p>The same document ends with an <b>Open questions</b> section for things the code does not settle. That section is how you tell an explanation from a guess.</p>
+        </li>
+        <li>
+          <h3>Check it</h3>
+          <p>Lint checks the document's structure. Tangle writes the code into the project, next to where it always lived, so nothing about the build changes. Then compare against your copy.</p>
+          [[term:t1:lit lint invoice.lit]]
+          [[term:t1:lit tangle invoice.lit .]]
+          [[term:t1:diff ../invoice.orig.py invoice.py]]
+          <p>No output from <code>diff</code> means the generated file is identical to the original. The behaviour cannot have changed, and the program still runs:</p>
+          [[term:t1:python3 invoice.py]]
+        </li>
+        <li>
+          <h3>Read it</h3>
+          <p>Weave turns the document into a page with a table of contents, numbered chunks you can click through, and a chunk index. It also writes LaTeX, ready for your own engine.</p>
+          [[term:t1:lit weave invoice.lit -o site]]
+          <p>Open <code>site/invoice.html</code> in a browser. A <code>.lit</code> file is also perfectly readable in any editor, because it is plain text.</p>
+        </li>
+        <li>
+          <h3>Find your way around</h3>
+          <p>Tangle also wrote a sourcemap. Ask where line 23 of <code>invoice.py</code> came from, and then where line 66 of the document ends up. Output is <code>path:line:column</code>, which most editors can jump to.</p>
+          [[term:t1:lit addr invoice.lit invoice.py:23]]
+          [[term:t2:lit addr invoice.lit invoice.lit:66]]
+        </li>
+        <li>
+          <h3>A teammate changes the code</h3>
+          <p>Someone fixes <code>invoice.py</code> in their editor without knowing a document exists. They raise the discount threshold to 12 and add a guard for an empty order.</p>
+          [[term:t2:diff ../invoice.orig.py invoice.py]]
+          <p>Ask absorb what it would do. It maps each changed line through the sourcemap to the chunk that wrote it, and removes the indentation that references added.</p>
+          [[term:t2:lit absorb invoice.lit --dry-run]]
+          <p>Looks right. Run it for real, without <code>--dry-run</code>. Then see what it did to the document.</p>
+          [[term:t2:lit absorb invoice.lit]]
+          <p>The code in the document now matches the code in the project. The prose does not: it still says the discount starts at 10 units. Absorb changes code and never prose, because only you know what the words should say.</p>
+          [[term:t2:grep -n From 10 units invoice.lit|grep -n "From 10 units" invoice.lit]]
+          <p>Fix the sentence in the document. That is an ordinary edit.</p>
+        </li>
+        <li>
+          <h3>You both edit, on the same day</h3>
+          <p>You raise the tax rate in the document. Meanwhile the teammate exempts New Hampshire in <code>invoice.py</code>. Whichever of tangle and absorb you ran first used to decide whose edit survived. Sync remembers what both sides looked like at the last agreement, and compares each against that.</p>
+          [[term:t3:lit sync invoice.lit status]]
+          [[term:t3:lit sync invoice.lit diff]]
+          <p>Two changes in different places. Merge brings each across, in its own direction.</p>
+          [[term:t3:lit sync invoice.lit merge]]
+          [[term:t3:lit sync invoice.lit status]]
+        </li>
+        <li>
+          <h3>When you touch the same line</h3>
+          <p>You set <code>TAX = 0.0925</code> in the document. The teammate sets <code>TAX = 0.09</code> in the file. Merge will not choose for you.</p>
+          [[term:t4:lit sync invoice.lit merge]]
+          <p>Nothing was changed. You can decide with <code>--prefer lit</code>, <code>--prefer gen</code> or <code>--prefer newer</code>, or pick by hand, as in the step after next. Here the document wins. The losing text is not gone:</p>
+          [[term:t4:lit sync invoice.lit merge --prefer lit]]
+          [[term:t5:lit sync invoice.lit restore invoice.py --list]]
+        </li>
+        <li>
+          <h3>You forgot to sync and ran tangle</h3>
+          <p>Tangle rewrites generated files. If one holds an edit that the document does not have, tangle says so and keeps a copy first.</p>
+          [[term:t5:lit tangle invoice.lit .]]
+          [[term:t5:lit sync invoice.lit restore invoice.py --list]]
+          <p>Bring one back with <code>lit sync invoice.lit restore invoice.py --sha ba30967a</code>, or print it with <code>--stdout</code>.</p>
+        </li>
+        <li>
+          <h3>Choose, change by change</h3>
+          <p>Pick walks through every region, like <code>git add -p</code> but in both directions. Here the document changed one line, the file another. The keys are in the prompt: apply, leave alone, revert, edit, and so on. I answered <b>y</b>, <b>n</b>, then <b>y</b> to write.</p>
+          [[pick]]
+          <p>The change from the document went into the file. The file's change was left pending, so it is still there next time:</p>
+          [[term:t7:lit sync invoice.lit status]]
+        </li>
+        <li>
+          <h3>Watch, if you like</h3>
+          <p>Watch records every change to the document and its files, and never modifies anything. Leave <code>lit watch invoice.lit</code> running in a terminal. With <code>--once</code> it records what changed since it last ran and exits.</p>
+          [[term:t6:lit watch invoice.lit --once]]
+          <p><code>lit sync invoice.lit log</code> then shows the journal, and <code>sync ... merge --prefer newer</code> uses the recorded edit times to settle conflicts.</p>
+        </li>
+        <li>
+          <h3>Remove it</h3>
+          <p>When you are done, one command removes the skill and, after asking, the package.</p>
+          [[term:t7:lit uninstall-skill]]
+          <p>Plain <code>lit uninstall</code> removes the skill and then asks before it removes the package. Add <code>--yes</code> to skip the question.</p>
+        </li>
+      </ol>
+    </section>
+  ```
+}
+
+#web/install.html{
+  Install and remove, with the two commands each way.
+
+  ```
+    <section class="block" id="install">
+      <div class="intro">
+        <h2>Install and remove</h2>
+        <p>One binary, one command: <code>lit</code>. It is a Go program that uses only the standard library and the brashtag parser, and the skill is inside it. There is nothing else to install; the skill's scripts are Python and need only <code>python3</code>, which an assistant usually has already. Nothing is written anywhere except the skill folder you ask for.</p>
+      </div>
+      <div class="two">
+        <div class="panel">
+          <h3>Install</h3>
+          <div class="cmd"><code>go build -o lit ./cmd/lit</code><button class="btn" data-copy="go build -o lit ./cmd/lit">Copy</button></div>
+          <p class="small-note">In the tangled source of this document. Put the binary on your path.</p>
+          <div class="cmd"><code>lit install-skill</code><button class="btn" data-copy="lit install-skill">Copy</button></div>
+          <p class="small-note">The skill goes to <code>~/.claude/skills/brashtag-literate</code>. For one project only, use <code>lit install-skill --dest .claude/skills</code>. Installing again upgrades it.</p>
+        </div>
+        <div class="panel">
+          <h3>Remove</h3>
+          <div class="cmd"><code>lit uninstall</code><button class="btn" data-copy="lit uninstall">Copy</button></div>
+          <p class="small-note">Removes the skill folder, then asks before removing the binary. Use <code>--yes</code> to skip the question, or <code>lit uninstall-skill</code> to remove only the skill. A folder with the skill's name that lit did not create is never touched unless you pass <code>--force</code>. <code>lit where</code> shows what is installed and which parser is in use.</p>
+        </div>
+      </div>
+    </section>
+  ```
+}
+
+#h2{The page's style}
+
+One stylesheet, with colours defined as variables for a light and a dark theme, so that the lamp
+changes a single attribute. Each part is a chunk.
+
+#style: tokens and base{
+  The tokens: a warm paper for light, a dim lamp-lit room for dark, one accent, and the font
+  stacks. The layout is a single centred column that never scrolls sideways.
+
+  ```
+  :root{
+    /* Layout: a reading room. One wide column of prose, with two working benches (editor, lab) that break out of it. */
+    --bg:#e8ede4; --surface:#f4f7f0; --surface2:#dde5d8; --ink:#222a29; --muted:#5a6663; --line:#bfcabb;
+    --accent:#2a6858; --accent-ink:#f4f7f0; --lamp:rgba(226,160,48,.30); --lamp-solid:#c98a1c; --plum:#7a4a78;
+    --code-bg:rgba(42,104,88,.07); --ref-bg:rgba(122,74,120,.12); --bad:#a8392f; --ok:#2f7a45;
+    --glow:rgba(226,160,48,.22); --shadow:0 1px 0 rgba(0,0,0,.04),0 10px 30px -14px rgba(34,42,41,.28);
+    --display:"Young Serif",Georgia,"Times New Roman",serif; --body:"Literata",Georgia,serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+    --lh:20px;
+  }
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+    --bg:#171c1b; --surface:#1f2625; --surface2:#283130; --ink:#e8e4d8; --muted:#a2aca6; --line:#3a4644;
+    --accent:#8fcfb8; --accent-ink:#13201c; --lamp:rgba(242,184,75,.26); --lamp-solid:#f2b84b; --plum:#d3a6cd;
+    --code-bg:rgba(143,207,184,.08); --ref-bg:rgba(211,166,205,.14); --bad:#ff8f84; --ok:#7fd69a;
+    --glow:rgba(242,184,75,.13); --shadow:0 1px 0 rgba(255,255,255,.03),0 14px 34px -16px rgba(0,0,0,.7); color-scheme:dark}}
+  :root[data-theme="dark"]{
+    --bg:#171c1b; --surface:#1f2625; --surface2:#283130; --ink:#e8e4d8; --muted:#a2aca6; --line:#3a4644;
+    --accent:#8fcfb8; --accent-ink:#13201c; --lamp:rgba(242,184,75,.26); --lamp-solid:#f2b84b; --plum:#d3a6cd;
+    --code-bg:rgba(143,207,184,.08); --ref-bg:rgba(211,166,205,.14); --bad:#ff8f84; --ok:#7fd69a;
+    --glow:rgba(242,184,75,.13); --shadow:0 1px 0 rgba(255,255,255,.03),0 14px 34px -16px rgba(0,0,0,.7); color-scheme:dark}
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important;animation:none!important}}
+  body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.65 var(--body);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));
+    background-image:radial-gradient(60rem 30rem at 12% -6%,var(--glow),transparent 70%)}
+  a{color:var(--accent)}
+  .wrap{max-width:68rem;margin:0 auto}
+  .narrow{max-width:40rem}
+  h1,h2,h3{font-family:var(--display);font-weight:400;line-height:1.15;text-wrap:balance;margin:0}
+  h2{font-size:clamp(1.7rem,3.4vw,2.3rem);margin-bottom:.6rem}
+  h3{font-size:1.15rem}
+  p{margin:.6rem 0}
+  code,kbd,pre,textarea,.mono{font-family:var(--mono)}
+  code{font-size:.86em;background:var(--code-bg);padding:.08em .35em;border-radius:4px}
+  button{font:inherit;color:inherit;cursor:pointer}
+  :focus-visible{outline:2px solid var(--lamp-solid);outline-offset:2px;border-radius:4px}
+  .label{font:600 .72rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  ```
+}
+
+#style: top bar{
+  The top bar and the lamp.
+
+  ```
+  /* top bar */
+  .top{display:flex;align-items:center;gap:1.2rem;padding-block:1rem}
+  .mark{font-family:var(--display);font-size:1.25rem;text-decoration:none;color:var(--ink);display:flex;align-items:baseline;gap:.15rem}
+  .mark b{color:var(--accent);font-weight:400}
+  .top nav{margin-left:auto;display:flex;gap:1.1rem;font-size:.95rem}
+  .top nav a{color:var(--muted);text-decoration:none}.top nav a:hover{color:var(--ink)}
+  .lamp{border:1.5px dashed var(--line);background:transparent;border-radius:999px;width:2.4rem;height:2.4rem;display:grid;place-items:center;color:var(--ink)}
+  .lamp:hover{border-color:var(--lamp-solid)}
+  .lamp svg{width:1.2rem;height:1.2rem}
+  @media (max-width:640px){.top nav{display:none}.lamp{margin-left:auto}}
+  ```
+}
+
+#style: hero{
+  The first screen.
+
+  ```
+  /* hero */
+  .hero{padding-block:2.2rem 1.6rem;display:grid;grid-template-columns:minmax(0,1fr);gap:1.4rem}
+  .hero h1{font-size:clamp(2.3rem,6vw,4rem);max-width:15ch}
+  .hero h1 em{font-style:normal;color:var(--accent);background:linear-gradient(transparent 62%,var(--lamp) 62%)}
+  .lede{font-size:1.15rem;max-width:38rem;color:var(--ink)}
+  .install{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center}
+  .cmd{display:flex;align-items:center;gap:.5rem;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:.35rem .4rem .35rem .8rem;min-width:0;max-width:100%}
+  .cmd code{min-width:0;background:none;padding:0;white-space:nowrap;overflow-x:auto;font-size:.82rem}
+  .btn{border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:.3rem .7rem;font-size:.85rem}
+  .btn:hover{border-color:var(--accent)}
+  .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn[disabled]{opacity:.45;cursor:not-allowed}
+  .small-note{font-size:.88rem;color:var(--muted);max-width:38rem}
+
+  section.block{padding-block:3rem 1rem}
+  .intro{max-width:40rem;margin-bottom:1.2rem}
+  .stitch{border:0;border-top:2px dashed var(--line);margin:2.2rem 0 0}
+  ```
+}
+
+#style: chips{
+  The small buttons that load examples.
+
+  ```
+  /* chips */
+  .chips{display:flex;flex-wrap:wrap;gap:.45rem;margin:.9rem 0}
+  .chip{border:1.5px dashed var(--line);background:transparent;border-radius:999px;padding:.28rem .8rem;font-size:.85rem}
+  .chip:hover{border-color:var(--lamp-solid)}
+  .chip[aria-pressed="true"]{border-style:solid;border-color:var(--accent);background:var(--surface);color:var(--accent);font-weight:600}
+  ```
+}
+
+#style: panes and editor{
+  The editor is a transparent text area over a highlighted copy of the same text, so the text
+  keeps native editing and the highlight follows it.
+
+  ```
+  /* panes and editor */
+  .panes{display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start}
+  @media (max-width:860px){.panes,.lab-grid{grid-template-columns:1fr!important}}
+  .pane{background:var(--surface);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);min-width:0;overflow:hidden}
+  .pane-head{display:flex;align-items:center;gap:.6rem;padding:.55rem .9rem;border-bottom:1px solid var(--line);font:600 .78rem/1.2 var(--mono);color:var(--muted);flex-wrap:wrap}
+  .pane-head .sp{margin-left:auto}
+  .ed{position:relative;height:26rem;font:13px/var(--lh) var(--mono)}
+  .ed .gut{position:absolute;left:0;top:0;bottom:0;width:2.9rem;overflow:hidden;border-right:1px solid var(--line);color:var(--muted);text-align:right;user-select:none}
+  .ed .gut-in,.ed .hl-in{padding-block:8px;will-change:transform}
+  .ed .gut-in div{height:var(--lh);padding-right:.55rem}
+  .ed .gut-in div.bad{color:var(--bad);font-weight:700}
+  .ed .hl{position:absolute;left:2.9rem;right:0;top:0;bottom:0;overflow:hidden;pointer-events:none}
+  .ed .hl-in{width:max-content;min-width:100%}
+  .ed .l{height:var(--lh);padding:0 12px;white-space:pre;color:transparent}
+  .ed .l.code{background:var(--code-bg)}
+  .ed .l.ref{background:var(--ref-bg)}
+  .ed .l.hot{background:var(--lamp)}
+  .ed .l.bad{background:color-mix(in srgb,var(--bad) 22%,transparent)}
+  .ed textarea{position:absolute;left:2.9rem;right:0;top:0;bottom:0;width:calc(100% - 2.9rem);height:100%;border:0;background:transparent;color:var(--ink);resize:none;padding:8px 12px;font:inherit;white-space:pre;overflow:auto;tab-size:4;caret-color:var(--lamp-solid)}
+  .ed textarea:focus{outline:none}
+  .pane:focus-within{border-color:var(--accent)}
+  .legend{display:flex;gap:1rem;flex-wrap:wrap;padding:.5rem .9rem;border-top:1px solid var(--line);font-size:.76rem;color:var(--muted)}
+  .legend i{display:inline-block;width:.8rem;height:.8rem;border-radius:3px;vertical-align:-1px;margin-right:.3rem;border:1px solid var(--line)}
+  .legend .c{background:var(--code-bg)}.legend .r{background:var(--ref-bg)}.legend .h{background:var(--lamp)}
+
+  .tabs{display:flex;gap:.2rem;padding:.4rem .5rem 0;border-bottom:1px solid var(--line)}
+  .tab{border:0;background:transparent;padding:.4rem .8rem;border-radius:8px 8px 0 0;font:600 .8rem var(--mono);color:var(--muted);border-bottom:2px solid transparent}
+  .tab[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--accent)}
+  .outbody{height:26rem;overflow:auto;padding:.4rem 0}
+  .file-head{display:flex;justify-content:space-between;padding:.4rem .9rem;font:600 .78rem var(--mono);color:var(--accent)}
+  .file-head span:last-child{color:var(--muted);font-weight:400}
+  pre.gen{margin:0 0 .6rem;font-size:13px;line-height:var(--lh)}
+  .gl{display:block;padding:0 .9rem 0 0;white-space:pre;cursor:default}
+  .gl i{display:inline-block;width:2.9rem;text-align:right;padding-right:.7rem;color:var(--muted);font-style:normal;user-select:none}
+  .gl:hover,.gl.on{background:var(--lamp)}
+  .trace{margin-top:.7rem;font:.82rem/1.5 var(--mono);color:var(--muted);min-height:1.5em}
+  .trace b{color:var(--ink)}
+  .trace .arrow{color:var(--lamp-solid)}
+  .empty{padding:1.4rem 1rem;color:var(--muted);font-size:.95rem}
+  .err{margin:.9rem;padding:.8rem 1rem;border:1.5px dashed var(--bad);border-radius:10px;color:var(--ink);font-size:.95rem}
+  .err b{color:var(--bad);font-family:var(--mono)}
+  .tree,.tree ul{list-style:none;margin:0;padding-left:1.3rem}
+  .tree{padding:.3rem .9rem}
+  .tree li{margin:.2rem 0;border-left:1.5px dashed var(--line);padding-left:.7rem}
+  .tree .cn{font-family:var(--mono);font-size:.85rem;color:var(--plum);font-weight:600}
+  .tree .fn{font-family:var(--mono);font-size:.85rem;color:var(--accent);font-weight:700}
+  .tree .dim{font-size:.76rem;color:var(--muted);margin-left:.3rem}
+  .tree .bad,.warn{color:var(--bad)}
+  .warn{font-size:.85rem;padding:.2rem .9rem}
+  ```
+}
+
+#style: woven view{
+  The rendered document inside the playground.
+
+  ```
+  /* woven */
+  .woven{padding:.4rem 1.1rem 1rem;font-size:.95rem}
+  .woven h1{font-size:1.6rem;margin:.6rem 0}.woven h2{font-size:1.25rem;margin:1rem 0 .3rem}.woven h3{font-size:1.05rem}
+  .woven .chunk{margin:1rem 0;padding-left:.8rem;border-left:2px dashed var(--line)}
+  .woven .chunk .chunk{margin-left:.5rem}
+  .woven .chunk-head{font:.85rem var(--mono)}
+  .woven .num{color:var(--muted);text-decoration:none;margin-right:.3rem}
+  .woven .cname{color:var(--plum);font-weight:600}
+  .woven .badge{background:var(--accent);color:var(--accent-ink);font-size:.7rem;padding:.05rem .45rem;border-radius:99px;font-weight:600}
+  .woven .meta{font:.74rem var(--mono);color:var(--muted)}
+  .woven pre.code{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem;overflow-x:auto;font-size:.78rem;line-height:1.5;margin:.5rem 0}
+  .woven a.ref{color:var(--plum);font-weight:600;text-decoration:none}.woven .rn{color:var(--muted);font-size:.8em;margin-left:.15rem;font-weight:400}
+  .woven .ref.bad{color:var(--bad)}
+  .woven .cite a{text-decoration:none}
+  .woven .display{overflow-x:auto;margin:.4rem 0}
+  .woven ol.bib{font-size:.85rem;padding-left:1.6rem}
+  ```
+}
+
+#style: sync lab{
+  The lab, its regions and its log.
+
+  ```
+  /* lab */
+  .lab-grid{display:grid;grid-template-columns:3fr 2fr;gap:1rem;align-items:start}
+  .lab textarea{display:block;width:100%;border:0;background:transparent;color:var(--ink);padding:.7rem .9rem;font:13px/var(--lh) var(--mono);white-space:pre;overflow:auto;resize:vertical;tab-size:4}
+  .lab textarea:focus{outline:none}
+  #labLit{height:24rem}#labGen{height:12.5rem}
+  .tag{font-weight:600;border-radius:99px;padding:.1rem .55rem;border:1px solid var(--line);color:var(--muted)}
+  .tag.dirty{color:var(--ink);border-color:var(--lamp-solid);background:var(--lamp)}
+  .actions{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center;margin:1rem 0 .3rem}
+  .actions .sep{flex:1}
+  .edits .label{margin-right:.2rem}
+  .lab-out{display:grid;grid-template-columns:3fr 2fr;gap:1rem;align-items:start;margin-top:.8rem}
+  @media (max-width:860px){.lab-out{grid-template-columns:1fr}}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:.9rem 1rem;box-shadow:var(--shadow);min-width:0}
+  .panel h3{font-size:1rem;margin-bottom:.5rem}
+  .reg{border-top:1.5px dashed var(--line);padding:.6rem 0}
+  .reg:first-of-type{border-top:0}
+  .kind{font:700 .7rem var(--mono);letter-spacing:.05em;text-transform:uppercase;padding:.12rem .5rem;border-radius:99px;margin-right:.4rem}
+  .kind.lit{background:var(--ref-bg);color:var(--plum)}.kind.gen{background:var(--code-bg);color:var(--accent)}
+  .kind.same{background:var(--surface2);color:var(--muted)}.kind.conflict{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad)}
+  .diff{font:12.5px/1.55 var(--mono);margin:.4rem 0 0;overflow-x:auto;white-space:pre}
+  .diff .d{color:var(--bad)}.diff .a{color:var(--ok)}
+  .diff .who{display:block;color:var(--muted);font-size:.72rem;margin-top:.3rem}
+  .resolve{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.5rem}
+  .ok-line{color:var(--ok);font-weight:600}
+  ul.log{list-style:none;margin:0;padding:0;font-size:.88rem;max-height:17rem;overflow:auto}
+  ul.log li{padding:.35rem 0;border-top:1.5px dashed var(--line)}
+  ul.log li:first-child{border-top:0}
+  ul.log .bad{color:var(--bad)}ul.log .good{color:var(--ok)}
+  .backups{margin-top:.6rem;font-size:.85rem}
+  .backups .btn{padding:.1rem .5rem;font-size:.78rem}
+  ```
+}
+
+#style: notation{
+  The tree inspector.
+
+  ```
+  /* notation */
+  .rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(18.5rem,1fr));gap:1rem}
+  .rule{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.5rem;min-width:0}
+  .rule p{margin:0;font-size:.95rem}
+  .rule pre{margin:0;background:var(--code-bg);border-radius:8px;padding:.6rem .8rem;font-size:.78rem;line-height:1.5;overflow-x:auto;flex:1}
+  .rule .btn{align-self:flex-start}
+  .gotcha{margin-top:1.4rem;border:1.5px dashed var(--line);border-radius:12px;padding:1rem 1.2rem}
+  .gotcha ul{margin:.4rem 0 0;padding-left:1.2rem}
+  ```
+}
+
+#style: tools{
+  The toolbelt grid.
+
+  ```
+  /* tools */
+  .diagram{margin:1.2rem 0 1.6rem;color:var(--ink)}
+  .diagram .scroll{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:.8rem}
+  .diagram svg{display:block;width:100%;min-width:680px;height:auto}
+  .diagram figcaption{color:var(--muted);font-size:.9rem;margin-top:.4rem}
+  .tools{display:grid;grid-template-columns:repeat(auto-fit,minmax(20rem,1fr));gap:1rem}
+  .tool{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.55rem;min-width:0}
+  .tool h3{font-family:var(--mono);font-size:1rem;color:var(--accent)}
+  .tool p{margin:0;font-size:.95rem}
+  .tool .cmd{margin-top:auto}
+  ```
+}
+
+#style: self-hosting{
+  The numbers and the build output.
+
+  ```
+  /* itself */
+  .stats{display:flex;flex-wrap:wrap;gap:2.2rem;margin:1.2rem 0}
+  .stat b{display:block;font:400 2.4rem/1 var(--display);color:var(--accent);font-variant-numeric:tabular-nums}
+  .stat span{font-size:.85rem;color:var(--muted)}
+  .build{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1rem 1.2rem;font:13px/1.65 var(--mono);overflow-x:auto;max-width:44rem;white-space:pre}
+  .build .g{color:var(--ok)}.build .m{color:var(--muted)}
+  footer{padding-block:3rem 2.5rem;color:var(--muted);font-size:.9rem}
+  footer .wrap{border-top:2px dashed var(--line);padding-top:1.4rem;display:flex;gap:1.4rem;flex-wrap:wrap}
+  .tool .cmd code{white-space:normal;overflow-wrap:anywhere}
+
+  .feats{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:1rem}
+  .feat{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.45rem;min-width:0}
+  .feat h3{color:var(--accent)}.feat p{margin:0;font-size:.95rem}.feat a{margin-top:auto;font-size:.88rem;padding-top:.3rem}
+  .kinds{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:1rem;margin-bottom:.4rem}
+  .kind-card{border:1.5px dashed var(--line);border-radius:12px;padding:.8rem 1rem;display:flex;flex-direction:column;gap:.35rem;min-width:0}
+  .kind-card p{margin:0;font-size:.93rem}
+  .nk{font:700 .72rem var(--mono);letter-spacing:.04em;padding:.12rem .55rem;border-radius:99px;align-self:flex-start;display:inline-block}
+  .nk.blob{background:var(--surface2);color:var(--muted)}.nk.bag{background:var(--code-bg);color:var(--accent)}.nk.code{background:var(--ref-bg);color:var(--plum)}
+  textarea.plain{display:block;width:100%;height:18rem;border:0;background:transparent;color:var(--ink);padding:.7rem .9rem;font:13px/var(--lh) var(--mono);white-space:pre;overflow:auto;resize:vertical;tab-size:4}
+  textarea.plain:focus{outline:none}
+  .tree .q{font-size:.82rem;color:var(--ink)}.tree .snip{font:12px/1.5 var(--mono);color:var(--muted);white-space:pre-wrap;display:block;margin:.1rem 0 .2rem;overflow-wrap:anywhere}
+
+  .ed,pre.gen,.diff,.woven pre.code,.build{tab-size:4}
+  .hint{font-weight:400;font-size:.72rem;color:var(--muted);margin-left:auto;opacity:.85}
+  ```
+}
+
+#style: workflow{
+  The four steps.
+
+  ```
+  /* understand / flow */
+  .flow{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:1rem;counter-reset:f}
+  .flow li{counter-increment:f;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1rem 1.1rem;display:flex;flex-direction:column;gap:.5rem;min-width:0}
+  .flow li h3::before{content:counter(f);display:inline-grid;place-items:center;width:1.6rem;height:1.6rem;border-radius:50%;background:var(--accent);color:var(--accent-ink);font:700 .85rem var(--mono);margin-right:.55rem;vertical-align:.05em}
+  .flow li p{margin:0;font-size:.95rem}.flow li .cmd{margin-top:auto}
+  .prompt{margin-top:1.2rem;border:1.5px dashed var(--line);border-radius:12px;padding:.9rem 1.1rem;display:grid;gap:.4rem;justify-items:start}
+  .prompt p{margin:0;font-size:1rem}
+  .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(20rem,1fr));gap:1rem;align-items:start}
+  .two .cmd{margin:.5rem 0}
+  ```
+}
+
+#style: tutorial{
+  Terminal blocks, file blocks and the tutorial's rhythm.
+
+  ```
+  /* tutorial */
+  .steps{list-style:none;margin:0;padding:0;counter-reset:s;max-width:46rem}
+  .steps>li{counter-increment:s;position:relative;padding:0 0 2.2rem 3.2rem;min-width:0}
+  .steps>li::before{content:"";position:absolute;left:1.05rem;top:2.2rem;bottom:.2rem;border-left:2px dashed var(--line)}
+  .steps>li:last-child::before{display:none}
+  .steps>li>h3::before{content:counter(s);position:absolute;left:0;top:-.1rem;width:2.1rem;height:2.1rem;border-radius:50%;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font:700 .9rem var(--mono)}
+  .steps h3{font-size:1.3rem;margin:0 0 .3rem}
+  .steps p{margin:.5rem 0}
+  .term{position:relative;margin:.7rem 0;background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .term pre{margin:0;padding:.7rem 4.6rem .7rem .9rem;font:12.5px/1.55 var(--mono);overflow-x:auto;white-space:pre;tab-size:4}
+  .term .p{color:var(--lamp-solid);font-weight:700}.term .c{color:var(--ink);font-weight:600}
+  .term .o{color:var(--muted)}
+  .term .copy{position:absolute;right:.5rem;top:.45rem;padding:.1rem .55rem;font-size:.75rem}
+  .term .exit{position:absolute;right:.55rem;bottom:.45rem;font:700 .68rem var(--mono);color:var(--bad);border:1px solid var(--bad);border-radius:99px;padding:.05rem .5rem;background:var(--surface)}
+  .codefile{margin:.7rem 0;background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .codefile .file-head{border-bottom:1px solid var(--line)}
+  .codefile pre{margin:0;padding:.6rem .9rem;font:12.5px/1.55 var(--mono);overflow:auto;max-height:21rem;white-space:pre;tab-size:4}
+  @media (max-width:640px){.steps>li{padding-left:2.7rem}.steps>li>h3::before{width:1.8rem;height:1.8rem}.steps>li::before{left:.9rem}.term pre{padding-right:.9rem;padding-top:2.2rem}.term .copy{top:.4rem}}
+  p code,li code,.small-note code{overflow-wrap:anywhere}
+
+  .two .cmd code{white-space:normal;overflow-wrap:anywhere}
+  .two > .panel{min-width:0}
+  .two .term pre,.two .codefile pre{overflow-x:auto}
+  ```
+}
+
+#web/page.css{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<style: tokens and base>>>
+
+  <<<style: top bar>>>
+
+  <<<style: hero>>>
+
+  <<<style: chips>>>
+
+  <<<style: panes and editor>>>
+
+  <<<style: woven view>>>
+
+  <<<style: sync lab>>>
+
+  <<<style: notation>>>
+
+  <<<style: tools>>>
+
+  <<<style: self-hosting>>>
+
+  <<<style: workflow>>>
+  <<<style: tutorial>>>
+  ```
+}
+
+#h2{The live core}
+
+This is a port of the Go tools to JavaScript, as small as it can be while giving the same
+answers on the page's examples. It is checked by tests below, which run in Node.
+
+#core: constants and errors{
+  The same constants as the Go tangle, the escape rule, and an error type that carries a line
+  number. Messages are rewritten into plainer sentences.
+
+  ```
+  /* ---------- literate core: load, tangle, sourcemap, absorb, three-way merge, weave ---------- */
+  const HEADING = /^h[1-6]$/;
+  const RESERVED = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "cite", "bibliography", "agent-fill-in"]);
+  const REF = /^(\s*)<<<(.+?)>>>\s*$/;
+  const ESC = /^(\s*)\\(\\*<<<.+?>>>\s*)$/;
+  const FILE = /\.\w+$/;
+  const unescapeLine = (l) => { const m = ESC.exec(l); return m ? m[1] + m[2] : l; };
+  const lineAt = (text, i) => { let n = 1; for (let k = 0; k < i && k < text.length; k++) if (text.charCodeAt(k) === 10) n++; return n; };
+  const toLines = (t) => { if (t === "") return []; const a = t.split("\n"); if (a[a.length - 1] === "") a.pop(); return a; };
+
+  class LitError extends Error { constructor(msg, line) { super(msg); this.line = line; } }
+
+  const FRIENDLY = {
+    "unexpected {": "a { in prose. Put it inside backticks.",
+    "unopened bag missing { after #": "a # in prose. Put it inside backticks.",
+    "bag not closed": "a #bag{ is never closed.",
+    "code not closed": "a run of backticks is never closed.",
+  };
+  ```
+}
+
+#core: loading{
+  Loading wraps the text in an implicit root bag for the reason the Go tangle does, and turns
+  parser errors into messages with a line.
+
+  ```
+  function load(text) {
+    const full = "#document{" + text + "}";
+    const r = parseBag(full);
+    if (r.error) {
+      const at = r.rest === undefined ? full.length : full.length - r.rest.length - 10;
+      throw new LitError(FRIENDLY[r.error] || r.error, lineAt(text, Math.max(0, at)));
+    }
+    if (r.rest.trim() !== "") {
+      const at = full.length - r.rest.length - 11;
+      throw new LitError("a stray } closed the document early. Put it inside backticks.", lineAt(text, Math.max(0, at)));
+    }
+    return r.node;
+  }
+  ```
+}
+
+#core: positions and layout{
+  Offsets by summed lengths, as in the sourcemap, and the layout of a fence: the lines of its text
+  with the offset of each and the indentation to remove.
+
+  ```
+  function offsets(root) {
+    let pos = 0; const out = new Map();
+    (function go(bag) {
+      for (const k of bag.kids) {
+        if (k instanceof Blob) pos += k.text.length;
+        else if (k instanceof Code) { const s = pos + k.tag.length; out.set(k, s); pos = s + k.text.length + k.tag.length; }
+        else { pos += k.tag.length + 2; go(k); pos += 1; }
+      }
+    })(root);
+    return out;
+  }
+
+  function layout(code, off) {
+    const raw = code.text.split("\n"); const starts = []; let pos = off;
+    for (const r of raw) { starts.push(pos); pos += r.length + 1; }
+    let lo = 0, hi = raw.length, indent = "";
+    if (raw[0].trim() === "") lo = 1;
+    if (hi > lo && raw[hi - 1].trim() === "") { indent = raw[hi - 1]; hi--; }
+    const lines = [];
+    for (let i = lo; i < hi; i++) {
+      const r = raw[i];
+      lines.push({ text: r.startsWith(indent) ? r.slice(indent.length) : r.trimStart(), start: starts[i], end: starts[i] + r.length });
+    }
+    return { indent, lines, nlLast: hi < raw.length };
+  }
+  ```
+}
+
+#core: analysing and tangling{
+  Analysis collects chunks and blocks, expansion substitutes references with indentation, and
+  tangle returns the files together with the origin of every line, which is what the page uses to
+  trace lines both ways.
+
+  ```
+  const isFence = (c) => c.tag.length >= 3;
+
+  function analyseDoc(text) {
+    const root = load(text), offs = offsets(root);
+    const blocks = [], chunks = new Map(), bags = [];
+    const visit = (bag, parent) => {
+      const name = bag.tag.trim();
+      if (RESERVED.has(name)) return;
+      const entry = { name, parent, bag, number: bags.length + 1 };
+      bags.push(entry);
+      if (!chunks.has(name)) chunks.set(name, []);
+      const list = chunks.get(name);
+      for (const k of bag.kids) {
+        if (k instanceof Code && isFence(k)) {
+          const b = layout(k, offs.get(k)); b.chunk = name; const bid = blocks.length; blocks.push(b);
+          b.lines.forEach((l, li) => list.push({ text: l.text, bid, li }));
+        } else if (k instanceof Bag) visit(k, name);
+      }
+    };
+    for (const k of root.kids) if (k instanceof Bag) visit(k, null);
+    return { root, text, blocks, chunks, bags };
+  }
+
+  function expand(name, chunks, trail = []) {
+    if (!chunks.has(name)) throw new LitError(`undefined chunk <<<${name}>>>`, 0);
+    if (trail.includes(name)) throw new LitError("recursive chunk: " + [...trail, name].join(" -> "), 0);
+    const out = [];
+    for (const l of chunks.get(name)) {
+      const m = REF.exec(l.text);
+      if (m) {
+        for (const s of expand(m[2].trim(), chunks, [...trail, name]))
+          out.push(s.text === "" ? s : { text: m[1] + s.text, bid: s.bid, li: s.li, pfx: m[1] + s.pfx });
+      } else out.push({ text: unescapeLine(l.text), bid: l.bid, li: l.li, pfx: "" });
+    }
+    return out;
+  }
+
+  function tangle(text) {
+    const doc = analyseDoc(text), files = {}, origins = {};
+    for (const name of doc.chunks.keys()) if (FILE.test(name)) {
+      const ex = expand(name, doc.chunks);
+      files[name] = ex.map((l) => l.text); origins[name] = ex;
+    }
+    return { doc, files, origins };
+  }
+  ```
+}
+
+#core: diff{
+  A line diff by longest common subsequence, returning hunks like `git diff -U0`.
+
+  ```
+  /* ---------- diff ---------- */
+  function hunks(a, b) {
+    let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
+    let q = 0; while (q < a.length - p && q < b.length - p && a[a.length - 1 - q] === b[b.length - 1 - q]) q++;
+    const x = a.slice(p, a.length - q), y = b.slice(p, b.length - q), n = x.length, m = y.length;
+    const dp = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    const out = []; let i = 0, j = 0, cur = null;
+    const open = () => { if (!cur) cur = { s: p + i, e: p + i, add: [] }; };
+    const close = () => { if (cur) { cur.e = p + i; out.push(cur); cur = null; } };
+    while (i < n || j < m) {
+      if (i < n && j < m && x[i] === y[j]) { close(); i++; j++; }
+      else if (j >= m || (i < n && dp[i + 1][j] >= dp[i][j + 1])) { open(); i++; }
+      else { open(); cur.add.push(y[j]); j++; }
+    }
+    close();
+    return out;
+  }
+  ```
+}
+
+#core: absorb{
+  Absorb folds an edited generated file back into the text through the origins, replacing,
+  deleting and inserting lines, and refuses when it cannot tell which copy of a shared chunk was
+  meant.
+
+  ```
+  /* ---------- absorb: fold an edit of a generated file back into the .lit ---------- */
+  function absorb(text, fname, oldLines, newLines) {
+    const t = tangle(text), org = t.origins[fname], blocks = t.doc.blocks;
+    const ops = [], errors = [], notes = [];
+    const litText = (o, s) => {
+      if (!s.startsWith(o.pfx)) { errors.push(`"${s.trim()}" is indented less than the reference that contains it, so the .lit cannot express it.`); return null; }
+      return blocks[o.bid].indent + s.slice(o.pfx.length);
+    };
+    const lineOfOrigin = (o) => blocks[o.bid].lines[o.li];
+    const hasNext = (o) => o.li < blocks[o.bid].lines.length - 1 || blocks[o.bid].nlLast;
+    const insertAfter = (idx, lines) => {
+      if (idx >= 0) {
+        const o = org[idx], l = lineOfOrigin(o), tx = lines.map((s) => litText(o, s));
+        if (tx.includes(null)) return;
+        if (hasNext(o)) ops.push({ start: l.end + 1, end: l.end + 1, text: tx.join("\n") + "\n", ord: 0 });
+        else ops.push({ start: l.end, end: l.end, text: "\n" + tx.join("\n"), ord: 0 });
+      } else {
+        const o = org[0], l = lineOfOrigin(o), tx = lines.map((s) => litText(o, s));
+        if (tx.includes(null)) return;
+        ops.push({ start: l.start, end: l.start, text: tx.join("\n") + "\n", ord: 1 });
+      }
+    };
+    for (const h of hunks(oldLines, newLines)) {
+      const n = h.e - h.s, m = h.add.length;
+      for (let k = 0; k < Math.min(n, m); k++) {
+        const o = org[h.s + k], l = lineOfOrigin(o), tx = litText(o, h.add[k]);
+        if (tx !== null) ops.push({ start: l.start, end: l.end, text: tx, ord: 2 });
+      }
+      if (m > n) insertAfter(h.s + n - 1, h.add.slice(n));
+      for (let k = m; k < n; k++) {
+        const o = org[h.s + k], l = lineOfOrigin(o);
+        ops.push({ start: l.start, end: l.end + (hasNext(o) ? 1 : 0), text: "", ord: 2 });
+      }
+    }
+    if (errors.length) return { errors, notes, text };
+    ops.sort((a, b) => a.start - b.start || a.end - b.end || a.ord - b.ord);
+    let out = "", cur = 0;
+    for (const op of ops) {
+      if (op.start < cur) return { errors: ["two edits overlap; edit fewer lines at once."], notes, text };
+      out += text.slice(cur, op.start) + op.text; cur = op.end;
+    }
+    out += text.slice(cur);
+    try {
+      const back = tangle(out).files[fname];
+      if (JSON.stringify(back) !== JSON.stringify(newLines))
+        return { errors: ["a chunk used in several places was touched, so the patched .lit would regenerate something different from your file."], notes, text };
+    } catch (e) { return { errors: [e.message], notes, text }; }
+    return { errors, notes, text: out };
+  }
+  ```
+}
+
+#core: three-way merge{
+  The merge runs in generated-file space against a base, as the Go sync does, and reports regions
+  as coming from the document, from the file, from both or in conflict.
+
+  ```
+  /* ---------- three-way merge in generated-file space ---------- */
+  function diff3(base, ours, theirs) {
+    const H = (o, n) => hunks(o, n).map((h) => [h.s, h.e, h.add]);
+    const items = [...H(base, ours).map(([s, e, n]) => [s, e, n, "o"]), ...H(base, theirs).map(([s, e, n]) => [s, e, n, "t"])]
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1] || (a[3] < b[3] ? -1 : 1));
+    const groups = [];
+    for (const it of items) {
+      const g = groups[groups.length - 1];
+      const overlap = g && ((it[0] === it[1] && it[0] === g.s && g.s === g.e) || (it[0] < g.e && g.s < it[1]));
+      if (overlap) { g.s = Math.min(g.s, it[0]); g.e = Math.max(g.e, it[1]); g.h.push(it); }
+      else groups.push({ s: it[0], e: it[1], h: [it] });
+    }
+    return groups.map((g) => {
+      const side = (who) => { let out = [], pos = g.s;
+        for (const [hs, he, nw, w] of [...g.h].sort((a, b) => a[0] - b[0] || a[1] - b[1])) if (w === who) { out = out.concat(base.slice(pos, hs), nw); pos = he; }
+        return out.concat(base.slice(pos, g.e)); };
+      const hasO = g.h.some((h) => h[3] === "o"), hasT = g.h.some((h) => h[3] === "t");
+      const lit = side("o"), gen = side("t");
+      const kind = !hasT ? "lit" : !hasO ? "gen" : JSON.stringify(lit) === JSON.stringify(gen) ? "same" : "conflict";
+      return { s: g.s, e: g.e, base: base.slice(g.s, g.e), lit, gen, kind };
+    });
+  }
+
+  function outcome(r, act) {
+    if (!act) act = r.kind === "conflict" ? "leave" : "apply";
+    if (act === "apply") { const x = r.kind === "gen" ? r.gen : r.lit; return [x, x, x]; }
+    if (act === "leave") return [r.lit, r.gen, r.base];
+    if (act === "lit") return [r.lit, r.lit, r.lit];
+    if (act === "gen") return [r.gen, r.gen, r.gen];
+    if (act === "both") { const b = r.lit.concat(r.gen); return [b, b, b]; }
+    throw new Error("unknown decision " + act);
+  }
+
+  // one generated file: -> {regions, newLit, gen, base, notes, errors}
+  function mergeFile(litText, fname, baseLines, genLines, decisions = {}) {
+    const ours = tangle(litText).files[fname];
+    const regions = diff3(baseLines, ours, genLines);
+    let L = [], G = [], B = [], pos = 0;
+    regions.forEach((r, i) => {
+      const [l, g, b] = outcome(r, decisions[i]);
+      const stable = baseLines.slice(pos, r.s);
+      L = L.concat(stable, l); G = G.concat(stable, g); B = B.concat(stable, b); pos = r.e;
+    });
+    const rest = baseLines.slice(pos);
+    L = L.concat(rest); G = G.concat(rest); B = B.concat(rest);
+    let newLit = litText, errors = [], notes = [];
+    if (JSON.stringify(L) !== JSON.stringify(ours)) {
+      const a = absorb(litText, fname, ours, L);
+      errors = a.errors; notes = a.notes; if (!errors.length) newLit = a.text;
+    }
+    return { regions, ours, newLit, gen: G, base: B, errors, notes };
+  }
+  ```
+}
+
+#core: weave{
+  A compact weave for the page: headings, prose with inline code and math, and the chunks with
+  their references.
+
+  ```
+  /* ---------- weave: a compact version of weave.py for the page ---------- */
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+  function bibEntries(bag) {
+    const out = [];
+    for (const k of bag.kids) if (k instanceof Bag) {
+      const src = k.kids.filter((x) => x instanceof Code).map((x) => x.text).join("\n");
+      const f = {}; for (const m of src.matchAll(/(\w+)\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}/g)) f[m[1].toLowerCase()] = m[2].replace(/[{}]/g, "");
+      out.push({ key: k.tag.trim(), f });
+    }
+    return out;
+  }
+
+  function weave(text) {
+    const doc = analyseDoc(text), def = new Map();
+    for (const b of doc.bags) if (!def.has(b.name)) def.set(b.name, b.number);
+    const cites = new Map(); let bib = null; const usedIn = new Map();
+    const cnum = (key) => { if (!cites.has(key)) cites.set(key, cites.size + 1); return cites.get(key); };
+    for (const b of doc.bags) for (const k of b.bag.kids) if (k instanceof Code && isFence(k))
+      for (const l of fenceLines(k)) { const m = REF.exec(l); if (m) { const n = m[2].trim(); (usedIn.get(n) || usedIn.set(n, []).get(n)).push(b); } }
+    let seq = 0; const bagNo = new Map(); for (const b of doc.bags) bagNo.set(b.bag, b);
+    const html = [];
+    const inlineCode = (c) => /^\$[\s\S]*\$$/.test(c.text) && c.text.length > 2
+      ? "\u0004" + esc(c.text.slice(1, -1)) + "\u0005" : `<code>${esc(c.text)}</code>`;
+    const flush = (buf) => {
+      const s = buf.join(""); buf.length = 0;
+      for (let p of s.split(/\n\s*\n/)) {
+        p = p.trim(); if (!p) continue;
+        const one = /^\u0004[^\u0004\u0005]*\u0005$/.test(p);
+        p = p.replace(/\u0004([^\u0004\u0005]*)\u0005/g, (_, t) => one ? `\\[${t}\\]` : `\\(${t}\\)`);
+        html.push(one ? `<div class="display">${p}</div>` : `<p>${p.replace(/\s*\n\s*/g, " ")}</p>`);
+      }
+    };
+    const codeHtml = (k) => fenceLines(k).map((l) => {
+      const m = REF.exec(l);
+      if (m) { const n = m[2].trim(), d = def.get(n);
+        return d ? `${esc(m[1])}<a class="ref" href="#c-${d}">«${esc(n)}»<span class="rn">§${d}</span></a>` : `${esc(m[1])}<span class="ref bad">«${esc(n)}»</span>`; }
+      return esc(unescapeLine(l));
+    }).join("\n");
+    const walk = (bag, buf) => {
+      for (const k of bag.kids) {
+        if (k instanceof Blob) buf.push(esc(k.text));
+        else if (k instanceof Code) { if (isFence(k)) { flush(buf); html.push(`<pre class="code">${codeHtml(k)}</pre>`); } else buf.push(inlineCode(k)); }
+        else {
+          const t = k.tag.trim();
+          if (HEADING.test(t)) { flush(buf); const txt = k.kids.map((x) => x.text ?? "").join(""); html.push(`<${t} id="${slug(txt)}">${esc(txt)}</${t}>`); }
+          else if (t === "cite") { const keys = k.kids.map((x) => x.text ?? "").join("").split(",").map((s) => s.trim()).filter(Boolean);
+            buf.push(`<span class="cite">[${keys.map((q) => `<a href="#bib-${esc(q)}">${cnum(q)}</a>`).join(", ")}]</span>`); }
+          else if (t === "bibliography") bib = k;
+          else { flush(buf); const b = bagNo.get(k), isFile = FILE.test(t);
+            const used = (usedIn.get(t) || []).map((u) => `<a href="#c-${u.number}">§${u.number}</a>`);
+            html.push(`<section class="chunk" id="c-${b.number}"><div class="chunk-head"><a class="num" href="#c-${b.number}">§${b.number}</a> ${isFile ? '<span class="badge">file</span> <span class="cname">' + esc(t) + "</span>" : '<span class="cname">«' + esc(t) + "»</span> ≡"}</div>` +
+              (used.length ? `<div class="meta">used in ${used.join(", ")}</div>` : ""));
+            const inner = []; walk(k, inner); flush(inner); html.push("</section>"); }
+        }
+      }
+    };
+    const top = []; walk(doc.root, top); flush(top);
+    if (bib) {
+      const rows = bibEntries(bib).map((e) => {
+        const f = e.f, venue = f.journal || f.booktitle || f.publisher || "";
+        return `<li id="bib-${esc(e.key)}" value="${cnum(e.key)}">${esc(f.author || "")}. <i>${esc(f.title || "")}</i>. ${esc(venue)}${f.year ? ", " + esc(f.year) : ""}.</li>`;
+      });
+      html.push(`<h2>Bibliography</h2><ol class="bib">${rows.join("")}</ol>`);
+    }
+    return html.join("\n");
+  }
+  function fenceLines(code) {
+    let lines = code.text.split("\n");
+    if (lines.length && lines[0].trim() === "") lines = lines.slice(1);
+    let indent = "";
+    if (lines.length && lines[lines.length - 1].trim() === "") { indent = lines[lines.length - 1]; lines = lines.slice(0, -1); }
+    return lines.map((l) => (l.startsWith(indent) ? l.slice(indent.length) : l.trimStart()));
+  }
+  ```
+}
+
+#web/core.js{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<core: constants and errors>>>
+
+  <<<core: loading>>>
+
+  <<<core: positions and layout>>>
+
+  <<<core: analysing and tangling>>>
+
+  <<<core: diff>>>
+
+  <<<core: absorb>>>
+
+  <<<core: three-way merge>>>
+
+  <<<core: weave>>>
+  ```
+}
+
+#web/core.tests.mjs{
+  The tests are appended to the parser and the core and run in Node. They tangle a small document,
+  absorb an edit, merge two edits, check a conflict, check the error messages and check the
+  escape.
+
+  ````
+  const assert = (c, m) => { if (!c) { console.error("FAIL", m); process.exitCode = 1; } else console.log("ok", m); };
+  const LIT = `#h1{Tip}
+
+  Prose.
+
+  #split{
+    \`\`\`
+    def split(total, people, tip=0.15):
+        \<<<add the tip>>>
+        return round(total / people, 2)
+    \`\`\`
+    #add the tip{
+      \`\`\`
+      total = total * (1 + tip)
+      \`\`\`
+    }
+  }
+
+  #tip.py{
+    \`\`\`
+    \<<<split>>>
+
+    print(split(84.0, 4))
+    \`\`\`
+  }
+  `;
+  const t = tangle(LIT);
+  assert(t.files["tip.py"].join("\n") === 'def split(total, people, tip=0.15):\n    total = total * (1 + tip)\n    return round(total / people, 2)\n\nprint(split(84.0, 4))', "tangle");
+  // absorb nested + top
+  let gen = t.files["tip.py"].slice(); gen[1] = "    total *= 1 + tip"; gen[4] = "print(split(120.0, 3))";
+  const a = absorb(LIT, "tip.py", t.files["tip.py"], gen);
+  assert(!a.errors.length && a.text.includes("    total *= 1 + tip") && a.text.includes("print(split(120.0, 3))"), "absorb " + a.errors);
+  assert(JSON.stringify(tangle(a.text).files["tip.py"]) === JSON.stringify(gen), "absorb roundtrip");
+  // insert/delete
+  const g2 = t.files["tip.py"].slice(); g2.splice(2, 0, "    # tip is a fraction");
+  const a2 = absorb(LIT, "tip.py", t.files["tip.py"], g2);
+  assert(!a2.errors.length && JSON.stringify(tangle(a2.text).files["tip.py"]) === JSON.stringify(g2), "absorb insert " + a2.errors);
+  const g3 = t.files["tip.py"].slice(); g3.splice(3, 1);
+  const a3 = absorb(LIT, "tip.py", t.files["tip.py"], g3);
+  assert(!a3.errors.length && JSON.stringify(tangle(a3.text).files["tip.py"]) === JSON.stringify(g3), "absorb delete " + a3.errors);
+  // merge: lit edit + gen edit
+  const lit2 = LIT.replace("tip=0.15", "tip=0.18");
+  const m = mergeFile(lit2, "tip.py", t.files["tip.py"], gen);
+  assert(m.regions.length === 3 && m.regions.map(r=>r.kind).join() === "lit,gen,gen", "regions " + m.regions.map(r=>r.kind));
+  assert(!m.errors.length && m.gen.join("\n").includes("tip=0.18") && m.gen.join("\n").includes("120.0") && m.newLit.includes("tip=0.18") && m.newLit.includes("120.0"), "merge both ways " + m.errors);
+  // conflict
+  const gc = t.files["tip.py"].slice(); gc[0] = gc[0].replace("0.15", "0.20");
+  const mc = mergeFile(lit2, "tip.py", t.files["tip.py"], gc);
+  assert(mc.regions.length === 1 && mc.regions[0].kind === "conflict", "conflict");
+  const mc2 = mergeFile(lit2, "tip.py", t.files["tip.py"], gc, { 0: "gen" });
+  assert(mc2.newLit.includes("0.20") && mc2.gen[0].includes("0.20"), "conflict take gen");
+  // errors
+  for (const bad of ["#h1{x}\nstray } here\n", "#h1{x}\nprose # hash\n", "#h1{x}\na { b\n", "#a{\n"]) {
+    try { load(bad); assert(false, "should fail " + bad); } catch (e) { assert(e instanceof LitError, `${JSON.stringify(bad)} -> line ${e.line}: ${e.message}`); }
+  }
+  // escape
+  const E = "#d.txt{\n  ```\n  \\<<<name>>>\n  ```\n}\n".replace(/```/g, "```");
+  assert(tangle(E).files["d.txt"][0] === "<<<name>>>", "escape");
+  assert(weave(LIT).includes("§2"), "weave");
+  ````
+}
+
+#h2{The page's behaviour}
+
+The interface script connects the core to the page. It has no framework; each part is a few
+functions bound to elements by id.
+
+#ui: helpers, theme and copy buttons{
+  Helpers, the examples read back from the page, the lamp, which remembers the choice if storage
+  is available, and the copy buttons.
+
+  ```
+  /* ---------- page ---------- */
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const PRESETS = $$("script[data-preset]").map((s) => ({ id: s.dataset.id, name: s.dataset.preset, file: s.dataset.file, text: s.textContent.replace(/^\n/, "") }));
+  const preset = (id) => PRESETS.find((p) => p.id === id);
+  const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} } };
+
+  /* theme lamp */
+  (function () {
+    const root = document.documentElement, saved = store.get("lit-theme");
+    if (saved === "dark" || saved === "light") root.dataset.theme = saved;
+    $("#lamp").addEventListener("click", () => {
+      const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+      root.dataset.theme = dark ? "light" : "dark"; store.set("lit-theme", root.dataset.theme);
+    });
+  })();
+
+  /* copy buttons */
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest("[data-copy]"); if (!b) return;
+    const text = b.dataset.copy, done = () => { const o = b.textContent; b.textContent = "Copied"; setTimeout(() => (b.textContent = o), 1200); };
+    const fallback = () => { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); try { document.execCommand("copy"); done(); } catch (x) {} t.remove(); };
+    try { navigator.clipboard.writeText(text).then(done, fallback); } catch (x) { fallback(); }
+  });
+  ```
+}
+
+#ui: the editor{
+  The editor draws a gutter and a highlighted copy of the text under the text area, and keeps them
+  scrolled together.
+
+  ```
+  /* ---------- playground ---------- */
+  const src = $("#src"), gut = $("#gut"), hl = $("#hl"), trace = $("#trace");
+  let T = null, srcFile = "merge_sort.lit", hlRows = [], byLitLine = new Map(), lineStarts = [0];
+  const TRACE_IDLE = "Hover a generated line to see where it came from. Click into the document to see where a line goes.";
+  trace.textContent = TRACE_IDLE;
+
+  function lineOfOffset(off) { let lo = 0, hi = lineStarts.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (lineStarts[mid] <= off) lo = mid; else hi = mid - 1; } return lo + 1; }
+
+  function errLine(err, text) {
+    if (err.line) return err.line;
+    const m = /<<<(.+?)>>>/.exec(err.message); if (!m) return 0;
+    const i = text.indexOf("<<<" + m[1] + ">>>"); return i < 0 ? 0 : lineAt(text, i);
+  }
+
+  function drawEditor(text, t, bad) {
+    const lines = text.split("\n"); lineStarts = [0];
+    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lineStarts.push(i + 1);
+    const cls = new Array(lines.length).fill("");
+    if (t) for (const b of t.doc.blocks) for (const l of b.lines) { const n = lineOfOffset(l.start) - 1; cls[n] = REF.test(l.text) ? "ref" : "code"; }
+    if (bad) cls[bad - 1] = "bad";
+    hl.innerHTML = lines.map((l, i) => `<div class="l ${cls[i]}">${esc(l) || " "}</div>`).join("");
+    hlRows = [...hl.children];
+    gut.innerHTML = lines.map((_, i) => `<div class="${bad === i + 1 ? "bad" : ""}">${i + 1}</div>`).join("");
+    syncScroll();
+  }
+  function syncScroll() {
+    hl.style.transform = `translate(${-src.scrollLeft}px, ${-src.scrollTop}px)`;
+    gut.style.transform = `translateY(${-src.scrollTop}px)`;
+  }
+  src.addEventListener("scroll", syncScroll);
+
+  function setHot(lines) { hlRows.forEach((r, i) => r.classList.toggle("hot", lines.has(i + 1))); }
+  function setOn(keys) { $$(".gl", $("#out-tangled")).forEach((g) => g.classList.toggle("on", keys.has(g.dataset.f + ":" + g.dataset.i))); }
+  ```
+}
+
+#ui: rendering and updating{
+  Every change of the text tangles it again and redraws the files, the chunks and, when it is
+  visible, the woven page. A document that does not parse shows the error and the line instead.
+
+  ```
+  function renderTangled(t) {
+    byLitLine = new Map();
+    const names = Object.keys(t.origins);
+    if (!names.length) return `<div class="empty">No file yet. A chunk whose name ends in an extension, like <code>#hello.py{ ... }</code>, is written out as a file.</div>`;
+    return names.map((name) => {
+      const ex = t.origins[name];
+      const rows = ex.map((l, i) => {
+        const L = lineOfOffset(t.doc.blocks[l.bid].lines[l.li].start);
+        (byLitLine.get(L) || byLitLine.set(L, []).get(L)).push(name + ":" + i);
+        return `<span class="gl" data-f="${esc(name)}" data-i="${i}" data-l="${L}" data-b="${l.bid}"><i>${i + 1}</i>${esc(l.text) || " "}</span>`;
+      }).join("");
+      return `<div class="file-head"><span>${esc(name)}</span><span>${ex.length} lines</span></div><pre class="gen">${rows}</pre>`;
+    }).join("");
+  }
+
+  function renderChunks(t) {
+    const { chunks } = t.doc, kids = new Map(), used = new Set(), missing = new Set();
+    for (const [n, lines] of chunks) { const k = [];
+      for (const l of lines) { const m = REF.exec(l.text); if (m) { const c = m[2].trim(); k.push(c); used.add(c); if (!chunks.has(c)) missing.add(c); } }
+      kids.set(n, k); }
+    const defs = new Map(); for (const b of t.doc.bags) defs.set(b.name, (defs.get(b.name) || 0) + 1);
+    const node = (n, depth) => {
+      const own = chunks.get(n) ? chunks.get(n).length : 0, isFile = FILE.test(n);
+      const sub = depth < 8 && kids.get(n) ? kids.get(n).map((c) => node(c, depth + 1)).join("") : "";
+      return `<li><span class="${isFile ? "fn" : missing.has(n) ? "cn bad" : "cn"}">${isFile ? esc(n) : "«" + esc(n) + "»"}</span><span class="dim">${missing.has(n) ? "not defined" : own + " lines" + (defs.get(n) > 1 ? ` · defined ${defs.get(n)} times` : "")}</span>${sub ? `<ul>${sub}</ul>` : ""}</li>`;
+    };
+    const files = [...chunks.keys()].filter((n) => FILE.test(n));
+    const unused = [...chunks.keys()].filter((n) => !FILE.test(n) && !used.has(n) && chunks.get(n).length);
+    return (files.length ? `<ul class="tree">${files.map((f) => node(f, 0)).join("")}</ul>` : `<div class="empty">No file chunks, so nothing to draw.</div>`) +
+      unused.map((n) => `<div class="warn">«${esc(n)}» has code but nothing uses it, so it is never written.</div>`).join("");
+  }
+
+  let wovenDirty = true;
+  function renderWoven(text) {
+    const el = $("#out-woven");
+    try { el.innerHTML = weave(text); } catch (e) { el.innerHTML = ""; }
+    if (window.MathJax && MathJax.typesetPromise) { try { MathJax.typesetClear([el]); } catch (e) {} MathJax.typesetPromise([el]).catch(() => {}); }
+    wovenDirty = false;
+  }
+
+  function showError(err, text) {
+    const n = errLine(err, text);
+    const html = `<div class="err"><b>${n ? "line " + n : "error"}</b> ${esc(err.message)}${n ? `<br><span class="small-note">${esc(text.split("\n")[n - 1] || "")}</span>` : ""}</div>`;
+    $("#out-tangled").innerHTML = html; $("#out-chunks").innerHTML = html; $("#out-woven").innerHTML = html;
+    $("#srcStatus").textContent = "does not parse"; $("#srcStatus").style.color = "var(--bad)";
+    drawEditor(text, null, n);
+  }
+
+  function update() {
+    const text = src.value; let t;
+    try { t = tangle(text); } catch (e) { T = null; showError(e, text); return; }
+    T = t; drawEditor(text, t, 0);
+    const nf = Object.keys(t.files).length;
+    $("#srcStatus").textContent = `${t.doc.chunks.size} chunks · ${nf} file${nf === 1 ? "" : "s"}`; $("#srcStatus").style.color = "";
+    $("#out-tangled").innerHTML = renderTangled(t);
+    $("#out-chunks").innerHTML = renderChunks(t);
+    wovenDirty = true; if (!$("#out-woven").hidden) renderWoven(text);
+    trace.innerHTML = TRACE_IDLE;
+  }
+  src.addEventListener("input", update);
+
+  $("#out-tangled").addEventListener("mouseover", (e) => {
+    const g = e.target.closest(".gl"); if (!g || !T) return;
+    setHot(new Set([+g.dataset.l])); const b = T.doc.blocks[+g.dataset.b];
+    trace.innerHTML = `<b>${esc(g.dataset.f)}:${+g.dataset.i + 1}</b> <span class="arrow">→</span> <b>${esc(srcFile)}:${g.dataset.l}</b>  «${esc(b.chunk)}»`;
+  });
+  $("#out-tangled").addEventListener("mouseleave", () => { setHot(new Set()); trace.textContent = TRACE_IDLE; });
+  ```
+}
+
+#ui: tracing and presets{
+  Moving the caret into a code line shows where it is generated, and hovering a generated line
+  shows where it came from. Presets load examples.
+
+  ```
+  function caretTrace() {
+    if (!T) return; const L = lineAt(src.value, src.selectionStart); const hits = byLitLine.get(L);
+    setOn(new Set(hits || []));
+    if (hits) { const [f, i] = hits[0].split(":"); trace.innerHTML = `<b>${esc(srcFile)}:${L}</b> <span class="arrow">→</span> ${hits.map((h) => { const k = h.lastIndexOf(":"); return `<b>${esc(h.slice(0, k))}:${+h.slice(k + 1) + 1}</b>`; }).slice(0, 4).join(", ")}${hits.length > 4 ? ", …" : ""}`; }
+    else trace.innerHTML = `<b>${esc(srcFile)}:${L}</b> <span class="arrow">→</span> no generated line (prose, or a chunk nothing uses)`;
+  }
+  ["keyup", "click", "focus"].forEach((ev) => src.addEventListener(ev, caretTrace));
+  src.addEventListener("blur", () => setOn(new Set()));
+
+  $$("#tabs .tab").forEach((b) => b.addEventListener("click", () => {
+    $$("#tabs .tab").forEach((x) => x.setAttribute("aria-selected", x === b));
+    for (const id of ["tangled", "chunks", "woven"]) $("#out-" + id).hidden = id !== b.dataset.tab;
+    if (b.dataset.tab === "woven" && wovenDirty && T) renderWoven(src.value);
+  }));
+
+  function loadPreset(id, scroll) {
+    const p = preset(id); if (!p) return;
+    src.value = p.text; srcFile = p.file; $("#srcName").textContent = p.file; src.scrollTop = 0; src.scrollLeft = 0;
+    $$("#presets .chip").forEach((c) => c.setAttribute("aria-pressed", c.dataset.id === id));
+    update();
+    if (scroll) $("#try").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+  $("#presets").innerHTML = PRESETS.filter((p) => p.id !== "lab").map((p) => `<button class="chip" data-id="${p.id}" aria-pressed="false">${esc(p.name)}</button>`).join("");
+  $("#presets").addEventListener("click", (e) => { const c = e.target.closest(".chip"); if (c) loadPreset(c.dataset.id); });
+  document.addEventListener("click", (e) => { const b = e.target.closest("[data-load]"); if (b) loadPreset(b.dataset.load.replace(".lit", ""), true); });
+  loadPreset("merge");
+  ```
+}
+
+#ui: maths{
+  MathJax is loaded after first paint, so that it never delays the page.
+
+  ```
+  /* MathJax, loaded after first paint */
+  window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] }, svg: { fontCache: "global" }, startup: { typeset: false } };
+  { const s = document.createElement("script"); s.async = true; s.src = "https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-svg.min.js"; document.head.appendChild(s); }
+  ```
+}
+
+#ui: conventions{
+  The list of conventions with the example each one loads.
+
+  ````
+  /* ---------- notation rules ---------- */
+  const RULES = [
+    ["A bag is a chunk", "The toolkit reads any bag as a chunk of the program, except the headings h1 to h6, cite and bibliography. Chunks nest, and names may contain spaces.",
+      "#greeting{\n  Say hello.\n  ```\n  print(\"hello\")\n  ```\n}", "twice"],
+    ["A long run of ticks is program text", "A code node whose tag is three or more ticks is program text, and belongs to the innermost chunk. Use more ticks than the longest run inside it. One or two ticks stay inline code in the prose. The indentation of the closing run is stripped.",
+      "#loop{\n  Count to `n`.\n  ```\n  for i in range(n):\n      print(i)\n  ```\n}", "merge"],
+    ["A reference pastes a chunk", "A line of program text holding only a reference is replaced by the chunk, indented like the reference. Order in the document is free; order in the file is yours to choose.",
+      "def hello(name):\n    <<<greeting>>>", "files"],
+    ["The same name joins up", "Define a chunk twice and the code is concatenated in document order. Introduce each import beside the code that needs it.",
+      "#imports{\n  ```\n  import json\n  ```\n}\n\n(later in the document)\n\n#imports{\n  ```\n  import time\n  ```\n}", "twice"],
+    ["An extension makes a file", "A chunk named like a file is written out when you tangle. The name may carry a folder, such as rig/model.py.",
+      "#app.py{\n  ```\n  <<<imports>>>\n  <<<main>>>\n  ```\n}", "files"],
+    ["Math and citations", "A code span starting and ending with a dollar sign is LaTeX. A citation is a bag with a key, and the bibliography holds BibTeX that weave formats and links.",
+      "`$e^{i\\pi} + 1 = 0$`\nas shown in #cite{euler1748}.", "math"],
+    ["A backslash escapes a reference", "Writing about the notation needs a reference line that is not one. Put a backslash in front; tangle removes exactly one.",
+      "\\<<<shout>>>   (written out as: <<<shout>>>)", "escape"],
+  ];
+  $("#rules").innerHTML = RULES.map((r, i) => `<div class="rule"><h3>${esc(r[0])}</h3><p>${esc(r[1])}</p><pre>${esc(r[2])}</pre><button class="btn" data-load="${r[3]}">Try it in the editor</button></div>`).join("");
+  ````
+}
+
+#ui: toolbelt{
+  The list of tools.
+
+  ```
+  /* ---------- toolbelt ---------- */
+  const TOOLS = [
+    ["lit tangle", "Writes every file chunk, and a sourcemap next to them. Before overwriting a file you edited, it keeps a copy.", "lit tangle program.lit out/"],
+    ["lit weave", "Interlinked HTML with MathJax, a chunk index and a bibliography. LaTeX too, ready for your own engine.", "lit weave program.lit -o site/"],
+    ["lit absorb", "Folds an edit of a generated file back into the document, using git diff and the sourcemap. It refuses rather than guess.", "lit absorb program.lit out/app.py -o out/"],
+    ["lit addr", "Translates an address in either direction, for editors and error messages. It also copes with files you edited since tangling.", "lit addr program.lit out/app.py:42:9"],
+    ["lit sync", "Three-way merge between the document and its files, and an interactive picker, region by region, in both directions.", "lit sync program.lit pick -o out/"],
+    ["lit watch", "Records every change to either side without touching anything, so no edit is ever lost.", "lit watch program.lit -o out/"],
+    ["lit lint", "Finds what compilers cannot: stray braces, undefined references, citations with no entry, and unverifiable bibliography items.", "lit lint program.lit --refs"],
+    ["lit fill", "Fills each #agent-fill-in{...} gap: gathers context from the whole document, asks an assistant, checks the answer, writes it in.", "lit fill program.lit --agent anthropic"],
+    ["lit review", "Checks what was filled in, optionally asks a second assistant, and approves or rejects each fill.", "lit review program.lit --ai"],
+  ];
+  $("#toolgrid").innerHTML = TOOLS.map((t) => `<div class="tool"><h3>${esc(t[0])}</h3><p>${esc(t[1])}</p><div class="cmd"><code>${esc(t[2])}</code><button class="btn" data-copy="${esc(t[2])}">Copy</button></div></div>`).join("");
+  ```
+}
+
+#ui: the sync lab{
+  The lab holds a small program tangled from a document, applies canned edits to either side, and
+  shows what tangle, absorb and merge do with them, reporting each action in a log.
+
+  ```
+  /* ---------- the lab ---------- */
+  const labLit = $("#labLit"), labGen = $("#labGen"), LAB = preset("lab").text, F = "tip.py";
+  let baseGen = [], baseLit = "", backups = [];
+  const logEl = $("#log");
+  const joinLines = (a) => a.join("\n") + (a.length ? "\n" : "");
+  function say(msg, kind) { const li = document.createElement("li"); if (kind) li.className = kind; li.innerHTML = msg; logEl.prepend(li); }
+  function reset() {
+    labLit.value = LAB; const t = tangle(LAB); baseGen = t.files[F].slice(); baseLit = LAB; labGen.value = joinLines(baseGen); backups = [];
+    logEl.innerHTML = ""; say("Tangled <code>tip.lit</code> into <code>tip.py</code>. Both sides start out equal."); refresh();
+  }
+  const EDITS = [
+    ["Document: tip 18%", () => labLit.value.includes("tip=0.15") && (labLit.value = labLit.value.replace("tip=0.15", "tip=0.18")), "in the document"],
+    ["File: split for 3", () => labGen.value.includes("split(84.0, 4)") && (labGen.value = labGen.value.replace("split(84.0, 4)", "split(120.0, 3)")), "in tip.py"],
+    ["File: tidy the tip line", () => labGen.value.includes("total = total * (1 + tip)") && (labGen.value = labGen.value.replace("total = total * (1 + tip)", "total *= 1 + tip")), "in tip.py"],
+    ["File: tip 20%", () => labGen.value.includes("tip=0.15") && (labGen.value = labGen.value.replace("tip=0.15", "tip=0.20")), "in tip.py"],
+  ];
+  $("#edits").insertAdjacentHTML("beforeend", EDITS.map((e, i) => `<button class="chip" data-edit="${i}">${esc(e[0])}</button>`).join(""));
+  $("#edits").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-edit]"); if (!b) return; const ed = EDITS[+b.dataset.edit];
+    if (ed[1]()) say(`Edited ${ed[2]}: <i>${esc(ed[0].replace(/^(Document|File): /, ""))}</i>.`); else say("That line has already been changed. Start over, or edit the text yourself.", "bad");
+    refresh();
+  });
+
+  function diffHtml(base, now) {
+    const hs = hunks(base, now); if (!hs.length) return "";
+    return hs.map((h) => base.slice(h.s, h.e).map((l) => `<span class="d">- ${esc(l)}</span>`).concat(h.add.map((l) => `<span class="a">+ ${esc(l)}</span>`)).join("\n")).join("\n");
+  }
+  function regionHtml(r, i) {
+    const at = `line ${r.s + 1}${r.e - r.s > 1 ? "–" + r.e : ""}`;
+    if (r.kind === "conflict") return `<div class="reg"><span class="kind conflict">conflict</span><code>${F} ${at}</code>` +
+      `<pre class="diff"><span class="who">the document says</span>${diffHtml(r.base, r.lit)}<span class="who">the file says</span>${diffHtml(r.base, r.gen)}</pre>` +
+      `<div class="resolve"><button class="btn" data-res="${i}:lit">Keep the document's</button><button class="btn" data-res="${i}:gen">Keep the file's</button><button class="btn" data-res="${i}:both">Keep both</button></div></div>`;
+    const label = { lit: "from the document", gen: "from the file", same: "both sides, same change" }[r.kind];
+    return `<div class="reg"><span class="kind ${r.kind}">${label}</span><code>${F} ${at}</code><pre class="diff">${diffHtml(r.base, r.kind === "gen" ? r.gen : r.lit)}</pre></div>`;
+  }
+  let regions = [];
+  function refresh() {
+    const lit = labLit.value, gen = toLines(labGen.value);
+    const dl = lit !== baseLit, dg = JSON.stringify(gen) !== JSON.stringify(baseGen);
+    const ls = $("#litState"), gs = $("#genState");
+    ls.textContent = dl ? "edited" : "in sync"; ls.classList.toggle("dirty", dl);
+    gs.textContent = dg ? "edited" : "in sync"; gs.classList.toggle("dirty", dg);
+    let ours;
+    try { ours = tangle(lit).files[F]; if (!ours) throw new LitError("the document no longer defines tip.py", 0); }
+    catch (e) { regions = []; $("#pending").innerHTML = `<div class="err" style="margin:0"><b>${e.line ? "line " + e.line : "error"}</b> ${esc(e.message)}</div>`; setButtons(false); return; }
+    regions = diff3(baseGen, ours, gen);
+    const k = (x) => regions.filter((r) => r.kind === x).length;
+    $("#pending").innerHTML = regions.length ? regions.map(regionHtml).join("") : `<p class="ok-line" style="margin:0">Both sides agree. Nothing is waiting.</p>`;
+    setButtons(true);
+    $("#bMerge").disabled = !regions.length; $("#bAbsorb").disabled = !dg && !dl && !regions.length;
+    const bk = $("#backups");
+    bk.innerHTML = backups.length ? "Saved copies of edits that were replaced: " + backups.map((b, i) => `<button class="btn" data-restore="${i}">Restore #${i + 1}</button>`).join(" ") : "";
+  }
+  function setButtons(ok) { ["#bMerge", "#bTangle", "#bAbsorb"].forEach((s) => ($(s).disabled = !ok)); }
+  labLit.addEventListener("input", refresh); labGen.addEventListener("input", refresh);
+
+  $("#bTangle").addEventListener("click", () => {
+    let t; try { t = tangle(labLit.value); } catch (e) { say(esc(e.message), "bad"); return; }
+    const ours = t.files[F], cur = toLines(labGen.value);
+    if (JSON.stringify(cur) === JSON.stringify(ours)) { say("Tangle: tip.py already matches the document."); baseGen = ours.slice(); baseLit = labLit.value; refresh(); return; }
+    if (JSON.stringify(cur) !== JSON.stringify(baseGen)) { backups.push(labGen.value); say("Tangle replaced <code>tip.py</code>. It had edits that were not in the document, so a copy was saved. That is the order problem: tangle first, and the file's edit is gone from view.", "bad"); }
+    else say("Tangle rewrote <code>tip.py</code> from the document.", "good");
+    labGen.value = joinLines(ours); baseGen = ours.slice(); baseLit = labLit.value; refresh();
+  });
+  $("#bAbsorb").addEventListener("click", () => {
+    if (labLit.value !== baseLit) { say("Absorb refused: the document changed since it was tangled, so the sourcemap is out of date. Use Merge, which handles both.", "bad"); return; }
+    const pristine = tangle(labLit.value).files[F], cur = toLines(labGen.value);
+    if (JSON.stringify(pristine) === JSON.stringify(cur)) { say("Absorb: nothing to absorb, the file matches the document."); return; }
+    const a = absorb(labLit.value, F, pristine, cur);
+    if (a.errors.length) { say("Absorb refused: " + esc(a.errors[0]), "bad"); return; }
+    labLit.value = a.text; baseLit = a.text; baseGen = cur.slice();
+    say("Absorbed the file's edits into the document. Order problem, other direction: any edit you had made in the document and not tangled would have blocked this.", "good"); refresh();
+  });
+  function doMerge(decisions) {
+    const lit = labLit.value, gen = toLines(labGen.value);
+    let r; try { r = mergeFile(lit, F, baseGen, gen, decisions); } catch (e) { say(esc(e.message), "bad"); return; }
+    if (r.errors.length) { say("Merge refused: " + esc(r.errors[0]), "bad"); return; }
+    const n = (x) => r.regions.filter((q, i) => q.kind === x && !decisions[i]).length, left = r.regions.filter((q, i) => q.kind === "conflict" && !decisions[i]).length;
+    const parts = [];
+    if (n("lit")) parts.push(`${n("lit")} change${n("lit") > 1 ? "s" : ""} from the document went into the file`);
+    if (n("gen")) parts.push(`${n("gen")} edit${n("gen") > 1 ? "s" : ""} from the file went into the document`);
+    if (Object.keys(decisions).length) parts.push("your choice was applied");
+    labLit.value = r.newLit; labGen.value = joinLines(r.gen); baseGen = r.base; baseLit = r.newLit;
+    say("Merged: " + (parts.join("; ") || "nothing to do") + "." + (left ? ` ${left} conflict${left > 1 ? "s" : ""} left for you.` : " Both sides agree now."), left ? "bad" : "good");
+    refresh();
+  }
+  $("#bMerge").addEventListener("click", () => doMerge({}));
+  $("#pending").addEventListener("click", (e) => { const b = e.target.closest("[data-res]"); if (!b) return; const [i, c] = b.dataset.res.split(":"); doMerge({ [i]: c }); });
+  $("#backups").addEventListener("click", (e) => { const b = e.target.closest("[data-restore]"); if (!b) return; labGen.value = backups[+b.dataset.restore]; say("Restored a saved copy into <code>tip.py</code>."); refresh(); });
+  $("#bReset").addEventListener("click", reset);
+  reset();
+  ```
+}
+
+#ui: the tree inspector{
+  The inspector parses a text with the brashtag parser and draws the tree of bags, blobs and code.
+
+  ````
+  /* ---------- the tree inspector ---------- */
+  const TREES = [
+    ["A card", "#card{\n  #front{\n    This is front.\n  }\n  #back{\n    This is back.\n  }\n}\n"],
+    ["Hello and code", "Hello, World!\n\n#comment{\n  A first program!\n}\n\nCode to compute the nth Fibonacci number.\n\n`\ndef fibs(n):\n    if n == 0 or n == 1:\n        return 1\n    return fibs(n-1) + fibs(n-2)\n`\n\nThat is all.\n"],
+    ["More ticks", "A code node needs more ticks than the longest run inside it.\n\n``\nSome `code` here.\n``\n\n```\nA run of `` inside needs three.\n```\n"],
+    ["Break it", "A stray } in running text closes the tree early.\n\n#note{\n  Put it in ticks instead: `}`\n}\n"],
+  ];
+  const treeSrc = $("#treeSrc");
+  const snip = (s, n = 70) => { const t = s.replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n) + "…" : t; };
+  function nodeHtml(n) {
+    if (n instanceof Bag) { const kids = n.kids.map(nodeHtml).join("");
+      return `<li><span class="nk bag">bag</span> <span class="cn">#${esc(n.tag)}</span>${kids ? `<ul>${kids}</ul>` : ""}</li>`; }
+    if (n instanceof Code) return `<li><span class="nk code">code</span> <span class="dim">${n.tag.length} tick${n.tag.length > 1 ? "s" : ""}</span><span class="snip">${esc(n.text.replace(/^\n|\n$/g, ""))}</span></li>`;
+    if (n.text.trim() === "") return "";
+    return `<li><span class="nk blob">blob</span> <span class="q">${esc(snip(n.text))}</span></li>`;
+  }
+  function drawTree() {
+    const text = treeSrc.value, out = $("#treeOut"), st = $("#treeStatus");
+    try {
+      const root = load(text);
+      out.innerHTML = `<ul class="tree"><li><span class="nk bag">bag</span> <span class="cn">the whole text</span> <span class="dim">(an implicit bag around it)</span><ul>${root.kids.map(nodeHtml).join("")}</ul></li></ul>`;
+      st.textContent = "parses"; st.style.color = "";
+    } catch (e) {
+      out.innerHTML = `<div class="err"><b>${e.line ? "line " + e.line : "error"}</b> ${esc(e.message)}${e.line ? `<br><span class="small-note">${esc(text.split("\n")[e.line - 1] || "")}</span>` : ""}</div>`;
+      st.textContent = "does not parse"; st.style.color = "var(--bad)";
+    }
+  }
+  $("#treeChips").innerHTML = TREES.map((t, i) => `<button class="chip" data-tree="${i}" aria-pressed="false">${esc(t[0])}</button>`).join("");
+  $("#treeChips").addEventListener("click", (e) => {
+    const c = e.target.closest("[data-tree]"); if (!c) return;
+    $$("#treeChips .chip").forEach((x) => x.setAttribute("aria-pressed", x === c));
+    treeSrc.value = TREES[+c.dataset.tree][1]; drawTree();
+  });
+  treeSrc.addEventListener("input", () => { $$("#treeChips .chip").forEach((x) => x.setAttribute("aria-pressed", "false")); drawTree(); });
+  $("#treeChips .chip").click();
+  ````
+}
+
+#ui: the tab key{
+  In a text area Tab normally moves focus away, which is wrong in an editor for code. Tab inserts
+  a tab, and Escape followed by Tab leaves, so keyboard users are not trapped.
+
+  ```
+  /* ---------- Tab inserts a tab; Esc then Tab leaves the editor ---------- */
+  function typeInto(ta, text) {
+    ta.focus();
+    if (!document.execCommand("insertText", false, text)) { ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, "end"); ta.dispatchEvent(new Event("input", { bubbles: true })); }
+  }
+  function tabbable(ta) {
+    let escaped = false;
+    ta.addEventListener("blur", () => (escaped = false));
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { escaped = true; return; }
+      if (e.key !== "Tab" || e.ctrlKey || e.metaKey || e.altKey) { if (e.key !== "Shift") escaped = false; return; }
+      if (escaped) { escaped = false; return; }
+      e.preventDefault();
+      const v = ta.value, s = ta.selectionStart, en = ta.selectionEnd;
+      if (s === en && !e.shiftKey) { typeInto(ta, "\t"); return; }
+      const ls = v.lastIndexOf("\n", s - 1) + 1;
+      let le = v.indexOf("\n", en > s && v[en - 1] === "\n" ? en - 1 : en); if (le < 0) le = v.length;
+      const lines = v.slice(ls, le).split("\n");
+      const out = lines.map((l) => (e.shiftKey ? l.replace(/^(\t| {1,4})/, "") : "\t" + l));
+      const block = out.join("\n"), delta = block.length - (le - ls);
+      ta.setSelectionRange(ls, le); typeInto(ta, block);
+      if (s === en) { const first = out[0].length - lines[0].length; const p = Math.max(ls, s + first); ta.setSelectionRange(p, p); }
+      else ta.setSelectionRange(ls, le + delta);
+    });
+    const head = ta.closest(".pane") && ta.closest(".pane").querySelector(".pane-head");
+    if (head) { const h = document.createElement("span"); h.className = "hint"; h.textContent = "Tab inserts a tab · Esc, then Tab, leaves"; head.appendChild(h); }
+  }
+  ["#src", "#labLit", "#labGen", "#treeSrc"].forEach((s) => tabbable($(s)));
+  ```
+}
+
+#web/ui.js{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<ui: helpers, theme and copy buttons>>>
+
+  <<<ui: the editor>>>
+
+  <<<ui: rendering and updating>>>
+  <<<ui: tracing and presets>>>
+
+  <<<ui: maths>>>
+
+  <<<ui: conventions>>>
+
+  <<<ui: toolbelt>>>
+
+  <<<ui: the sync lab>>>
+
+  <<<ui: the tree inspector>>>
+
+  <<<ui: the tab key>>>
+  ```
+}
+
+#h2{Examples}
+
+The examples the editors can load, each a small literate document. They are data, not code, so
+each is a file chunk of its own.
+
+#web/presets/merge.lit{
+  A merge sort with the code split into named parts.
+
+  ````
+  #h1{Merge sort}
+
+  Split the list in half, sort each half, merge the two. The running time obeys
+  `$T(n) = 2T(n/2) + \Theta(n)$`
+  which solves to `$\Theta(n \log n)$` #cite{cormen2022}.
+
+  #merge{
+    To merge two sorted lists, repeatedly move the smaller head to the result. Taking from the
+    left on ties keeps the sort stable, which is why the test is `<=` and not `<`.
+
+    ```
+    def merge(a, b):
+        res = []
+        i = j = 0
+        while i < len(a) and j < len(b):
+            \<<<take the smaller head>>>
+        return res + a[i:] + b[j:]
+    ```
+
+    #take the smaller head{
+      ```
+      if a[i] <= b[j]:
+          res.append(a[i]); i += 1
+      else:
+          res.append(b[j]); j += 1
+      ```
+    }
+  }
+
+  #sort{
+    Lists of length one or less are already sorted. Otherwise cut in the middle, sort the halves, merge.
+
+    ```
+    def merge_sort(xs):
+        if len(xs) <= 1:
+            return xs
+        mid = len(xs) // 2
+        return merge(merge_sort(xs[:mid]), merge_sort(xs[mid:]))
+    ```
+  }
+
+  #merge_sort.py{
+    ```
+    \<<<merge>>>
+
+
+    \<<<sort>>>
+    ```
+  }
+
+  #bibliography{
+    #cormen2022{
+      ```
+      @book{cormen2022,
+        author = {Thomas H. Cormen and Charles E. Leiserson and Ronald L. Rivest and Clifford Stein},
+        title = {Introduction to Algorithms}, publisher = {MIT Press}, edition = {4th}, year = {2022}
+      }
+      ```
+    }
+  }
+  ````
+}
+
+#web/presets/twice.lit{
+  A chunk defined twice: the definitions concatenate.
+
+  ````
+  #h1{Imports, explained where they matter}
+
+  Chunks with the same name are joined in document order. A program can introduce each import
+  next to the code that needs it, and tangle collects them at the top.
+
+  #imports{
+    We need `json` to read the settings.
+    ```
+    import json
+    ```
+  }
+
+  #load settings{
+    ```
+    def load(path):
+        with open(path) as f:
+            return json.load(f)
+    ```
+  }
+
+  #imports{
+    Later, `time` is needed to stamp the log.
+    ```
+    import time
+    ```
+  }
+
+  #stamp{
+    ```
+    def stamp(msg):
+        return f"{time.strftime('%H:%M')} {msg}"
+    ```
+  }
+
+  #app.py{
+    ```
+    \<<<imports>>>
+
+
+    \<<<load settings>>>
+
+
+    \<<<stamp>>>
+    ```
+  }
+  ````
+}
+
+#web/presets/files.lit{
+  One chunk used by two files.
+
+  ````
+  #h1{One chunk, two files}
+
+  The greeting is written once. Tangle pastes it into the module and into the test, and each paste
+  keeps the indentation of the reference that asked for it.
+
+  #greeting{
+    ```
+    return f"Hello, {name}!"
+    ```
+  }
+
+  #hello.py{
+    ```
+    def hello(name):
+        \<<<greeting>>>
+    ```
+  }
+
+  #test_hello.py{
+    ```
+    from hello import hello
+
+
+    def expected(name):
+        \<<<greeting>>>
+
+
+    def test_hello():
+        assert hello("Ada") == expected("Ada")
+    ```
+  }
+  ````
+}
+
+#web/presets/escape.lit{
+  A reference that is shown and not expanded.
+
+  ````
+  #h1{Writing about the notation}
+
+  A reference alone on a line is replaced by its chunk. To show one literally, put a backslash in
+  front of it. Tangle removes exactly one backslash.
+
+  #shout{
+    ```
+    LOUD
+    ```
+  }
+
+  #NOTATION.md{
+    ```
+    The real thing, expanded:
+    \<<<shout>>>
+
+    The literal thing, escaped:
+    \\<<<shout>>>
+    ```
+  }
+  ````
+}
+
+#web/presets/math.lit{
+  Mathematics and a citation in the prose.
+
+  ````
+  #h1{Softmax, carefully}
+
+  The softmax of a vector `$x$` is
+
+  `$\mathrm{softmax}(x)_i = \frac{e^{x_i}}{\sum_j e^{x_j}}$`
+
+  Subtracting the maximum first changes nothing mathematically and avoids overflow; see the
+  discussion of overflow and underflow in #cite{goodfellow2016}. A paragraph that holds nothing but
+  one math span becomes display math when woven.
+
+  #softmax{
+    ```
+    import math
+
+
+    def softmax(x):
+        m = max(x)
+        e = [math.exp(v - m) for v in x]
+        s = sum(e)
+        return [v / s for v in e]
+    ```
+  }
+
+  #softmax.py{
+    ```
+    \<<<softmax>>>
+    ```
+  }
+
+  #bibliography{
+    #goodfellow2016{
+      ```
+      @book{goodfellow2016,
+        author = {Ian Goodfellow and Yoshua Bengio and Aaron Courville},
+        title = {Deep Learning}, publisher = {MIT Press}, year = {2016}
+      }
+      ```
+    }
+  }
+  ````
+}
+
+#web/presets/oops.lit{
+  A document with a mistake, to see the error.
+
+  ````
+  #h1{A document that does not parse}
+
+  Prose may not contain a stray } like this one, nor a bare hash or an opening brace. Delete the
+  brace in the line above and the document comes back. Inside backticks they are fine: `} # {`.
+
+  #oops.txt{
+    ```
+    still fine in here
+    ```
+  }
+  ````
+}
+
+#web/presets/lab.lit{
+  The program the sync lab edits.
+
+  ````
+  #h1{Splitting a bill}
+
+  Divide the total by the number of people, after adding the tip.
+
+  #split{
+    ```
+    def split(total, people, tip=0.15):
+        \<<<add the tip>>>
+        return round(total / people, 2)
+    ```
+    #add the tip{
+      ```
+      total = total * (1 + tip)
+      ```
+    }
+  }
+
+  #tip.py{
+    ```
+    \<<<split>>>
+
+    print(split(84.0, 4))
+    ```
+  }
+  ````
+}
+
+#h2{Recorded runs}
+
+The tutorial shows what `lit` printed when it was run on a small legacy script, in a scratch
+home directory. The transcripts are recordings, kept as data: a transcript line that starts with
+a dollar sign is a command, and the exit status closes each run. The script and the two stages
+of its literate version are kept beside them.
+
+#web/tut/t1.txt{
+  Install the skill, lint, tangle, check the result against the original script, run it, weave,
+  and look up an address.
+
+  ```
+  $ lit install-skill
+  installed the skill brashtag-literate 0.2.0 in /tmp/rec/home/.claude/skills/brashtag-literate
+  [exit 0]
+
+  $ lit lint invoice.lit
+  7 chunks, 46 code lines, 399 words of prose, 0 citations, 0 bibliography entries; 0 error(s), 0 warning(s)
+  [exit 0]
+
+  $ lit tangle invoice.lit .
+  wrote invoice.py
+  wrote invoice.lit.map
+  [exit 0]
+
+  $ diff ../invoice.orig.py invoice.py
+  [exit 0]
+
+  $ python3 invoice.py
+  widget         12 x     3.32 =      39.90
+  gizmo           1 x    19.99 =      19.99
+  bolt          250 x     0.10 =      25.50
+  subtotal                             85.39
+  tax                                   7.04
+  TOTAL                                92.43
+  [exit 0]
+
+  $ lit weave invoice.lit -o site
+  wrote site/invoice.html  (7 chunks, 0 citations)
+  wrote site/invoice.tex   -> compile with:  latexmk -pdf invoice.tex
+  [exit 0]
+
+  $ ls site
+  invoice.html
+  invoice.tex
+  [exit 0]
+
+  $ lit addr invoice.lit invoice.py:23
+  invoice.lit:66:5  «tax and total»
+  [exit 0]
+  ```
+}
+
+#web/tut/t2.txt{
+  A teammate edits the generated file; a dry run of absorb, then absorb itself.
+
+  ```
+  $ lit addr invoice.lit invoice.lit:66
+  invoice.py:23:5  «tax and total»
+  [exit 0]
+
+  # (a teammate edits invoice.py in their editor: threshold 10 -> 12, plus an empty-list guard)
+
+  $ diff ../invoice.orig.py invoice.py
+  10c10
+  <     elif qty >= 10:
+  ---
+  >     elif qty >= 12:
+  15a16,17
+  >     if not items:
+  >         raise ValueError("no items")
+  [exit 1]
+
+  $ lit absorb invoice.lit --dry-run
+    invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
+    invoice.py:15+  2 line(s) added
+  --- a/invoice.lit
+  +++ b/invoice.lit
+  @@ -30,3 +30,3 @@
+           unit = unit * 0.85
+  -    elif qty >= 10:
+  +    elif qty >= 12:
+           unit = unit * 0.95
+  @@ -48,2 +48,4 @@
+     def invoice(items, region="TX"):
+  +      if not items:
+  +          raise ValueError("no items")
+         sub = 0
+
+  (dry run: nothing written)
+  [exit 0]
+
+  $ lit absorb invoice.lit
+    invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
+    invoice.py:15+  2 line(s) added
+  --- a/invoice.lit
+  +++ b/invoice.lit
+  @@ -30,3 +30,3 @@
+           unit = unit * 0.85
+  -    elif qty >= 10:
+  +    elif qty >= 12:
+           unit = unit * 0.95
+  @@ -48,2 +48,4 @@
+     def invoice(items, region="TX"):
+  +      if not items:
+  +          raise ValueError("no items")
+         sub = 0
+
+  absorbed edits from 1 file(s) into invoice.lit; sourcemap refreshed
+  [exit 0]
+
+  $ diff ../invoice.before-absorb.lit invoice.lit
+  31c31
+  <     elif qty >= 10:
+  ---
+  >     elif qty >= 12:
+  48a49,50
+  >       if not items:
+  >           raise ValueError("no items")
+  [exit 1]
+
+  $ grep -n From 10 units invoice.lit
+  15:  The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
+  [exit 0]
+  ```
+}
+
+#web/tut/t3.txt{
+  Both sides edited, in different places: status, diff and merge.
+
+  ````
+  # (you fix the prose in invoice.lit: "From 10 units" becomes "From 12 units", and change the tax rate in the .lit)
+
+  # (the teammate, meanwhile, exempts New Hampshire in invoice.py)
+
+  $ lit sync invoice.lit status
+  the .lit has changed since the last sync
+    invoice.py                   1 from the .lit, 1 edited in the file
+
+  2 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
+  [exit 0]
+
+  $ lit sync invoice.lit diff
+
+  == invoice.py  region 1/2  (base lines 3-3)  made in the .lit; the generated file does not have it
+        1 | import sys
+        2 | 
+   -     | TAX = 0.0825
+   +     | TAX = 0.0875
+        4 | 
+        5 | 
+        6 | def price_for(qty, unit):
+
+  == invoice.py  region 2/2  (base lines 25-25)  made in the generated file; the .lit does not have it
+       22 |         amt = round(p * qty, 2)
+       23 |         lines.append((name, qty, p, amt))
+       24 |         sub += amt
+   -     |     tax = 0 if region == "OR" else round(sub * TAX, 2)
+   +     |     tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+       26 |     total = round(sub + tax, 2)
+       27 |     return lines, sub, tax, total
+       28 | 
+  [exit 0]
+
+  $ lit sync invoice.lit merge
+
+  the .lit would change:
+  --- a/invoice.lit
+  +++ b/invoice.lit
+  @@ -67,3 +67,3 @@
+       ```
+  -    tax = 0 if region == "OR" else round(sub * TAX, 2)
+  +    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+       total = round(sub + tax, 2)
+  generated files rewritten: invoice.py
+
+  synced. .lit updated; wrote: invoice.py. Previous versions are kept (see `log`).
+  [exit 0]
+
+  $ grep -n -e TAX =  -e OR invoice.py
+  3:TAX = 0.0875
+  25:    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+  [exit 0]
+
+  $ grep -n -e TAX =  -e region in invoice.lit
+  68:    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+  119:  TAX = 0.0875
+  [exit 0]
+
+  $ lit sync invoice.lit status
+    invoice.py                   in sync
+
+  everything is in sync.
+  [exit 0]
+  ````
+}
+
+#web/tut/t4.txt{
+  Both sides edited in the same place: the conflict, and merge preferring the document.
+
+  ```
+  # (you set TAX = 0.0925 in the .lit; the teammate sets TAX = 0.09 in invoice.py)
+
+  $ lit sync invoice.lit merge
+
+  the .lit would not change
+  generated files rewritten: none
+  left pending: 1 region(s)
+
+  synced. .lit unchanged; wrote: no generated files. Previous versions are kept (see `log`).
+  1 conflict(s) left pending; resolve with `pick` or `merge --prefer ...`
+  [exit 1]
+
+  $ lit sync invoice.lit merge --prefer lit
+
+  the .lit would not change
+  generated files rewritten: invoice.py
+
+  synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).
+  [exit 0]
+
+  $ cat invoice.py
+  import sys
+
+  TAX = 0.0925
+
+
+  def price_for(qty, unit):
+      # volume pricing
+      if qty >= 100:
+          unit = unit * 0.85
+      elif qty >= 12:
+          unit = unit * 0.95
+      return unit
+
+
+  def invoice(items, region="TX"):
+      if not items:
+          raise ValueError("no items")
+      sub = 0
+      lines = []
+      for name, qty, unit in items:
+          p = price_for(qty, unit)
+          amt = round(p * qty, 2)
+          lines.append((name, qty, p, amt))
+          sub += amt
+      tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+      total = round(sub + tax, 2)
+      return lines, sub, tax, total
+
+
+  def render(lines, sub, tax, total):
+      out = []
+      for name, qty, p, amt in lines:
+          out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+      out.append("%-12s %29.2f" % ("subtotal", sub))
+      out.append("%-12s %29.2f" % ("tax", tax))
+      out.append("%-12s %29.2f" % ("TOTAL", total))
+      return "\n".join(out)
+
+
+  if __name__ == "__main__":
+      items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+      print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
+  [exit 0]
+  ```
+}
+
+#web/tut/t5.txt{
+  The recorded versions: the list, the log, and a tangle that does not lose the teammate's edit.
+
+  ```
+  $ lit sync invoice.lit restore invoice.py --list
+  19:35:20  backup    4171669d  before sync
+  19:35:20  backup    ab79045c  before sync
+  [exit 0]
+
+  $ lit sync invoice.lit log -n 6
+  2026-11-09 19:35:20  sync      lit  invoice.lit                  -  invoice.py
+  2026-11-09 19:35:20  base      lit  invoice.lit                  1ada16f0  sync
+  2026-11-09 19:35:20  sync      lit  invoice.lit                  -  
+  2026-11-09 19:35:20  backup    gen  invoice.py                   ab79045c  before sync
+  2026-11-09 19:35:20  base      lit  invoice.lit                  1ada16f0  sync
+  2026-11-09 19:35:20  sync      lit  invoice.lit                  -  invoice.py
+  [exit 0]
+
+  # (the teammate edits invoice.py again, and you run tangle before syncing)
+
+  $ lit tangle invoice.lit .
+  wrote invoice.py
+  wrote invoice.lit.map
+  warning: invoice.py had edits that are not in the .lit; tangle replaced them, but a copy is kept (snapshot ba30967a; see lit sync invoice.lit log / restore)
+  [exit 0]
+
+  $ lit sync invoice.lit restore invoice.py --list
+  19:35:20  backup    4171669d  before sync
+  19:35:20  backup    ab79045c  before sync
+  19:35:21  backup    ba30967a  replaced by tangle
+  [exit 0]
+  ```
+}
+
+#web/tut/t6.txt{
+  Choosing region by region with pick, then the state and the watcher's recording.
+
+  ```
+  $ lit sync invoice.lit pick
+
+  == invoice.py  region 1/2  (base lines 18-18)  made in the .lit; the generated file does not have it
+       15 | def invoice(items, region="TX"):
+       16 |     if not items:
+       17 |         raise ValueError("no items")
+   -     |     sub = 0
+   +     |     sub = 0.0
+       19 |     lines = []
+       20 |     for name, qty, unit in items:
+       21 |         p = price_for(qty, unit)
+  apply to the generated file? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
+  == invoice.py  region 2/2  (base lines 33-33)  made in the generated file; the .lit does not have it
+       30 | def render(lines, sub, tax, total):
+       31 |     out = []
+       32 |     for name, qty, p, amt in lines:
+   -     |         out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+   +     |         out.append("%-14s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+       34 |     out.append("%-12s %29.2f" % ("subtotal", sub))
+       35 |     out.append("%-12s %29.2f" % ("tax", tax))
+       36 |     out.append("%-12s %29.2f" % ("TOTAL", total))
+  apply to the .lit? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
+  the .lit would not change
+  generated files rewritten: invoice.py
+  left pending: 1 region(s)
+
+  Write these changes? [y/n] > nothing written.
+  [exit 1]
+
+  $ lit sync invoice.lit status
+  the .lit has changed since the last sync
+    invoice.py                   1 from the .lit, 1 edited in the file
+
+  2 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
+  [exit 0]
+
+  $ lit watch invoice.lit --once
+            waiting: 1 change(s) from the .lit, 1 edit(s) in generated files   ->  lit sync invoice.lit status
+  [exit 0]
+  ```
+}
+
+#web/tut/t7.txt{
+  The rest of the pick session, the state, and the removal of the skill.
+
+  ```
+  $ lit sync invoice.lit pick
+
+  == invoice.py  region 1/2  (base lines 18-18)  made in the .lit; the generated file does not have it
+       15 | def invoice(items, region="TX"):
+       16 |     if not items:
+       17 |         raise ValueError("no items")
+   -     |     sub = 0
+   +     |     sub = 0.0
+       19 |     lines = []
+       20 |     for name, qty, unit in items:
+       21 |         p = price_for(qty, unit)
+  apply to the generated file? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
+  == invoice.py  region 2/2  (base lines 33-33)  made in the generated file; the .lit does not have it
+       30 | def render(lines, sub, tax, total):
+       31 |     out = []
+       32 |     for name, qty, p, amt in lines:
+   -     |         out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+   +     |         out.append("%-14s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+       34 |     out.append("%-12s %29.2f" % ("subtotal", sub))
+       35 |     out.append("%-12s %29.2f" % ("tax", tax))
+       36 |     out.append("%-12s %29.2f" % ("TOTAL", total))
+  apply to the .lit? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
+  the .lit would not change
+  generated files rewritten: invoice.py
+  left pending: 1 region(s)
+
+  Write these changes? [y/n] > 
+  synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).
+  [exit 0]
+
+  $ lit sync invoice.lit status
+    invoice.py                   1 edited in the file
+
+  1 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
+  [exit 0]
+
+  $ lit uninstall-skill
+  removed /tmp/rec/home/.claude/skills/brashtag-literate
+  [exit 0]
+  ```
+}
+
+#web/tut/t9.txt{
+  Gaps for an assistant: list, the context of one, fill with a check, review, and the program that
+  results.
+
+  ```
+  $ lit fill words.lit --list
+    0  words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+    1  words.lit:35  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
+  [exit 0]
+
+  $ lit fill words.lit --dry-run --show-context
+  hint 0: words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+  sections: task; where in the document; what the program is; prose of this section; where this chunk is used; other unfilled hints; the chunk, with the gap marked; the tangled file main.go around the gap
+  prompt: 1208 characters
+  [exit 0]
+
+  $ lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go'
+  filling words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+    filled as f-ea0cf1 (6 line(s)); lit review shows it
+  filling words.lit:45  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
+    filled as f-663c33 (17 line(s)); lit review shows it
+  2 filled, 0 failed, 0 hint(s) still open
+  [exit 0]
+
+  $ lit review words.lit --ai --agent 'sh review.sh'
+  == f-ea0cf1  «read the words»  words.lit:28  [pending, as written]
+     hint:  count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts
+     agent: command: sh agent.sh
+     | sc := bufio.NewScanner(os.Stdin)
+     | for sc.Scan() {
+     | 	for _, w := range strings.Fields(sc.Text()) {
+     | 		counts[strings.ToLower(w)]++
+     | 	}
+     | }
+     ok: parses, tangles, no placeholders
+     second opinion:
+       VERDICT: concerns
+       - the error of the scanner is never looked at
+       - fine otherwise: it does what the hint says
+  == f-663c33  «print the top ten»  words.lit:45  [pending, as written]
+     hint:  print at most ten lines of count and word, most frequent first, ties alphabetical
+     agent: command: sh agent.sh
+     | type kv struct {
+     | 	word string
+     | 	n    int
+     | }
+     | var all []kv
+     | for w, n := range counts {
+     | 	all = append(all, kv{w, n})
+     | }
+     | sort.Slice(all, func(i, j int) bool {
+     | 	if all[i].n != all[j].n {
+     | 		return all[i].n > all[j].n
+     | 	}
+     | … (5 more line(s); --full shows all)
+     ok: parses, tangles, no placeholders
+     second opinion:
+       VERDICT: concerns
+       - the error of the scanner is never looked at
+       - fine otherwise: it does what the hint says
+
+  the checks passed, but a second opinion raised concerns; read them above. lit review --approve ID records that you looked.
+  [exit 0]
+
+  $ lit review words.lit --approve-all
+  approved f-ea0cf1
+  approved f-663c33
+  [exit 0]
+
+  $ lit tangle words.lit .
+  wrote main.go
+  wrote words.lit.map
+  [exit 0]
+
+  $ go run main.go < sample.txt
+  3 the
+  2 and
+  1 bird
+  1 cat
+  1 dog
+  [exit 0]
+  ```
+}
+
+#web/tut/t8.txt{
+  A project in three files: lint, tangle, addresses in chapter files, and absorb writing into the
+  chapter that owns the line.
+
+  ```
+  $ lit lint shop.lit
+  3 chunks, 11 code lines, 109 words of prose, 0 citations, 0 bibliography entries; 0 error(s), 0 warning(s)
+  [exit 0]
+
+  $ lit tangle shop.lit .
+  wrote shop.py
+  wrote shop.lit.map
+  [exit 0]
+
+  $ python3 shop.py
+  widget       12 x    3.32 =    39.84
+  gizmo         1 x   19.99 =    19.99
+  [exit 0]
+
+  $ lit addr shop.lit shop.py:3
+  pricing.lit:9:3  «pricing»
+  [exit 0]
+
+  $ lit addr shop.lit report.lit:8
+  shop.py:6:1  «report»
+  [exit 0]
+
+  # (a teammate lowers the threshold from 12 to 10 in shop.py)
+
+  $ lit absorb shop.lit
+    shop.py:2  «pricing», pricing.lit:8: 1 changed
+  --- a/pricing.lit
+  +++ b/pricing.lit
+  @@ -7,3 +7,3 @@
+     def unit_price(qty, price):
+  -      if qty >= 12:
+  +      if qty >= 10:
+             return round(price * 0.95, 2)
+
+  absorbed edits from 1 file(s) into shop.lit; sourcemap refreshed
+  [exit 0]
+
+  $ lit tangle shop.lit .
+  wrote shop.py
+  wrote shop.lit.map
+  [exit 0]
+  ```
+}
+
+#web/tut/shop/shop.lit{
+  The root of the three-file project.
+
+  ````
+  #h1{A small shop}
+
+  This program prices an order and prints it. It is split into chapters, one for each part of the
+  program: how a unit price is worked out, and how an order is reported. This file is the root: it says
+  what the program is, lists the chapters in reading order, and assembles the one file they produce.
+
+  #include{pricing.lit}
+  #include{report.lit}
+
+  #shop.py{
+    ```
+    \<<<pricing>>>
+
+    \<<<report>>>
+    ```
+  }
+  ````
+}
+
+#web/tut/shop/pricing.lit{
+  A chapter.
+
+  ````
+  #h1{Pricing}
+
+  The unit price falls with the quantity bought: from 12 units there is a discount of 5 percent.
+
+  #pricing{
+    ```
+    def unit_price(qty, price):
+        if qty >= 12:
+            return round(price * 0.95, 2)
+        return price
+    ```
+  }
+  ````
+}
+
+#web/tut/shop/report.lit{
+  Another chapter, which uses a chunk of the first.
+
+  ````
+  #h1{The report}
+
+  An order is a list of (name, quantity, price) triples. Each line is printed with its total. The
+  chapter on pricing says how the unit price is worked out; this one only uses it.
+
+  #report{
+    ```
+    ORDER = [("widget", 12, 3.50), ("gizmo", 1, 19.99)]
+    for name, qty, price in ORDER:
+        unit = unit_price(qty, price)
+        print(f"{name:10s} {qty:4d} x {unit:7.2f} = {qty * unit:8.2f}")
+    ```
+  }
+  ````
+}
+
+#web/tut/words.lit{
+  The word counter with two gaps, which the run of t9 fills in.
+
+  ````
+  #h1{Word counter}
+  Counts the words on its standard input and prints the ten most common.
+
+  #main.go{
+    ```
+    package main
+
+    import (
+    	"bufio"
+    	"fmt"
+    	"os"
+    	"sort"
+    	"strings"
+    )
+
+    func main() {
+    	counts := map[string]int{}
+    	\<<<read the words>>>
+    	\<<<print the top ten>>>
+    }
+    ```
+  }
+
+  #h2{Reading}
+  Words are separated by white space and compared without regard to case.
+
+  #read the words{
+    #agent-fill-in{count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts}
+  }
+
+  #h2{Printing}
+  Most frequent first; words that are equally frequent come in alphabetical order.
+
+  #print the top ten{
+    #agent-fill-in{print at most ten lines of count and word, most frequent first, ties alphabetical}
+  }
+  ````
+}
+
+#web/tut/agent.sh{
+  The stand-in for an assistant: a script that recognises which gap it is asked about and prints a
+  fenced answer. A real model replaces it with a flag.
+
+  ````
+  #!/bin/sh
+  # A canned answer standing in for a model: it recognises which gap it is asked about.
+  p=$(cat)
+  case "$p" in
+  *"Chunk to fill: «read the words»"*)
+  cat <<'X'
+  ```
+  sc := bufio.NewScanner(os.Stdin)
+  for sc.Scan() {
+  	for _, w := range strings.Fields(sc.Text()) {
+  		counts[strings.ToLower(w)]++
+  	}
+  }
+  ```
+  X
+  ;;
+  *)
+  cat <<'X'
+  ```
+  type kv struct {
+  	word string
+  	n    int
+  }
+  var all []kv
+  for w, n := range counts {
+  	all = append(all, kv{w, n})
+  }
+  sort.Slice(all, func(i, j int) bool {
+  	if all[i].n != all[j].n {
+  		return all[i].n > all[j].n
+  	}
+  	return all[i].word < all[j].word
+  })
+  for i := 0; i < len(all) && i < 10; i++ {
+  	fmt.Println(all[i].n, all[i].word)
+  }
+  ```
+  X
+  ;;
+  esac
+  ````
+}
+
+#web/tut/review.sh{
+  The stand-in for a second opinion.
+
+  ```
+  #!/bin/sh
+  # A canned second opinion standing in for a model.
+  cat >/dev/null
+  printf 'VERDICT: concerns\n- the error of the scanner is never looked at\n- fine otherwise: it does what the hint says\n'
+  ```
+}
+
+#web/tut/invoice.orig.py{
+  The legacy script the tutorial starts from.
+
+  ```
+  import sys
+
+  TAX = 0.0825
+
+
+  def price_for(qty, unit):
+      # volume pricing
+      if qty >= 100:
+          unit = unit * 0.85
+      elif qty >= 10:
+          unit = unit * 0.95
+      return unit
+
+
+  def invoice(items, region="TX"):
+      sub = 0
+      lines = []
+      for name, qty, unit in items:
+          p = price_for(qty, unit)
+          amt = round(p * qty, 2)
+          lines.append((name, qty, p, amt))
+          sub += amt
+      tax = 0 if region == "OR" else round(sub * TAX, 2)
+      total = round(sub + tax, 2)
+      return lines, sub, tax, total
+
+
+  def render(lines, sub, tax, total):
+      out = []
+      for name, qty, p, amt in lines:
+          out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+      out.append("%-12s %29.2f" % ("subtotal", sub))
+      out.append("%-12s %29.2f" % ("tax", tax))
+      out.append("%-12s %29.2f" % ("TOTAL", total))
+      return "\n".join(out)
+
+
+  if __name__ == "__main__":
+      items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+      print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
+  ```
+}
+
+#web/tut/invoice.before-absorb.lit{
+  The literate version as the assistant wrote it.
+
+  ````
+  #h1{Invoicing}
+
+  This program turns a list of purchased items into a printed invoice. It is a small script that grew
+  in place: three functions and a demo. This document explains what each part does and, where the code
+  does not say, what is unknown. The code has not been changed. Tangling this document reproduces
+  `invoice.py` exactly.
+
+  An item is a triple of name, quantity and unit price. An invoice is the priced lines, a subtotal, a
+  tax and a total. Every amount is a Python float rounded to cents, which matters in the section on
+  rounding.
+
+  #h2{Volume pricing}
+
+  #price_for{
+    The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
+    from 100 units a 15 percent discount. The discount applies to the unit price, not to the line,
+    and the thresholds are the first match in order, so a quantity of 100 gets the larger discount
+    only and the two never combine.
+
+    ```
+    def price_for(qty, unit):
+        # volume pricing
+        \<<<discount tiers>>>
+        return unit
+    ```
+
+    #discount tiers{
+      ```
+      if qty >= 100:
+          unit = unit * 0.85
+      elif qty >= 10:
+          unit = unit * 0.95
+      ```
+    }
+  }
+
+  #h2{Pricing a whole invoice}
+
+  #invoice{
+    Each item is priced, its line amount rounded to cents, and the rounded amounts are summed. Rounding
+    each line before summing means the subtotal is the sum of what the customer sees on the page, which
+    is usually what an invoice should do, but it can differ by a cent from rounding the unscaled sum.
+
+    The function returns the lines too, because printing needs the discounted unit price, not the
+    original.
+
+    ```
+    def invoice(items, region="TX"):
+        sub = 0
+        lines = []
+        for name, qty, unit in items:
+            p = price_for(qty, unit)
+            amt = round(p * qty, 2)
+            lines.append((name, qty, p, amt))
+            sub += amt
+        \<<<tax and total>>>
+        return lines, sub, tax, total
+    ```
+
+    #tax and total{
+      Tax is a flat rate on the subtotal, except in region OR, where it is zero. Oregon has no
+      state sales tax, which is the likely reason for the exception. Nothing in the code says so, and
+      no other region is special, so this is an open question for whoever owns the tax rules.
+
+      ```
+      tax = 0 if region == "OR" else round(sub * TAX, 2)
+      total = round(sub + tax, 2)
+      ```
+    }
+  }
+
+  #h2{Printing}
+
+  #render{
+    The layout is fixed-width text: name, quantity, discounted unit price and line amount on each
+    line, then three summary lines whose amounts line up under the line amounts. The widths are
+    literal numbers in the format strings, so changing a width means changing every line that
+    shares it.
+
+    ```
+    def render(lines, sub, tax, total):
+        out = []
+        for name, qty, p, amt in lines:
+            out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+        out.append("%-12s %29.2f" % ("subtotal", sub))
+        out.append("%-12s %29.2f" % ("tax", tax))
+        out.append("%-12s %29.2f" % ("TOTAL", total))
+        return "\n".join(out)
+    ```
+  }
+
+  #h2{Running it}
+
+  #demo{
+    Run as a script, the module prices three sample items and prints the invoice. An optional first
+    argument is the region.
+
+    ```
+    if __name__ == "__main__":
+        items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+        print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
+    ```
+  }
+
+  #h2{Open questions}
+
+  The tax rate is a module constant, `0.0825`, with no note of where it comes from or whether it
+  varies by region. The region check treats exactly the string `OR` as exempt and every other string,
+  including a typo, as taxable at the default rate. Neither is changed here.
+
+  #h2{Assembly}
+
+  #invoice.py{
+    ```
+    import sys
+
+    TAX = 0.0825
+
+
+    \<<<price_for>>>
+
+
+    \<<<invoice>>>
+
+
+    \<<<render>>>
+
+
+    \<<<demo>>>
+    ```
+  }
+  ````
+}
+
+#web/tut/invoice.lit{
+  The literate version after absorbing the teammate's edit.
+
+  ````
+  #h1{Invoicing}
+
+  This program turns a list of purchased items into a printed invoice. It is a small script that grew
+  in place: three functions and a demo. This document explains what each part does and, where the code
+  does not say, what is unknown. The code has not been changed. Tangling this document reproduces
+  `invoice.py` exactly.
+
+  An item is a triple of name, quantity and unit price. An invoice is the priced lines, a subtotal, a
+  tax and a total. Every amount is a Python float rounded to cents, which matters in the section on
+  rounding.
+
+  #h2{Volume pricing}
+
+  #price_for{
+    The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
+    from 100 units a 15 percent discount. The discount applies to the unit price, not to the line,
+    and the thresholds are the first match in order, so a quantity of 100 gets the larger discount
+    only and the two never combine.
+
+    ```
+    def price_for(qty, unit):
+        # volume pricing
+        \<<<discount tiers>>>
+        return unit
+    ```
+
+    #discount tiers{
+      ```
+      if qty >= 100:
+          unit = unit * 0.85
+      elif qty >= 12:
+          unit = unit * 0.95
+      ```
+    }
+  }
+
+  #h2{Pricing a whole invoice}
+
+  #invoice{
+    Each item is priced, its line amount rounded to cents, and the rounded amounts are summed. Rounding
+    each line before summing means the subtotal is the sum of what the customer sees on the page, which
+    is usually what an invoice should do, but it can differ by a cent from rounding the unscaled sum.
+
+    The function returns the lines too, because printing needs the discounted unit price, not the
+    original.
+
+    ```
+    def invoice(items, region="TX"):
+        if not items:
+            raise ValueError("no items")
+        sub = 0
+        lines = []
+        for name, qty, unit in items:
+            p = price_for(qty, unit)
+            amt = round(p * qty, 2)
+            lines.append((name, qty, p, amt))
+            sub += amt
+        \<<<tax and total>>>
+        return lines, sub, tax, total
+    ```
+
+    #tax and total{
+      Tax is a flat rate on the subtotal, except in region OR, where it is zero. Oregon has no
+      state sales tax, which is the likely reason for the exception. Nothing in the code says so, and
+      no other region is special, so this is an open question for whoever owns the tax rules.
+
+      ```
+      tax = 0 if region == "OR" else round(sub * TAX, 2)
+      total = round(sub + tax, 2)
+      ```
+    }
+  }
+
+  #h2{Printing}
+
+  #render{
+    The layout is fixed-width text: name, quantity, discounted unit price and line amount on each
+    line, then three summary lines whose amounts line up under the line amounts. The widths are
+    literal numbers in the format strings, so changing a width means changing every line that
+    shares it.
+
+    ```
+    def render(lines, sub, tax, total):
+        out = []
+        for name, qty, p, amt in lines:
+            out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+        out.append("%-12s %29.2f" % ("subtotal", sub))
+        out.append("%-12s %29.2f" % ("tax", tax))
+        out.append("%-12s %29.2f" % ("TOTAL", total))
+        return "\n".join(out)
+    ```
+  }
+
+  #h2{Running it}
+
+  #demo{
+    Run as a script, the module prices three sample items and prints the invoice. An optional first
+    argument is the region.
+
+    ```
+    if __name__ == "__main__":
+        items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+        print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
+    ```
+  }
+
+  #h2{Open questions}
+
+  The tax rate is a module constant, `0.0825`, with no note of where it comes from or whether it
+  varies by region. The region check treats exactly the string `OR` as exempt and every other string,
+  including a typo, as taxable at the default rate. Neither is changed here.
+
+  #h2{Assembly}
+
+  #invoice.py{
+    ```
+    import sys
+
+    TAX = 0.0825
+
+
+    \<<<price_for>>>
+
+
+    \<<<invoice>>>
+
+
+    \<<<render>>>
+
+
+    \<<<demo>>>
+    ```
+  }
+  ````
+}

@@ -1,0 +1,282 @@
+#h1{Gaps for the assistant: hints and agents}
+
+A literate program can be written with gaps. An author who knows what a chunk must do and has
+not written it leaves a bag inside the chunk, `#agent-fill-in{what it must do}`, and an
+assistant fills it in later with the whole document for context. This chapter is the first half:
+finding the gaps, and the assistants that can be asked.
+
+#hints: finding the gaps{
+  A gap is a bag with the reserved tag `agent-fill-in`, written inside a chunk:
+  `#agent-fill-in{count the words and print them}`. Tangle never emits it, so a program with gaps
+  still tangles, and the gap is simply missing from the generated file. Finding the gaps walks the
+  tree with offsets, because the editing that follows is done on the text and needs to know where
+  each gap starts, at its hash, and where it ends, after its closing brace. Each site remembers
+  its chunk, its words, its position in the text and its number among the gaps of the document.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"strings"
+  )
+
+  // A HintSite is an #agent-fill-in{...} bag inside a chunk, with its place in the program text.
+  type HintSite struct {
+  	Index      int    // number among the hints of the program, in document order (the Index of the Hole)
+  	Chunk      string // the chunk it sits in
+  	Start, End int    // byte range of the whole bag in Source.Text
+  	Text       string // the hint as plain text
+  	Raw        string // the text between the braces, as written
+  	File       string // source file (the root or a chapter) and the line in it
+  	Line       int
+  }
+
+  // FindHints lists the hints of a program in document order. They are numbered exactly as Collect numbers its
+  // holes, so site i and hole i are the same hint.
+  func FindHints(src *Source, root Bag) []HintSite {
+  	var out []HintSite
+  	Walk(root, func(n Node, parents []Bag, start, end int) bool {
+  		b, ok := n.(Bag)
+  		if !ok {
+  			return true
+  		}
+  		tag := strings.TrimSpace(b.Tag())
+  		if b.Tag() == HintTag {
+  			// a hint counts when every bag around it is a chunk (as in Collect) and there is one
+  			for _, p := range parents[1:] {
+  				if Reserved[strings.TrimSpace(p.Tag())] {
+  					return false
+  				}
+  			}
+  			if len(parents) < 2 {
+  				return false
+  			}
+  			name, line, _ := src.Locate(start)
+  			out = append(out, HintSite{Index: len(out), Chunk: strings.TrimSpace(parents[len(parents)-1].Tag()),
+  				Start: start, End: end, Text: PlainText(b), Raw: src.Text[start+len(HintTag)+2 : end-1], File: name, Line: line})
+  			return false
+  		}
+  		return !Reserved[tag]
+  	})
+  	return out
+  }
+  ```
+}
+
+#internal/lit/hints.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<hints: finding the gaps>>>
+
+  <<<hints: describing a gap>>>
+  ```
+}
+
+#agent: the interface{
+  The assistant is anything that can be asked a question: it receives a system message and a
+  prompt and returns text. The interface is that small on purpose, so a test can supply a
+  function, a team can supply a script, and the real thing is one more implementation.
+
+  ```
+  package lit
+
+  import (
+  	"bytes"
+  	"context"
+  	"encoding/json"
+  	"errors"
+  	"fmt"
+  	"io"
+  	"net/http"
+  	"os"
+  	"os/exec"
+  	"runtime"
+  	"strings"
+  	"time"
+  )
+
+  // An Agent turns a prompt into a reply. Two kinds are built in: a command that reads the prompt on standard
+  // input and writes the reply on standard output (any model or script will do), and the Anthropic Messages API
+  // over net/http. Tests (and other tools) can supply their own.
+  type Agent interface {
+  	Name() string
+  	Ask(ctx context.Context, system, prompt string) (string, error)
+  }
+
+  // AgentFunc adapts a function to an Agent.
+  type AgentFunc func(system, prompt string) (string, error)
+
+  func (f AgentFunc) Name() string { return "func" }
+  func (f AgentFunc) Ask(_ context.Context, system, prompt string) (string, error) {
+  	return f(system, prompt)
+  }
+  ```
+}
+
+#agent: a command{
+  The command agent runs a shell command with the system message and the prompt on its standard
+  input and takes its standard output as the reply, so that any tool that reads a prompt can be an
+  agent: a wrapper around a command line client, a local model, a script that answers from a file.
+  A context carries the timeout, and a failing command is reported with the start of what it wrote
+  to its error stream.
+
+  ```
+  // CommandAgent runs a shell command. The system text and the prompt are written to its standard input, and
+  // whatever it prints is the reply.
+  type CommandAgent struct{ Cmd string }
+
+  func (a CommandAgent) Name() string { return "command: " + a.Cmd }
+
+  func (a CommandAgent) Ask(ctx context.Context, system, prompt string) (string, error) {
+  	var cmd *exec.Cmd
+  	if runtime.GOOS == "windows" {
+  		cmd = exec.CommandContext(ctx, "cmd", "/C", a.Cmd)
+  	} else {
+  		cmd = exec.CommandContext(ctx, "sh", "-c", a.Cmd)
+  	}
+  	cmd.Stdin = strings.NewReader(system + "\n\n" + prompt)
+  	var out, errb bytes.Buffer
+  	cmd.Stdout, cmd.Stderr = &out, &errb
+  	if err := cmd.Run(); err != nil {
+  		msg := strings.TrimSpace(errb.String())
+  		if len(msg) > 400 {
+  			msg = msg[:400] + "..."
+  		}
+  		return "", fmt.Errorf("agent command failed: %v: %s", err, msg)
+  	}
+  	return out.String(), nil
+  }
+  ```
+}
+
+#agent: the Messages API{
+  The other implementation speaks to the Anthropic Messages API with `net/http` and nothing else.
+  The key comes from `ANTHROPIC_API_KEY`, the address from `ANTHROPIC_BASE_URL`, which is how a
+  test points it at a local server, and the model from `--model` or `LIT_MODEL`. The reply text is
+  the text blocks of the answer, joined; an error from the service is returned with its message.
+
+  ```
+  // APIAgent talks to the Anthropic Messages API.
+  type APIAgent struct {
+  	Key, Model, BaseURL string
+  	MaxTokens           int
+  	Client              *http.Client
+  }
+
+  func (a APIAgent) Name() string { return "anthropic " + a.Model }
+
+  func (a APIAgent) Ask(ctx context.Context, system, prompt string) (string, error) {
+  	base := a.BaseURL
+  	if base == "" {
+  		base = "https://api.anthropic.com"
+  	}
+  	max := a.MaxTokens
+  	if max == 0 {
+  		max = 8192
+  	}
+  	body, _ := json.Marshal(map[string]any{
+  		"model": a.Model, "max_tokens": max, "system": system,
+  		"messages": []map[string]string{{"role": "user", "content": prompt}},
+  	})
+  	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(base, "/")+"/v1/messages", bytes.NewReader(body))
+  	if err != nil {
+  		return "", err
+  	}
+  	req.Header.Set("content-type", "application/json")
+  	req.Header.Set("x-api-key", a.Key)
+  	req.Header.Set("anthropic-version", "2023-06-01")
+  	cl := a.Client
+  	if cl == nil {
+  		cl = &http.Client{Timeout: 5 * time.Minute}
+  	}
+  	resp, err := cl.Do(req)
+  	if err != nil {
+  		return "", err
+  	}
+  	defer resp.Body.Close()
+  	data, _ := io.ReadAll(resp.Body)
+  	if resp.StatusCode != 200 {
+  		msg := string(data)
+  		if len(msg) > 400 {
+  			msg = msg[:400] + "..."
+  		}
+  		return "", fmt.Errorf("anthropic API: %s: %s", resp.Status, msg)
+  	}
+  	var r struct {
+  		Content []struct {
+  			Type string `json:"type"`
+  			Text string `json:"text"`
+  		} `json:"content"`
+  	}
+  	if err := json.Unmarshal(data, &r); err != nil {
+  		return "", fmt.Errorf("anthropic API: unreadable reply: %v", err)
+  	}
+  	var sb strings.Builder
+  	for _, c := range r.Content {
+  		if c.Type == "text" {
+  			sb.WriteString(c.Text)
+  		}
+  	}
+  	return sb.String(), nil
+  }
+  ```
+}
+
+#agent: choosing one{
+  The choice is by a specification string: `anthropic`, optionally followed by a colon and a
+  model, selects the API, and anything else is a command. `LIT_AGENT` supplies the string when
+  `--agent` is not given, then the presence of `ANTHROPIC_API_KEY` selects the API, and with none
+  of these there is no agent and the command says so rather than guessing.
+
+  ```
+  // DefaultModel is used with the API when no model is named.
+  const DefaultModel = "claude-sonnet-5-5"
+
+  // NewAgent builds an agent from a specification: "anthropic" or "anthropic:MODEL" for the API, anything else
+  // is a command. With no specification it looks at $LIT_AGENT, then at $ANTHROPIC_API_KEY.
+  func NewAgent(spec, model string) (Agent, error) {
+  	if spec == "" {
+  		spec = os.Getenv("LIT_AGENT")
+  	}
+  	if spec == "" && os.Getenv("ANTHROPIC_API_KEY") != "" {
+  		spec = "anthropic"
+  	}
+  	if spec == "" {
+  		return nil, errors.New("no agent: pass --agent 'COMMAND' (reads the prompt on stdin, prints the reply), or --agent anthropic with ANTHROPIC_API_KEY set; $LIT_AGENT works too")
+  	}
+  	if spec == "anthropic" || strings.HasPrefix(spec, "anthropic:") {
+  		key := os.Getenv("ANTHROPIC_API_KEY")
+  		if key == "" {
+  			return nil, errors.New("ANTHROPIC_API_KEY is not set")
+  		}
+  		if i := strings.Index(spec, ":"); i >= 0 && model == "" {
+  			model = spec[i+1:]
+  		}
+  		if model == "" {
+  			model = os.Getenv("LIT_MODEL")
+  		}
+  		if model == "" {
+  			model = DefaultModel
+  		}
+  		return APIAgent{Key: key, Model: model, BaseURL: os.Getenv("ANTHROPIC_BASE_URL")}, nil
+  	}
+  	return CommandAgent{Cmd: spec}, nil
+  }
+  ```
+}
+
+#internal/lit/agent.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<agent: the interface>>>
+
+  <<<agent: a command>>>
+
+  <<<agent: the Messages API>>>
+
+  <<<agent: choosing one>>>
+  ```
+}

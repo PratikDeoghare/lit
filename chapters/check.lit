@@ -1,0 +1,184 @@
+#h1{Gaps for the assistant: sanity checks}
+
+Code from an assistant is not trusted. It is checked before it is written, and the whole program
+is checked after.
+
+#check: the program as a whole{
+  After a fill the whole program is parsed and tangled again, and every generated file whose
+  extension says what it is must still be well-formed: Go files go through `go/parser`, JSON
+  through `encoding/json`. Where the error is in a generated file the finding gives the position
+  in the document too, through the sourcemap, because the document is what the author edits.
+
+  ```
+  var placeholderRe = regexp.MustCompile(`(?i)\b(TODO|FIXME|XXX)\b|not implemented|unimplemented|implement me|your code here|\.\.\.\s*$|^\s*pass\s*(#.*)?$`)
+
+  // CheckProgram runs the checks that need no model: the program must parse and tangle, every generated Go file
+  // and JSON file must be syntactically valid, and the generated text must not still hold the marks of a gap.
+  // text is the program text to check (the flat text; it need not be what is on disk).
+  func CheckProgram(src *Source, text string) []Finding {
+  	ns := &Source{Root: src.Root, Base: src.Base, Texts: src.Texts, Order: src.Order, Text: text, Pieces: nil}
+  	if src.Text == text {
+  		ns = src
+  	}
+  	if _, err := ns.Parse(); err != nil {
+  		return []Finding{{"error", "the program no longer parses: " + err.Error()}}
+  	}
+  	files, order, err := TangleText(text)
+  	if err != nil {
+  		return []Finding{{"error", "the program does not tangle: " + err.Error()}}
+  	}
+  	m, _, err := BuildMap(ns)
+  	if err != nil {
+  		m = nil
+  	}
+  	var out []Finding
+  	for _, name := range order {
+  		body := files[name]
+  		report := func(line int, msg string) {
+  			where := name + fmt.Sprintf(":%d", line)
+  			if m != nil {
+  				where = spotOf(src, text, m, name, line)
+  			}
+  			out = append(out, Finding{"error", fmt.Sprintf("%s: %s", where, msg)})
+  		}
+  		switch strings.ToLower(filepath.Ext(name)) {
+  		case ".go":
+  			fset := token.NewFileSet()
+  			if _, err := parser.ParseFile(fset, name, body, parser.AllErrors|parser.ParseComments); err != nil {
+  				if el, ok := err.(scanner.ErrorList); ok {
+  					for i, e := range el {
+  						if i == 3 {
+  							out = append(out, Finding{"error", fmt.Sprintf("%s: ... and %d more syntax error(s)", name, len(el)-3)})
+  							break
+  						}
+  						report(e.Pos.Line, "syntax error: "+e.Msg)
+  					}
+  				} else {
+  					out = append(out, Finding{"error", name + ": " + err.Error()})
+  				}
+  			}
+  		case ".json":
+  			var v any
+  			if err := json.Unmarshal([]byte(body), &v); err != nil {
+  				out = append(out, Finding{"error", name + ": invalid JSON: " + err.Error()})
+  			}
+  		}
+  	}
+  	return out
+  }
+  ```
+}
+
+#check: the code that came back{
+  The code itself is looked at before it is written: empty code is an error, and so is code that
+  still says `TODO`, `FIXME`, `not implemented` or `implement me`, because a gap filled with a
+  promise to fill it is not filled.
+
+  ```
+  // CheckFillCode looks at the lines of one filled gap on their own.
+  func CheckFillCode(code []string, hint string) []Finding {
+  	var out []Finding
+  	if strings.TrimSpace(strings.Join(code, "")) == "" {
+  		return []Finding{{"error", "the filled code is empty"}}
+  	}
+  	for i, l := range code {
+  		if placeholderRe.MatchString(l) {
+  			out = append(out, Finding{"warn", fmt.Sprintf("line %d looks like a placeholder: %s", i+1, strings.TrimSpace(l))})
+  		}
+  		if strings.Contains(l, "\x00") {
+  			out = append(out, Finding{"error", "the code contains a NUL character"})
+  		}
+  	}
+  	if len(code) > 80 {
+  		out = append(out, Finding{"warn", fmt.Sprintf("%d lines for one gap; consider splitting it into named chunks with prose", len(code))})
+  	}
+  	tabs, spaces := 0, 0
+  	for _, l := range code {
+  		switch {
+  		case strings.HasPrefix(l, "\t"):
+  			tabs++
+  		case strings.HasPrefix(l, "  "):
+  			spaces++
+  		}
+  	}
+  	if tabs > 0 && spaces > 0 {
+  		out = append(out, Finding{"warn", "the code mixes tab and space indentation"})
+  	}
+  	return out
+  }
+  ```
+}
+
+#check: an external command{
+  The author's own check, a build or a test, runs in a scratch directory with the tangled files,
+  never in the real output. It runs only when the fill closes the last open gap, since an import
+  that nobody uses yet makes a half-finished program fail to build, unless `--check-each` is
+  given. Its output becomes the finding that is sent back to the assistant on a retry.
+
+  ```
+  // RunCheck tangles the program into a scratch directory and runs a shell command there (go vet ./... say).
+  func RunCheck(text, cmdline string, timeout time.Duration) []Finding {
+  	files, _, err := TangleText(text)
+  	if err != nil {
+  		return []Finding{{"error", "does not tangle: " + err.Error()}}
+  	}
+  	dir, err := os.MkdirTemp("", "lit-check")
+  	if err != nil {
+  		return []Finding{{"error", err.Error()}}
+  	}
+  	defer os.RemoveAll(dir)
+  	names := make([]string, 0, len(files))
+  	for n := range files {
+  		names = append(names, n)
+  	}
+  	sort.Strings(names)
+  	for _, n := range names {
+  		if err := writeFile(filepath.Join(dir, filepath.FromSlash(n)), files[n]); err != nil {
+  			return []Finding{{"error", err.Error()}}
+  		}
+  	}
+  	var cmd *exec.Cmd
+  	if runtime.GOOS == "windows" {
+  		cmd = exec.Command("cmd", "/C", cmdline)
+  	} else {
+  		cmd = exec.Command("sh", "-c", cmdline)
+  	}
+  	cmd.Dir = dir
+  	var buf bytes.Buffer
+  	cmd.Stdout, cmd.Stderr = &buf, &buf
+  	if err := cmd.Start(); err != nil {
+  		return []Finding{{"error", "check command: " + err.Error()}}
+  	}
+  	done := make(chan error, 1)
+  	go func() { done <- cmd.Wait() }()
+  	select {
+  	case err := <-done:
+  		if err != nil {
+  			msg := strings.TrimSpace(buf.String())
+  			if len(msg) > 1500 {
+  				msg = msg[:1500] + "\n..."
+  			}
+  			return []Finding{{"error", fmt.Sprintf("`%s` failed:\n%s", cmdline, msg)}}
+  		}
+  	case <-time.After(timeout):
+  		cmd.Process.Kill()
+  		return []Finding{{"error", fmt.Sprintf("`%s` timed out after %s", cmdline, timeout)}}
+  	}
+  	return []Finding{{"ok", "`" + cmdline + "` passed"}}
+  }
+  ```
+}
+
+#internal/lit/check.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<check: findings>>>
+
+  <<<check: the program as a whole>>>
+
+  <<<check: the code that came back>>>
+
+  <<<check: an external command>>>
+  ```
+}

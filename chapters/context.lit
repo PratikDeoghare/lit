@@ -1,0 +1,454 @@
+#h1{Gaps for the assistant: the context}
+
+What an assistant is told decides whether the code it returns fits. This chapter builds the
+prompt from the document: from the gap up to the root, and out to the chunks it touches.
+
+#context: the prompt{
+  The point of the whole feature is what the assistant is told. A gap in a chunk is not a function
+  to implement in a vacuum: the document says what the program is for, what the section around the
+  gap is about, where the chunk is used, and what the neighbouring chunks look like, and a person
+  filling the gap would read all of it. The builder collects the same things and puts them in a
+  prompt, most specific last. The system message sets the rules: reply with one fenced block that
+  replaces the gap, or with `CANNOT:` and a reason, and never invent names the document does not
+  give.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"path/filepath"
+  	"regexp"
+  	"sort"
+  	"strings"
+  )
+
+  // A Prompt is what the agent is asked.
+  type Prompt struct {
+  	System, User string
+  	Sections     []string // titles of the sections that fit, for --show-context
+  }
+
+  const fillSystem = `You fill in one gap in a literate program written in brashtag notation.
+
+  The program is prose interleaved with named code chunks. A line of code that consists only of <<<name>>> expands to the code of the chunk of that name, indented as the reference is; a line written \<<<name>>> is literal text. Chunks are concatenated into source files by a tool called tangle. A gap is marked by the author with an agent-fill-in hint; you write the code lines that belong there.
+
+  Rules:
+  - Reply with exactly one fenced code block holding the lines to insert, and nothing else. Use a fence of three backticks (more if your code contains three).
+  - The lines are inserted verbatim as code lines of the chunk at the marked place. Keep the indentation that the neighbouring lines of the chunk call for; do not add indentation for the place where the chunk will be expanded (tangle adds that).
+  - Follow the language, naming, error handling and style of the surrounding code. Use only identifiers that exist in the context shown or in the language's standard library, and say nothing about imports unless the chunk is the place for them.
+  - Do not repeat code that is already there, do not leave placeholders, TODOs or ellipses, and do not write the code of other chunks. A <<<name>>> line is allowed only for a chunk that exists.
+  - If the hint cannot be satisfied from what you are shown, reply with a single line that starts with CANNOT: and gives the reason.`
+
+  type section struct {
+  	title string
+  	body  string
+  	prio  int // lower is kept first when the budget is tight
+  }
+  ```
+}
+
+#context: prose of a section{
+  Prose is taken from the tree, not from the text, so that the code a section contains is not
+  repeated and an inline code span or a formula is shown as its source.
+
+  ```
+  var blankRuns = regexp.MustCompile(`\n{3,}`)
+
+  var (
+  	refMention = regexp.MustCompile("<<<([^>]+)>>>|«([^»]+)»|`([^`]+)`")
+  )
+
+  // proseOf renders the prose items of a chunk as plain paragraphs.
+  func (d *Doc) proseOf(c *chunk) string {
+  	var out []string
+  	for _, it := range c.items {
+  		if it.kind != "prose" {
+  			continue
+  		}
+  		blocks, table := d.blocks(it.kids)
+  		for _, b := range blocks {
+  			switch b.kind {
+  			case "ul":
+  				for _, i := range b.items {
+  					out = append(out, "- "+plainFill(i, table))
+  				}
+  			case "math":
+  				out = append(out, b.text)
+  			default:
+  				out = append(out, plainFill(b.text, table))
+  			}
+  		}
+  	}
+  	return strings.Join(out, "\n\n")
+  }
+
+  func plainFill(s string, table []Code) string {
+  	s = citeRun.ReplaceAllString(s, "")
+  	return subPlaceholders(s, table, func(c Code) string { return "`" + c.Text() + "`" })
+  }
+  ```
+}
+
+#context: chunk text and windows{
+  A chunk is shown in document order with the gap marked, so that the assistant sees what comes
+  before and after it. For the tangled file only a window around the gap is shown, since the file
+  may be long.
+
+  ```
+  // chunkText renders a chunk's content in document order: prose, code and the hint, with the hint at `mark`.
+  func (d *Doc) chunkText(c *chunk, mark *item) string {
+  	var out []string
+  	for _, it := range c.items {
+  		switch it.kind {
+  		case "prose":
+  			out = append(out, d.proseOf(&chunk{items: []*item{it}}))
+  		case "code":
+  			out = append(out, strings.Join(it.lines, "\n"))
+  		case "hint":
+  			if it == mark {
+  				out = append(out, "⟦ FILL IN HERE: "+it.text+" ⟧")
+  			} else {
+  				out = append(out, "⟦ another unfilled hint: "+it.text+" ⟧")
+  			}
+  		case "chunk":
+  			out = append(out, "(nested chunk «"+it.chunk.name+"»)")
+  		}
+  	}
+  	return strings.Join(out, "\n\n")
+  }
+
+  func (d *Doc) codeLines(c *chunk) []string {
+  	var out []string
+  	for _, it := range c.items {
+  		if it.kind == "code" {
+  			out = append(out, it.lines...)
+  		}
+  	}
+  	return out
+  }
+
+  func window(lines []string, at, before, after int) string {
+  	lo, hi := max(0, at-before), min(len(lines), at+after+1)
+  	var out []string
+  	if lo > 0 {
+  		out = append(out, "…")
+  	}
+  	out = append(out, lines[lo:hi]...)
+  	if hi < len(lines) {
+  		out = append(out, "…")
+  	}
+  	return strings.Join(out, "\n")
+  }
+  ```
+}
+
+#context: where a chunk is used{
+  Walking up the references from the chunk to the files gives the chain a reader would follow to
+  learn where the code ends up. The depth and the number of sites are limited, because the point
+  is orientation and not completeness.
+
+  ```
+  type useSite struct {
+  	c     *chunk
+  	depth int
+  	line  int
+  	via   string
+  }
+
+  // useChain walks from a chunk to the chunks that expand it, and on to those that expand them, up to the files.
+  func (d *Doc) useChain(name string, maxDepth, maxSites int) []useSite {
+  	var out []useSite
+  	seen := map[*chunk]bool{}
+  	type qe struct {
+  		name  string
+  		depth int
+  	}
+  	queue := []qe{{name, 1}}
+  	for len(queue) > 0 && len(out) < maxSites {
+  		q := queue[0]
+  		queue = queue[1:]
+  		for _, u := range d.uses[q.name] {
+  			if seen[u] || len(out) >= maxSites {
+  				continue
+  			}
+  			seen[u] = true
+  			line := -1
+  			for i, l := range d.codeLines(u) {
+  				if m := refRe.FindStringSubmatch(l); m != nil && strings.TrimSpace(m[2]) == q.name {
+  					line = i
+  					break
+  				}
+  			}
+  			out = append(out, useSite{u, q.depth, line, q.name})
+  			if q.depth < maxDepth && u.name != "" && !fileRe.MatchString(u.name) {
+  				queue = append(queue, qe{u.name, q.depth + 1})
+  			}
+  		}
+  	}
+  	return out
+  }
+  ```
+}
+
+#context: assembling{
+  The sections are collected in the order of the prompt: the task, the path of headings to the
+  gap, the introduction of the program, the prose of the ancestors, the prose of the section, the
+  chain of use sites, the chunks that the chunk expands or the gap's words name, the other gaps,
+  the chunk with the gap marked and the window of the tangled file. Each has a priority. If the
+  whole is larger than the budget the lowest priorities are trimmed first and the order is kept,
+  so a long document degrades by losing distant detail and never by losing the task or the chunk.
+
+  ```
+  // BuildPrompt gathers the context of hint k: where it sits in the document, the prose and code around it, the
+  // chunks that expand its chunk, up to the files, the chunks it expands or mentions, and the tangled file with
+  // the gap marked. budget is the largest size of the user prompt in characters.
+  func BuildPrompt(src *Source, root Bag, k int, budget int) (*Prompt, error) {
+  	sites := FindHints(src, root)
+  	if k < 0 || k >= len(sites) {
+  		return nil, fmt.Errorf("no hint number %d (the program has %d)", k, len(sites))
+  	}
+  	site := sites[k]
+  	doc := NewDoc(root, filepath.Base(src.Root), src.Base, nil)
+  	var target *item
+  	var holeChunk *chunk
+  	n := 0
+  	var headings [7]string
+  	var crumbs []string
+  	found := false
+  	for _, p := range walk(doc.root) {
+  		if p.it.kind == "head" && !found {
+  			text, _ := runText(p.it.kids)
+  			headings[p.it.level] = strings.TrimSpace(text)
+  			for l := p.it.level + 1; l <= 6; l++ {
+  				headings[l] = ""
+  			}
+  		}
+  		if p.it.kind == "hint" && p.c.name != "" {
+  			if n == k {
+  				target, holeChunk, found = p.it, p.c, true
+  				for _, h := range headings {
+  					if h != "" {
+  						crumbs = append(crumbs, h)
+  					}
+  				}
+  			}
+  			n++
+  		}
+  	}
+  	if target == nil || n != len(sites) {
+  		return nil, fmt.Errorf("internal: found %d hints in the document tree but %d in the text", n, len(sites))
+  	}
+
+  	chunks := Collect(root, true)
+  	files := doc.partof[holeChunk.name]
+  	if fileRe.MatchString(holeChunk.name) {
+  		files = append([]string{holeChunk.name}, files...)
+  	}
+  	lang := ""
+  	if len(files) > 0 {
+  		lang = strings.TrimPrefix(filepath.Ext(files[0]), ".")
+  	}
+
+  	var secs []section
+  	// 1. the task
+  	task := fmt.Sprintf("Hint (%s line %d): %s\nChunk to fill: «%s»", site.File, site.Line, orNone(site.Text), holeChunk.name)
+  	if len(files) > 0 {
+  		task += "\nEnds up in: " + strings.Join(files, ", ")
+  	} else {
+  		task += "\nThis chunk is not expanded into any file yet."
+  	}
+  	if lang != "" {
+  		task += "\nLanguage: " + lang
+  	}
+  	secs = append(secs, section{"task", task, 0})
+  	// 2. where in the document
+  	if len(crumbs) > 0 {
+  		secs = append(secs, section{"where in the document", strings.Join(crumbs, " › "), 1})
+  	}
+  	// 3. the document's introduction
+  	if intro := doc.introText(); intro != "" {
+  		secs = append(secs, section{"what the program is", trunc(intro, 1800), 4})
+  	}
+  	// 4. prose of the nesting ancestors
+  	var anc []string
+  	for p := holeChunk.parent; p != nil && p.name != ""; p = p.parent {
+  		if t := doc.proseOf(p); t != "" {
+  			anc = append([]string{"«" + p.name + "»: " + trunc(t, 800)}, anc...)
+  		}
+  	}
+  	if len(anc) > 0 {
+  		secs = append(secs, section{"the chunks around this one", strings.Join(anc, "\n\n"), 3})
+  	}
+  	// 5. the section prose
+  	if t := doc.sectionProse(target); t != "" {
+  		secs = append(secs, section{"prose of this section", trunc(t, 2500), 2})
+  	}
+  	// 6. use sites up to the files
+  	var uses []string
+  	for _, u := range doc.useChain(holeChunk.name, 4, 8) {
+  		lines := doc.codeLines(u.c)
+  		body := ""
+  		if u.line >= 0 {
+  			body = window(lines, u.line, 5, 5)
+  		}
+  		who := "«" + u.c.name + "»"
+  		if u.c.name == "" {
+  			who = "the document"
+  		}
+  		head := fmt.Sprintf("%s«%s» is expanded in %s:", strings.Repeat("  ", u.depth-1), u.via, who)
+  		if p := doc.proseOf(u.c); p != "" && u.depth == 1 {
+  			head += "\n(" + trunc(p, 400) + ")"
+  		}
+  		uses = append(uses, head+"\n"+indentBlock(body, strings.Repeat("  ", u.depth-1)))
+  	}
+  	if len(uses) > 0 {
+  		secs = append(secs, section{"where this chunk is used", strings.Join(uses, "\n\n"), 2})
+  	}
+  	// 7. chunks it expands or the hint mentions
+  	want := map[string]bool{}
+  	var wantOrder []string
+  	addWant := func(nm string) {
+  		nm = strings.TrimSpace(nm)
+  		if _, ok := doc.defs[nm]; ok && nm != holeChunk.name && !want[nm] {
+  			want[nm] = true
+  			wantOrder = append(wantOrder, nm)
+  		}
+  	}
+  	for _, r := range holeChunk.refs {
+  		addWant(r)
+  	}
+  	for _, it := range holeChunk.items {
+  		if it.kind == "code" {
+  			for _, l := range it.lines {
+  				if m := refRe.FindStringSubmatch(l); m != nil {
+  					addWant(m[2])
+  				}
+  			}
+  		}
+  	}
+  	for _, m := range refMention.FindAllStringSubmatch(site.Text+" "+site.Raw, -1) {
+  		addWant(m[1] + m[2] + m[3])
+  	}
+  	var refs []string
+  	for _, nm := range wantOrder {
+  		var parts []string
+  		for _, c := range doc.defs[nm] {
+  			if p := doc.proseOf(c); p != "" {
+  				parts = append(parts, trunc(p, 300))
+  			}
+  			parts = append(parts, trunc(strings.Join(doc.codeLines(c), "\n"), 1200))
+  		}
+  		refs = append(refs, "«"+nm+"»:\n"+strings.Join(parts, "\n"))
+  	}
+  	if len(refs) > 0 {
+  		secs = append(secs, section{"chunks this one expands or the hint mentions", strings.Join(refs, "\n\n"), 3})
+  	}
+  	// 8. the chunk, in document order, with the gap marked
+  	secs = append(secs, section{"the chunk, with the gap marked", doc.chunkText(holeChunk, target), 1})
+  	// 9. the tangled file around the gap
+  	if len(files) > 0 {
+  		if lines, err := chunks.Expand(files[0]); err == nil {
+  			at := -1
+  			for i, l := range lines {
+  				if m := holeRe.FindStringSubmatch(l); m != nil && m[1] == fmt.Sprint(k) {
+  					at = i
+  				}
+  			}
+  			if at >= 0 {
+  				shown := make([]string, len(lines))
+  				for i, l := range lines {
+  					if m := holeRe.FindStringSubmatch(l); m != nil {
+  						ind := l[:len(l)-len(strings.TrimLeft(l, " \t"))]
+  						if m[1] == fmt.Sprint(k) {
+  							shown[i] = ind + "⟦ FILL IN HERE ⟧"
+  						} else {
+  							shown[i] = ind + "⟦ another unfilled hint ⟧"
+  						}
+  					} else {
+  						shown[i] = Unescape(l)
+  					}
+  				}
+  				secs = append(secs, section{"the tangled file " + files[0] + " around the gap", window(shown, at, 40, 25), 1})
+  			}
+  		}
+  	}
+  	// 10. other hints
+  	var others []string
+  	for _, s := range sites {
+  		if s.Index != k {
+  			others = append(others, s.Describe())
+  		}
+  	}
+  	if len(others) > 0 {
+  		secs = append(secs, section{"other unfilled hints", strings.Join(others, "\n"), 5})
+  	}
+
+  	// the budget: sections keep their order in the prompt but are trimmed from the lowest priority up
+  	remaining := budget
+  	keep := make([]string, len(secs))
+  	idx := make([]int, len(secs))
+  	for i := range idx {
+  		idx[i] = i
+  	}
+  	sort.SliceStable(idx, func(a, b int) bool { return secs[idx[a]].prio < secs[idx[b]].prio })
+  	for _, i := range idx {
+  		s := secs[i]
+  		need := len(s.body) + len(s.title) + 12
+  		switch {
+  		case need <= remaining:
+  			keep[i] = s.body
+  			remaining -= need
+  		case remaining > 400 && s.prio > 0:
+  			keep[i] = trunc(s.body, remaining-len(s.title)-40) + "\n… (cut to fit the budget)"
+  			remaining = 0
+  		}
+  	}
+  	// the chunk and the tangled window read best last: general first, then specific
+  	order := []string{"task", "where in the document", "what the program is", "the chunks around this one", "prose of this section",
+  		"where this chunk is used", "chunks this one expands or the hint mentions", "other unfilled hints", "the chunk, with the gap marked"}
+  	rank := func(t string) int {
+  		for i, o := range order {
+  			if o == t {
+  				return i
+  			}
+  		}
+  		return len(order) // the tangled file window
+  	}
+  	pos := make([]int, 0, len(secs))
+  	for i := range secs {
+  		if keep[i] != "" {
+  			pos = append(pos, i)
+  		}
+  	}
+  	sort.SliceStable(pos, func(a, b int) bool { return rank(secs[pos[a]].title) < rank(secs[pos[b]].title) })
+  	var sb strings.Builder
+  	p := &Prompt{System: fillSystem}
+  	for _, i := range pos {
+  		fmt.Fprintf(&sb, "=== %s ===\n%s\n\n", secs[i].title, keep[i])
+  		p.Sections = append(p.Sections, secs[i].title)
+  	}
+  	sb.WriteString("Write the code for the gap now.\n")
+  	p.User = blankRuns.ReplaceAllString(sb.String(), "\n\n")
+  	return p, nil
+  }
+  ```
+}
+
+#internal/lit/context.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<context: the prompt>>>
+
+  <<<context: prose of a section>>>
+
+  <<<context: chunk text and windows>>>
+
+  <<<context: where a chunk is used>>>
+
+  <<<context: assembling>>>
+
+  <<<context: small helpers>>>
+  ```
+}

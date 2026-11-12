@@ -1,0 +1,342 @@
+#h1{Gaps for the assistant: review}
+
+The author comes back to a program that has been filled in, and wants to see what was done,
+whether it holds up, and to keep or undo each fill.
+
+#review: the command{
+  Review is for the person who comes back after the assistant has worked. It lists every fill,
+  runs the deterministic checks again on the program as it is now, and can ask an assistant for a
+  verdict. A fill that is approved is kept and marked; a fill that is rejected is undone, and the
+  gap's original text comes back, ready to be filled differently.
+
+  ```
+  package lit
+
+  import (
+  	"bytes"
+  	"context"
+  	"encoding/json"
+  	"fmt"
+  	"strings"
+  	"time"
+  )
+
+  var reviewSpec = Spec{
+  	Opts: map[string]bool{"all": false, "check": true, "ai": false, "agent": true, "model": true, "approve": true, "approve-all": false,
+  		"reject": true, "json": false, "full": false, "timeout": true},
+  }
+
+  const reviewUsage = `usage: lit review SOURCE.lit [--all] [--check 'CMD'] [--ai [--agent SPEC] [--model M]]
+                    [--approve ID ...] [--approve-all] [--reject ID ...] [--full] [--json]
+
+  Reviews what agents filled in with lit fill. For every pending fill (every fill with --all):
+    - is it still in the .lit as written, or has someone edited it since
+    - does the whole program still parse and tangle, are the generated Go and JSON files valid, are there
+      placeholders, an enormous block, mixed indentation (no model needed)
+    - with --check 'CMD': does CMD (go vet ./..., go test ./...) pass on the tangled program
+    - with --ai: a second opinion from the agent: does the code do what the hint asks, bugs, invented names
+    --approve ID / --approve-all  mark fills as reviewed;  --reject ID  put the hint back in place of the code
+  Exit status 0 if nothing is wrong, 1 if a check failed or the second opinion is "reject", 2 for usage errors.`
+
+  const reviewSystem = `You review code that another model wrote to fill one gap in a literate program. Be a sceptical, careful reviewer.
+
+  Reply with a first line "VERDICT: ok", "VERDICT: concerns" or "VERDICT: reject", then at most six short bullet points. Look for: code that does not do what the hint asks; bugs and unhandled errors; identifiers, functions, packages or fields that do not exist in the context shown; behaviour that contradicts the prose of the chunk or the code around it; surprising side effects (files, network, deletion); code that duplicates something already present. Do not praise and do not restate the code.`
+
+  // reviewItem is the outcome of reviewing one fill.
+  type reviewItem struct {
+  	ID       string   `json:"id"`
+  	Chunk    string   `json:"chunk"`
+  	Where    string   `json:"where"`
+  	Hint     string   `json:"hint"`
+  	Status   string   `json:"status"`
+  	Present  string   `json:"present"` // as written | edited | gone
+  	Findings []string `json:"findings"`
+  	Verdict  string   `json:"verdict,omitempty"`
+  	Bad      bool     `json:"bad"`
+  }
+
+  func (r *reviewItem) add(f Finding) {
+  	r.Findings = append(r.Findings, f.String())
+  	if f.Level == "error" {
+  		r.Bad = true
+  	}
+  }
+  ```
+}
+
+#review: reading the record{
+  Decisions come first: approving or rejecting by number changes the record and the document, and
+  the listing that follows shows the state after them. Without arguments only fills that have not
+  been decided are shown, and with `--all` every one.
+
+  ```
+  // Review checks what agents filled in.
+  func Review(argv []string, io IO) int {
+  	a, err := ParseArgs(argv, reviewSpec)
+  	if err != nil || len(a.Pos) != 1 {
+  		fmt.Fprintln(io.Err, reviewUsage)
+  		return 2
+  	}
+  	fail := func(err error) int { fmt.Fprintln(io.Err, "review: "+err.Error()); return 2 }
+  	src, err := ReadSource(a.Pos[0])
+  	if err != nil {
+  		return fail(err)
+  	}
+  	root, err := src.Parse()
+  	if err != nil {
+  		return fail(err)
+  	}
+  	fills, err := LoadFills(src)
+  	if err != nil {
+  		return fail(err)
+  	}
+  	byID := map[string]*FillRecord{}
+  	for _, f := range fills {
+  		byID[f.ID] = f
+  	}
+  	// ---- decisions first
+  	for _, id := range a.All("reject") {
+  		f := byID[id]
+  		if f == nil {
+  			return fail(fmt.Errorf("no fill %s", id))
+  		}
+  		if n := strings.Count(src.Text, f.Inserted); n != 1 {
+  			return fail(fmt.Errorf("fill %s was edited since (its text occurs %d times); take it out by hand", id, n))
+  		}
+  		if _, err := src.WriteBack(strings.Replace(src.Text, f.Inserted, f.Orig, 1)); err != nil {
+  			return fail(err)
+  		}
+  		recordStatus(src, id, "rejected", "", "hint put back")
+  		fmt.Fprintf(io.Out, "rejected %s: the hint is back in %s\n", id, f.File)
+  		if src, err = ReadSource(a.Pos[0]); err != nil {
+  			return fail(err)
+  		}
+  		f.Status = "rejected"
+  	}
+  	for _, id := range a.All("approve") {
+  		f := byID[id]
+  		if f == nil {
+  			return fail(fmt.Errorf("no fill %s", id))
+  		}
+  		recordStatus(src, id, "approved", "")
+  		f.Status = "approved"
+  		fmt.Fprintf(io.Out, "approved %s\n", id)
+  	}
+  	if a.Has("approve-all") {
+  		for _, f := range fills {
+  			if f.Status == "pending" {
+  				recordStatus(src, f.ID, "approved", "")
+  				f.Status = "approved"
+  				fmt.Fprintf(io.Out, "approved %s\n", f.ID)
+  			}
+  		}
+  		return 0
+  	}
+  	if len(a.All("approve"))+len(a.All("reject")) > 0 {
+  		return 0
+  	}
+
+  	// ---- the review
+  	var todo []*FillRecord
+  	for _, f := range fills {
+  		if f.Status == "pending" || (a.Has("all") && f.Status != "") {
+  			todo = append(todo, f)
+  		}
+  	}
+  	open := FindHints(src, root)
+  	if len(todo) == 0 {
+  		fmt.Fprintf(io.Out, "no fills to review; %d hint(s) still open\n", len(open))
+  		return 0
+  	}
+  	program := CheckProgram(src, src.Text)
+  	var checkRes []Finding
+  	if c := a.Get("check", ""); c != "" {
+  		checkRes = RunCheck(src.Text, c, 5*time.Minute)
+  	}
+  	var agent Agent
+  	if a.Has("ai") {
+  		agent = AgentOverride
+  		if agent == nil {
+  			if agent, err = NewAgent(a.Get("agent", ""), a.Get("model", "")); err != nil {
+  				return fail(err)
+  			}
+  		}
+  	}
+  	chunks := Collect(root, false)
+  	var items []*reviewItem
+  	bad := false
+  	for _, f := range todo {
+  		it := &reviewItem{ID: f.ID, Chunk: f.Chunk, Where: fmt.Sprintf("%s:%d", f.File, f.Line), Hint: f.Hint, Status: f.Status}
+  		switch n := strings.Count(src.Text, f.Inserted); {
+  		case n == 1:
+  			it.Present = "as written"
+  		case n == 0 && f.Status == "rejected":
+  			it.Present = "taken out"
+  		case n == 0:
+  			it.Present = "edited"
+  			it.add(Finding{"warn", "the code was edited after it was filled (or taken out); the checks below are of the program as it is"})
+  		default:
+  			it.Present = "as written (several copies)"
+  		}
+  		for _, x := range CheckFillCode(strings.Split(f.Code, "\n"), f.Hint) {
+  			it.add(x)
+  		}
+  		for _, x := range append(append([]Finding(nil), program...), checkRes...) {
+  			it.add(x)
+  		}
+  		if agent != nil {
+  			verdict, err := aiReview(agent, src, root, chunks, f, program, checkRes)
+  			if err != nil {
+  				it.add(Finding{"warn", "no second opinion: " + err.Error()})
+  			} else {
+  				it.Verdict = verdict
+  				if strings.HasPrefix(strings.ToLower(verdict), "verdict: reject") {
+  					it.Bad = true
+  				}
+  				recordStatus(src, f.ID, "", verdict)
+  			}
+  		}
+  		bad = bad || it.Bad
+  		items = append(items, it)
+  	}
+  	if a.Has("json") {
+  		var buf bytes.Buffer
+  		enc := json.NewEncoder(&buf)
+  		enc.SetIndent("", " ")
+  		enc.SetEscapeHTML(false)
+  		enc.Encode(items)
+  		io.Out.Write(buf.Bytes())
+  	} else {
+  		for i, it := range items {
+  			f := todo[i]
+  			fmt.Fprintf(io.Out, "== %s  «%s»  %s  [%s, %s]\n", it.ID, it.Chunk, it.Where, it.Status, it.Present)
+  			fmt.Fprintf(io.Out, "   hint:  %s\n   agent: %s\n", orNone(it.Hint), f.Agent)
+  			code := strings.Split(f.Code, "\n")
+  			show := code
+  			if len(show) > 12 && !a.Has("full") {
+  				show = append(append([]string(nil), code[:12]...), fmt.Sprintf("… (%d more line(s); --full shows all)", len(code)-12))
+  			}
+  			for _, l := range show {
+  				fmt.Fprintf(io.Out, "   | %s\n", l)
+  			}
+  			seen := map[string]bool{}
+  			okCount := 0
+  			for _, s := range it.Findings {
+  				if seen[s] {
+  					continue
+  				}
+  				seen[s] = true
+  				if strings.HasPrefix(s, "ok:") {
+  					okCount++
+  				}
+  				fmt.Fprintf(io.Out, "   %s\n", strings.ReplaceAll(s, "\n", "\n   "))
+  			}
+  			if len(it.Findings) == 0 {
+  				fmt.Fprintln(io.Out, "   ok: parses, tangles, no placeholders")
+  			}
+  			if it.Verdict != "" {
+  				fmt.Fprintf(io.Out, "   second opinion:\n     %s\n", strings.ReplaceAll(strings.TrimSpace(it.Verdict), "\n", "\n     "))
+  			}
+  		}
+  		if bad {
+  			fmt.Fprintf(io.Out, "\nproblems found. fix the .lit, or lit review --reject ID to put a hint back.\n")
+  		} else {
+  			concerns := false
+  			for _, it := range items {
+  				concerns = concerns || (it.Verdict != "" && !strings.HasPrefix(strings.ToLower(it.Verdict), "verdict: ok"))
+  			}
+  			if concerns {
+  				fmt.Fprintf(io.Out, "\nthe checks passed, but a second opinion raised concerns; read them above. lit review --approve ID records that you looked.\n")
+  			} else {
+  				fmt.Fprintf(io.Out, "\nnothing wrong found in %d fill(s). lit review --approve ID (or --approve-all) records that you looked.\n", len(items))
+  			}
+  		}
+  	}
+  	if bad {
+  		return 1
+  	}
+  	return 0
+  }
+  ```
+}
+
+#review: the second opinion{
+  The assistant is shown the gap's words, the chunk with the code, the prose around it and the
+  deterministic findings, and asked for a first line `VERDICT: ok`, `VERDICT: concerns` or
+  `VERDICT: reject`, followed by at most six reasons. A reply that does not follow the format
+  counts as concerns. A model that wrote the code is not a good judge of it, so the review can use
+  another agent or model than the fill.
+
+  ```
+  func aiReview(agent Agent, src *Source, root Bag, chunks *Chunks, f *FillRecord, program, check []Finding) (string, error) {
+  	var sb strings.Builder
+  	fmt.Fprintf(&sb, "Hint the author left for the gap: %s\nChunk: «%s»\n\n", orNone(f.Hint), f.Chunk)
+  	if lines, ok := chunks.Lines[f.Chunk]; ok {
+  		fmt.Fprintf(&sb, "=== the whole chunk as it is now ===\n%s\n\n", trunc(strings.Join(lines, "\n"), 6000))
+  	}
+  	fmt.Fprintf(&sb, "=== the code the agent wrote ===\n%s\n\n", f.Code)
+  	doc := NewDoc(root, "x", src.Base, nil)
+  	for _, files := range [][]string{doc.partof[f.Chunk]} {
+  		for i, file := range files {
+  			if i == 1 {
+  				break
+  			}
+  			if lines, err := chunks.Expand(file); err == nil {
+  				fmt.Fprintf(&sb, "=== the tangled file %s (start) ===\n%s\n\n", file, trunc(strings.Join(lines, "\n"), 5000))
+  			}
+  		}
+  	}
+  	if p := doc.chunkProse(f.Chunk); p != "" {
+  		fmt.Fprintf(&sb, "=== prose of the chunk ===\n%s\n\n", trunc(p, 1500))
+  	}
+  	var res []string
+  	for _, x := range append(append([]Finding(nil), program...), check...) {
+  		res = append(res, x.String())
+  	}
+  	if len(res) > 0 {
+  		fmt.Fprintf(&sb, "=== automatic checks ===\n%s\n\n", strings.Join(res, "\n"))
+  	}
+  	sb.WriteString("Review the code the agent wrote.\n")
+  	reply, err := agent.Ask(context.Background(), reviewSystem, sb.String())
+  	if err != nil {
+  		return "", err
+  	}
+  	reply = strings.TrimSpace(reply)
+  	if !strings.HasPrefix(strings.ToUpper(reply), "VERDICT:") {
+  		reply = "VERDICT: concerns (the reviewer did not follow the format)\n" + reply
+  	}
+  	return reply, nil
+  }
+  ```
+}
+
+#review: the prose of a chunk{
+  The words that explain a chunk are what the code is judged against.
+
+  ```
+  // chunkProse is the prose of every definition of a chunk.
+  func (d *Doc) chunkProse(name string) string {
+  	var out []string
+  	for _, c := range d.defs[name] {
+  		if p := d.proseOf(c); p != "" {
+  			out = append(out, p)
+  		}
+  	}
+  	return strings.Join(out, "\n\n")
+  }
+  ```
+}
+
+#internal/lit/review.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<review: the command>>>
+
+  <<<review: reading the record>>>
+
+  <<<review: the second opinion>>>
+
+  <<<review: the prose of a chunk>>>
+  ```
+}

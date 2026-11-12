@@ -1,0 +1,1672 @@
+#h1{Rendering: weave}
+
+Weave turns the document into something to read: a linked HTML page with MathJax, and a LaTeX
+file that the author compiles. It does not produce a PDF itself, because a PDF is one command
+away from the LaTeX and the right engine depends on the machine.
+
+#weave: the document tree{
+  Weave turns the document into something to read: a linked HTML page with MathJax, and a LaTeX
+  file that the author compiles. It does not produce a PDF itself, because a PDF is one command
+  away from the LaTeX and the right engine depends on the machine. Both backends share an
+  analysis. Inline pieces, code spans and citations, are swapped for private-use placeholders
+  while prose is split into paragraphs and lists, and substituted back as HTML or LaTeX.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"io"
+  	"os"
+  	"path/filepath"
+  	"regexp"
+  	"strings"
+  )
+
+  // Inline pieces are swapped for private-use placeholders while prose is split into paragraphs and lists,
+  // then substituted back as HTML or LaTeX.
+  var (
+  	citeRun = regexp.MustCompile("\ue002[^\ue003]*\ue003(?:\\s+\ue002[^\ue003]*\ue003)*")
+  	citeOne = regexp.MustCompile("\ue002([^\ue003]*)\ue003")
+  	codePH  = regexp.MustCompile("\ue000(\\d+)\ue001")
+  	quotes  = regexp.MustCompile(`"([^"]*)"`)
+  	mathRe  = regexp.MustCompile(`(?s)^\s*\$(.+)\$\s*$`)
+  )
+
+  // ---- the document tree
+
+  type chunk struct {
+  	name   string
+  	parent *chunk
+  	items  []*item
+  	num    int
+  	id     string
+  	refs   []string // chunk names referenced from this chunk's code
+  }
+
+  // item kinds: prose (kids), code (lines), head (level, kids), chunk, bib (bag), img (bag), hint (text)
+  type item struct {
+  	kind  string
+  	kids  []Node
+  	lines []string
+  	level int
+  	chunk *chunk
+  	bag   Bag
+  	text  string
+  }
+
+  func plainKids(kids []Node) string {
+  	var sb strings.Builder
+  	for _, k := range kids {
+  		switch k := k.(type) {
+  		case Blob:
+  			sb.WriteString(k.Text())
+  		case Code:
+  			sb.WriteString(k.Text())
+  		}
+  	}
+  	return strings.TrimSpace(sb.String())
+  }
+
+  // runText turns inline kids into text with placeholders plus the table of code spans.
+  func runText(kids []Node) (string, []Code) {
+  	var sb strings.Builder
+  	var table []Code
+  	for _, k := range kids {
+  		switch k := k.(type) {
+  		case Blob:
+  			sb.WriteString(k.Text())
+  		case Code:
+  			table = append(table, k)
+  			fmt.Fprintf(&sb, "\ue000%d\ue001", len(table)-1)
+  		case Bag:
+  			sb.WriteString("\ue002" + plainKids(k.Kids()) + "\ue003")
+  		}
+  	}
+  	return sb.String(), table
+  }
+
+  func mathOf(c Code) (string, bool) {
+  	if m := mathRe.FindStringSubmatch(c.Text()); m != nil {
+  		return strings.TrimSpace(m[1]), true
+  	}
+  	return "", false
+  }
+  ```
+}
+
+#weave: building the tree{
+  The parse tree becomes a tree of chunks whose items are prose, code, headings, nested chunks,
+  figures, the bibliography and hints, in document order. Citations stay inline in the prose.
+
+  ```
+  func buildChunk(b Bag, parent *chunk) *chunk {
+  	c := &chunk{parent: parent}
+  	if parent != nil {
+  		c.name = strings.TrimSpace(b.Tag())
+  	}
+  	var run []Node
+  	flush := func() {
+  		if len(run) > 0 {
+  			c.items = append(c.items, &item{kind: "prose", kids: append([]Node(nil), run...)})
+  			run = run[:0]
+  		}
+  	}
+  	for _, k := range b.Kids() {
+  		switch k := k.(type) {
+  		case Code:
+  			if isFence(k) {
+  				flush()
+  				c.items = append(c.items, &item{kind: "code", lines: FenceText(k)})
+  			} else {
+  				run = append(run, k)
+  			}
+  		case Bag:
+  			tag := strings.TrimSpace(k.Tag())
+  			switch {
+  			case tag == "cite":
+  				run = append(run, k)
+  			case tag == "img":
+  				flush()
+  				c.items = append(c.items, &item{kind: "img", bag: k})
+  			case isHeading(tag):
+  				flush()
+  				c.items = append(c.items, &item{kind: "head", level: int(tag[1] - '0'), kids: k.Kids()})
+  			case tag == "bibliography":
+  				flush()
+  				c.items = append(c.items, &item{kind: "bib", bag: k})
+  			case tag == HintTag:
+  				flush()
+  				c.items = append(c.items, &item{kind: "hint", text: PlainText(k)})
+  			default:
+  				flush()
+  				c.items = append(c.items, &item{kind: "chunk", chunk: buildChunk(k, c)})
+  			}
+  		default:
+  			run = append(run, k)
+  		}
+  	}
+  	flush()
+  	return c
+  }
+  ```
+}
+
+#weave: figures and walking{
+  A figure is `#img{`path` caption}`, or the path as a word. Walking the tree gives every item
+  with the chunk that holds it.
+
+  ```
+  // imgParts reads #img{`path` caption} (or #img{path caption}).
+  func imgParts(b Bag) (path, caption string) {
+  	var code *Code
+  	var blobs strings.Builder
+  	for _, k := range b.Kids() {
+  		switch k := k.(type) {
+  		case Code:
+  			if code == nil {
+  				kk := k
+  				code = &kk
+  			}
+  		case Blob:
+  			blobs.WriteString(k.Text())
+  		}
+  	}
+  	rest := strings.Join(strings.Fields(blobs.String()), " ")
+  	if code != nil {
+  		return strings.TrimSpace(code.Text()), rest
+  	}
+  	p, c, _ := strings.Cut(rest, " ")
+  	return p, strings.TrimSpace(c)
+  }
+
+  type pair struct {
+  	c  *chunk
+  	it *item
+  }
+
+  // walk lists every item in document order with the chunk that holds it.
+  func walk(c *chunk) []pair {
+  	var out []pair
+  	for _, it := range c.items {
+  		out = append(out, pair{c, it})
+  		if it.kind == "chunk" {
+  			out = append(out, walk(it.chunk)...)
+  		}
+  	}
+  	return out
+  }
+
+  var nonAlnum = regexp.MustCompile(`[^A-Za-z0-9]+`)
+
+  func slug(s string) string {
+  	s = strings.Trim(nonAlnum.ReplaceAllString(s, "-"), "-")
+  	if s == "" {
+  		return "x"
+  	}
+  	return s
+  }
+
+  // ---- analysis shared by both backends
+  ```
+}
+
+#weave: analysis{
+  Analysis is one pass over the items: headings get unique identifiers, chunks are numbered and
+  indexed by name, the bibliography is read, references and citations are collected with where
+  they occur, and for every file the chunks that end up in it are found by following references.
+  It warns about undefined references, missing figures and citations without an entry.
+
+  ```
+  type heading struct {
+  	level     int
+  	title, id string
+  }
+
+  type placeRef struct{ name, id string }
+
+  type Doc struct {
+  	srcName, base string
+  	bag           Bag
+  	root          *chunk
+  	defs          map[string][]*chunk
+  	defOrder      []string
+  	uses          map[string][]*chunk
+  	useOrder      []string
+  	partof        map[string][]string
+  	bibsrc        map[string]string
+  	bibOrder      []string
+  	citeNo        map[string]int
+  	citeOrder     []string
+  	citedIn       map[string][]placeRef
+  	heads         []heading
+  	usedIDs       map[string]bool
+  	headID        map[*item]string
+  	headTitle     map[string]string
+  	title         string
+  	files         map[string]string
+  	filesDone     bool
+  	warn          io.Writer
+  }
+
+  func NewDoc(root Bag, srcName, base string, warn io.Writer) *Doc {
+  	if warn == nil {
+  		warn = io.Discard
+  	}
+  	if base == "" {
+  		base = "."
+  	}
+  	d := &Doc{srcName: srcName, base: base, bag: root, root: buildChunk(root, nil), warn: warn,
+  		defs: map[string][]*chunk{}, uses: map[string][]*chunk{}, partof: map[string][]string{}, bibsrc: map[string]string{},
+  		citeNo: map[string]int{}, citedIn: map[string][]placeRef{}, usedIDs: map[string]bool{}, headID: map[*item]string{},
+  		headTitle: map[string]string{}}
+  	d.analyse()
+  	d.title = strings.TrimSuffix(srcName, filepath.Ext(srcName))
+  	for _, h := range d.heads {
+  		if h.level == 1 {
+  			d.title = h.title
+  			break
+  		}
+  	}
+  	return d
+  }
+
+  type figure struct {
+  	kind string // "text" or "file"
+  	val  string
+  }
+  ```
+}
+
+#weave: figures{
+  A figure is found among the file chunks of the program, so a picture can be part of the literate
+  source, or next to the root file.
+
+  ```
+  // image finds a figure: a file chunk of the program, or a file next to it.
+  func (d *Doc) image(path string) *figure {
+  	if !d.filesDone {
+  		d.filesDone = true
+  		d.files = map[string]string{}
+  		ch := Collect(d.bag, false)
+  		for _, n := range ch.Order {
+  			if fileRe.MatchString(n) {
+  				if lines, err := ch.Expand(n); err == nil {
+  					d.files[n] = strings.Join(lines, "\n") + "\n"
+  				}
+  			}
+  		}
+  	}
+  	if t, ok := d.files[path]; ok {
+  		return &figure{"text", t}
+  	}
+  	full := filepath.Join(d.base, path)
+  	if fi, err := os.Stat(full); err == nil && fi.Mode().IsRegular() {
+  		return &figure{"file", full}
+  	}
+  	return nil
+  }
+
+  func (d *Doc) uniqueID(base string) string {
+  	cand := base
+  	for i := 1; d.usedIDs[cand]; {
+  		i++
+  		cand = fmt.Sprintf("%s-%d", base, i)
+  	}
+  	d.usedIDs[cand] = true
+  	return cand
+  }
+
+  func citeKeys(text string) []string {
+  	var out []string
+  	for _, m := range citeOne.FindAllStringSubmatch(text, -1) {
+  		for _, k := range strings.Split(m[1], ",") {
+  			if k = strings.TrimSpace(k); k != "" {
+  				out = append(out, k)
+  			}
+  		}
+  	}
+  	return out
+  }
+
+  func (d *Doc) addDef(c *chunk) {
+  	if _, ok := d.defs[c.name]; !ok {
+  		d.defOrder = append(d.defOrder, c.name)
+  	}
+  	d.defs[c.name] = append(d.defs[c.name], c)
+  }
+
+  func (d *Doc) analyse() {
+  	n := 0
+  	items := walk(d.root)
+  	for _, p := range items {
+  		it := p.it
+  		switch it.kind {
+  		case "head":
+  			text, _ := runText(it.kids)
+  			title := strings.TrimSpace(text)
+  			hid := d.uniqueID("h-" + slug(title))
+  			d.heads = append(d.heads, heading{it.level, title, hid})
+  			d.headID[it], d.headTitle[hid] = hid, title
+  		case "chunk":
+  			n++
+  			c := it.chunk
+  			c.num, c.id = n, d.uniqueID("c-"+slug(c.name))
+  			d.addDef(c)
+  		case "bib":
+  			for _, k := range it.bag.Kids() {
+  				if kb, ok := k.(Bag); ok {
+  					var lines []string
+  					for _, kk := range kb.Kids() {
+  						if kc, ok := kk.(Code); ok && isFence(kc) {
+  							lines = append(lines, FenceText(kc)...)
+  						}
+  					}
+  					key := strings.TrimSpace(kb.Tag())
+  					if _, seen := d.bibsrc[key]; !seen {
+  						d.bibOrder = append(d.bibOrder, key)
+  					}
+  					d.bibsrc[key] = strings.Join(lines, "\n")
+  				}
+  			}
+  		}
+  	}
+  	var curHead *placeRef
+  	for _, p := range items {
+  		it, ch := p.it, p.c
+  		switch it.kind {
+  		case "head":
+  			hid := d.headID[it]
+  			curHead = &placeRef{d.headTitle[hid], hid}
+  		case "code":
+  			for _, ln := range it.lines {
+  				if m := refRe.FindStringSubmatch(ln); m != nil {
+  					name := strings.TrimSpace(m[2])
+  					ch.refs = append(ch.refs, name)
+  					if _, ok := d.uses[name]; !ok {
+  						d.useOrder = append(d.useOrder, name)
+  					}
+  					found := false
+  					for _, u := range d.uses[name] {
+  						found = found || u == ch
+  					}
+  					if !found {
+  						d.uses[name] = append(d.uses[name], ch)
+  					}
+  				}
+  			}
+  		case "prose":
+  			text, _ := runText(it.kids)
+  			for _, key := range citeKeys(text) {
+  				if _, ok := d.citeNo[key]; !ok {
+  					d.citeNo[key] = len(d.citeNo) + 1
+  					d.citeOrder = append(d.citeOrder, key)
+  				}
+  				var where *placeRef
+  				switch {
+  				case ch.name != "":
+  					where = &placeRef{ch.name, ch.id}
+  				case curHead != nil:
+  					nm := curHead.name
+  					if curHead.id == d.heads[0].id {
+  						nm = "introduction"
+  					}
+  					where = &placeRef{nm, curHead.id}
+  				}
+  				if where != nil {
+  					dup := false
+  					for _, w := range d.citedIn[key] {
+  						dup = dup || w == *where
+  					}
+  					if !dup {
+  						d.citedIn[key] = append(d.citedIn[key], *where)
+  					}
+  				}
+  			}
+  		}
+  	}
+  	for _, p := range items {
+  		if p.it.kind == "img" {
+  			if path, _ := imgParts(p.it.bag); d.image(path) == nil {
+  				fmt.Fprintf(d.warn, "warning: #img{%s}: no such file chunk or file\n", path)
+  			}
+  		}
+  	}
+  	for _, name := range d.useOrder {
+  		if _, ok := d.defs[name]; !ok {
+  			fmt.Fprintf(d.warn, "warning: <<<%s>>> is referenced but never defined\n", name)
+  		}
+  	}
+  	for _, f := range d.defOrder {
+  		if !fileRe.MatchString(f) {
+  			continue
+  		}
+  		seen := map[string]bool{f: true}
+  		queue := []string{f}
+  		for len(queue) > 0 {
+  			cur := queue[0]
+  			queue = queue[1:]
+  			for _, c := range d.defs[cur] {
+  				for _, r := range c.refs {
+  					if _, ok := d.defs[r]; ok && !seen[r] {
+  						seen[r] = true
+  						queue = append(queue, r)
+  						d.partof[r] = append(d.partof[r], f)
+  					}
+  				}
+  			}
+  		}
+  	}
+  	for _, key := range d.citeOrder {
+  		if _, ok := d.bibsrc[key]; !ok {
+  			fmt.Fprintf(d.warn, "warning: #cite{%s} has no bibliography entry\n", key)
+  		}
+  	}
+  }
+  ```
+}
+
+#weave: prose blocks{
+  A run of prose is split into paragraphs, bullet lists and display math: a paragraph that is
+  nothing but one `$...$` code span is display math.
+
+  ```
+  type block struct {
+  	kind  string // "p" | "ul" | "math"
+  	text  string
+  	items []string
+  }
+
+  // blocks splits a prose run into paragraphs, bullet lists and display math; text still has placeholders.
+  func (d *Doc) blocks(kids []Node) ([]block, []Code) {
+  	text, table := runText(kids)
+  	var paras [][]string
+  	var cur []string
+  	for _, ln := range append(strings.Split(text, "\n"), "") {
+  		if s := strings.TrimSpace(ln); s != "" {
+  			cur = append(cur, s)
+  		} else if len(cur) > 0 {
+  			paras = append(paras, cur)
+  			cur = nil
+  		}
+  	}
+  	var out []block
+  	for _, p := range paras {
+  		if strings.HasPrefix(p[0], "- ") {
+  			var items []string
+  			for _, ln := range p {
+  				if strings.HasPrefix(ln, "- ") {
+  					items = append(items, ln[2:])
+  				} else {
+  					items[len(items)-1] += " " + ln
+  				}
+  			}
+  			out = append(out, block{kind: "ul", items: items})
+  			continue
+  		}
+  		t := strings.Join(p, " ")
+  		if m := codePH.FindStringSubmatch(t); m != nil && m[0] == t {
+  			var i int
+  			fmt.Sscan(m[1], &i)
+  			if tex, ok := mathOf(table[i]); ok {
+  				out = append(out, block{kind: "math", text: tex})
+  				continue
+  			}
+  		}
+  		out = append(out, block{kind: "p", text: t})
+  	}
+  	return out, table
+  }
+
+  func (d *Doc) users(c *chunk) []*chunk {
+  	var out []*chunk
+  	for _, u := range d.uses[c.name] {
+  		if u != c {
+  			out = append(out, u)
+  		}
+  	}
+  	return out
+  }
+  ```
+}
+
+#internal/lit/weavedoc.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<weave: the document tree>>>
+
+  <<<weave: building the tree>>>
+
+  <<<weave: figures and walking>>>
+
+  <<<weave: analysis>>>
+
+  <<<weave: figures>>>
+
+  <<<weave: prose blocks>>>
+  ```
+}
+
+#bib: accents{
+  The bibliography is BibTeX in fences. The standard library has no Unicode normalisation, so the
+  accents that BibTeX writes as commands are turned into the precomposed letters from a small
+  table; a letter that is not in it keeps its combining mark.
+
+  ```
+  package lit
+
+  import (
+  	"regexp"
+  	"strings"
+  )
+
+  // accented maps an accent command and a base letter to the precomposed letter. The standard library has no
+  // Unicode normalisation, so the common Latin letters are listed here; others keep the combining mark.
+  var accented = func() map[string]rune {
+  	m := map[string]rune{}
+  	add := func(acc, bases, composed string) {
+  		b, c := []rune(bases), []rune(composed)
+  		for i := range b {
+  			m[acc+string(b[i])] = c[i]
+  		}
+  	}
+  	add("'", "AEIOUYaeiouyCcNnSsZzLlRr", "\u00c1\u00c9\u00cd\u00d3\u00da\u00dd\u00e1\u00e9\u00ed\u00f3\u00fa\u00fd\u0106\u0107\u0143\u0144\u015a\u015b\u0179\u017a\u0139\u013a\u0154\u0155")
+  	add("`", "AEIOUaeiou", "\u00c0\u00c8\u00cc\u00d2\u00d9\u00e0\u00e8\u00ec\u00f2\u00f9")
+  	add("\"", "AEIOUaeiouyY", "\u00c4\u00cb\u00cf\u00d6\u00dc\u00e4\u00eb\u00ef\u00f6\u00fc\u00ff\u0178")
+  	add("^", "AEIOUaeiouCcGgHhJjSsWwYy", "\u00c2\u00ca\u00ce\u00d4\u00db\u00e2\u00ea\u00ee\u00f4\u00fb\u0108\u0109\u011c\u011d\u0124\u0125\u0134\u0135\u015c\u015d\u0174\u0175\u0176\u0177")
+  	add("~", "ANOanoIiUu", "\u00c3\u00d1\u00d5\u00e3\u00f1\u00f5\u0128\u0129\u0168\u0169")
+  	return m
+  }()
+
+  var combining = map[string]string{"'": "\u0301", "`": "\u0300", "\"": "\u0308", "^": "\u0302", "~": "\u0303"}
+
+  var (
+  	accentRe = regexp.MustCompile("\\\\(['`\"^~])\\{?(\\w)\\}?")
+  	braceRe  = regexp.MustCompile(`[{}]`)
+  )
+
+  func texText(s string) string {
+  	s = accentRe.ReplaceAllStringFunc(s, func(m string) string {
+  		g := accentRe.FindStringSubmatch(m)
+  		if r, ok := accented[g[1]+g[2]]; ok {
+  			return string(r)
+  		}
+  		return g[2] + combining[g[1]]
+  	})
+  	s = strings.ReplaceAll(s, "--", "\u2013")
+  	s = strings.ReplaceAll(s, `\&`, "&")
+  	return strings.TrimSpace(braceRe.ReplaceAllString(s, ""))
+  }
+
+  var (
+  	bibHead  = regexp.MustCompile(`^\s*@(\w+)\s*\{\s*([^,]+),`)
+  	bibField = regexp.MustCompile(`\s*(\w+)\s*=\s*`)
+  	bibBare  = regexp.MustCompile(`^[^,}\s]+`)
+  	andRe    = regexp.MustCompile(`\s+and\s+`)
+  	urlRe    = regexp.MustCompile(`\\url\{([^}]+)\}`)
+  	arxivRe  = regexp.MustCompile(`arXiv:([\w./-]+)`)
+  	arxivSfx = regexp.MustCompile(`\s*arXiv:\S+`)
+  )
+  ```
+}
+
+#bib: parsing an entry{
+  An entry is a key and fields, each a braced or bare value. Braces nest, so the value runs to the
+  matching one.
+
+  ```
+  func parseBibtex(src string) map[string]string {
+  	pos := 0
+  	if m := bibHead.FindStringIndex(src); m != nil {
+  		pos = m[1]
+  	}
+  	fields := map[string]string{}
+  	for {
+  		loc := bibField.FindStringSubmatchIndex(src[pos:])
+  		if loc == nil {
+  			break
+  		}
+  		name := strings.ToLower(src[pos+loc[2] : pos+loc[3]])
+  		p := pos + loc[1]
+  		var val string
+  		if p < len(src) && src[p] == '{' {
+  			depth, j := 0, p
+  			for j < len(src) {
+  				switch src[j] {
+  				case '{':
+  					depth++
+  				case '}':
+  					depth--
+  				}
+  				if depth == 0 {
+  					break
+  				}
+  				j++
+  			}
+  			val, pos = src[p+1:min(j, len(src))], j+1
+  		} else {
+  			val = bibBare.FindString(src[p:])
+  			pos = p + len(val)
+  		}
+  		fields[name] = val
+  	}
+  	return fields
+  }
+  ```
+}
+
+#bib: what the weaver needs{
+  The fields are reduced to authors in the order and form of a reference list, a title, a venue,
+  volume and pages, a year, and one of a URL, an arXiv identifier or a free note. Anything not
+  seen in the entry is left out rather than filled in.
+
+  ```
+  type bibInfo struct{ authors, title, venue, vol, pages, year, url, hp, arxiv string }
+
+  func first(vals ...string) string {
+  	for _, v := range vals {
+  		if v != "" {
+  			return v
+  		}
+  	}
+  	return ""
+  }
+
+  func bibParts(f map[string]string) bibInfo {
+  	var names []string
+  	for _, n := range andRe.Split(texText(f["author"]), -1) {
+  		names = append(names, strings.TrimSpace(n))
+  	}
+  	authors := ""
+  	switch {
+  	case len(names) > 0 && names[len(names)-1] == "others":
+  		authors = strings.Join(names[:len(names)-1], ", ") + " et al."
+  	case len(names) > 1:
+  		authors = strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+  	case len(names) > 0:
+  		authors = names[0]
+  	}
+  	venue := arxivSfx.ReplaceAllString(first(f["journal"], f["booktitle"], f["institution"], f["publisher"]), "")
+  	hp := f["howpublished"]
+  	um := urlRe.FindStringSubmatch(hp)
+  	am := arxivRe.FindStringSubmatch(f["note"] + " " + f["journal"])
+  	vol := f["volume"]
+  	if f["number"] != "" {
+  		vol += "(" + f["number"] + ")"
+  	}
+  	b := bibInfo{authors: authors, title: texText(f["title"]), venue: texText(venue), vol: vol,
+  		pages: texText(f["pages"]), year: f["year"]}
+  	if um != nil {
+  		b.url = um[1]
+  	} else {
+  		b.hp = texText(hp)
+  	}
+  	if am != nil {
+  		b.arxiv = am[1]
+  	}
+  	return b
+  }
+
+  // stop adds a full stop unless the text already ends in punctuation.
+  func stop(s string) string {
+  	if s != "" && strings.ContainsRune(".?!", rune(s[len(s)-1])) {
+  		return s
+  	}
+  	return s + "."
+  }
+  ```
+}
+
+#internal/lit/bib.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<bib: accents>>>
+
+  <<<bib: parsing an entry>>>
+
+  <<<bib: what the weaver needs>>>
+  ```
+}
+
+#html: escaping and inline{
+  The HTML backend writes text with the five characters escaped, quotes and citations in the
+  typographic style, and code spans as `code`, or as MathJax when they are `$...$`.
+
+  ```
+  package lit
+
+  import (
+  	"encoding/base64"
+  	"fmt"
+  	"mime"
+  	"os"
+  	"path/filepath"
+  	"regexp"
+  	"sort"
+  	"strings"
+  )
+
+  var (
+  	escText = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+  	escAttr = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#x27;")
+  )
+
+  func esc(s string) string { return escText.Replace(s) }
+
+  type htmlWeaver struct {
+  	d       *Doc
+  	mathjax string
+  }
+
+  func (w *htmlWeaver) citeHTML(m string) string {
+  	d := w.d
+  	var links []string
+  	for _, k := range citeKeys(m) {
+  		if _, ok := d.bibsrc[k]; ok {
+  			links = append(links, fmt.Sprintf(`<a href="#bib-%s">%d</a>`, k, d.citeNo[k]))
+  		} else {
+  			links = append(links, "?"+esc(k))
+  		}
+  	}
+  	return `<span class="cite">[` + strings.Join(links, ", ") + "]</span>"
+  }
+
+  func mathHTML(tex string, display bool) string {
+  	if display {
+  		return `<div class="display">\[` + esc(tex) + `\]</div>`
+  	}
+  	return `<span class="math">\(` + esc(tex) + `\)</span>`
+  }
+
+  func codeSpanHTML(k Code) string {
+  	if tex, ok := mathOf(k); ok {
+  		return mathHTML(tex, false)
+  	}
+  	return "<code>" + esc(k.Text()) + "</code>"
+  }
+
+  func subPlaceholders(s string, table []Code, f func(Code) string) string {
+  	return codePH.ReplaceAllStringFunc(s, func(m string) string {
+  		var i int
+  		fmt.Sscan(codePH.FindStringSubmatch(m)[1], &i)
+  		return f(table[i])
+  	})
+  }
+
+  func (w *htmlWeaver) fill(s string, table []Code) string {
+  	s = quotes.ReplaceAllString(esc(s), "“$1”")
+  	s = citeRun.ReplaceAllStringFunc(s, w.citeHTML)
+  	return subPlaceholders(s, table, codeSpanHTML)
+  }
+
+  func (w *htmlWeaver) inline(kids []Node) string {
+  	text, table := runText(kids)
+  	return w.fill(strings.TrimSpace(text), table)
+  }
+  ```
+}
+
+#html: prose and code{
+  Paragraphs, lists and display math are written as elements. Code is written as plain text, so
+  the page stays readable as source, and every reference line becomes a link to the chunk with its
+  number.
+
+  ```
+  func (w *htmlWeaver) prose(kids []Node) string {
+  	blocks, table := w.d.blocks(kids)
+  	var out []string
+  	for _, b := range blocks {
+  		switch b.kind {
+  		case "ul":
+  			s := "<ul>"
+  			for _, i := range b.items {
+  				s += "<li>" + w.fill(i, table) + "</li>"
+  			}
+  			out = append(out, s+"</ul>")
+  		case "math":
+  			out = append(out, mathHTML(b.text, true))
+  		default:
+  			out = append(out, "<p>"+w.fill(b.text, table)+"</p>")
+  		}
+  	}
+  	return strings.Join(out, "\n")
+  }
+
+  func (w *htmlWeaver) refLink(name, indent string) string {
+  	c, ok := w.d.defs[name]
+  	if !ok {
+  		return esc(indent) + `<span class="ref bad">` + "«" + esc(name) + "»</span>"
+  	}
+  	return fmt.Sprintf(`%s<a class="ref pg" href="#%s">«%s»<span class="rn">§%d</span></a>`, esc(indent), c[0].id, esc(name), c[0].num)
+  }
+
+  func (w *htmlWeaver) code(lines []string) string {
+  	var segs, buf []string
+  	for _, ln := range lines {
+  		if m := refRe.FindStringSubmatch(ln); m != nil {
+  			if len(buf) > 0 {
+  				segs = append(segs, esc(strings.Join(buf, "\n")))
+  				buf = nil
+  			}
+  			segs = append(segs, w.refLink(strings.TrimSpace(m[2]), m[1]))
+  		} else {
+  			buf = append(buf, Unescape(ln))
+  		}
+  	}
+  	if len(buf) > 0 {
+  		segs = append(segs, esc(strings.Join(buf, "\n")))
+  	}
+  	return `<pre class="code">` + strings.Join(segs, "\n") + "</pre>"
+  }
+  ```
+}
+
+#html: chunks{
+  Each chunk is a section with its number, its name, a line saying where it is used and which
+  files it ends up in, and its items in order. A file chunk has a badge.
+
+  ```
+  func label(name string) string {
+  	if fileRe.MatchString(name) {
+  		return esc(name)
+  	}
+  	return "«" + esc(name) + "»"
+  }
+
+  func (w *htmlWeaver) chunkLink(c *chunk) string {
+  	return fmt.Sprintf(`<a class="pg" href="#%s">%s §%d</a>`, c.id, label(c.name), c.num)
+  }
+
+  func (w *htmlWeaver) meta(c *chunk) string {
+  	d := w.d
+  	var bits []string
+  	if users := d.users(c); len(users) > 0 {
+  		var l []string
+  		for _, u := range users {
+  			l = append(l, w.chunkLink(u))
+  		}
+  		bits = append(bits, "used in "+strings.Join(l, ", "))
+  	}
+  	if !fileRe.MatchString(c.name) && len(d.partof[c.name]) > 0 {
+  		var l []string
+  		for _, f := range d.partof[c.name] {
+  			l = append(l, fmt.Sprintf(`<a href="#%s">%s</a>`, d.defs[f][0].id, esc(f)))
+  		}
+  		bits = append(bits, "part of "+strings.Join(l, ", "))
+  	}
+  	if len(bits) == 0 {
+  		return ""
+  	}
+  	return `<div class="meta">` + strings.Join(bits, " · ") + "</div>"
+  }
+
+  func (w *htmlWeaver) chunk(c *chunk, depth int) string {
+  	var title string
+  	if fileRe.MatchString(c.name) {
+  		title = `<span class="badge">file</span> <span class="fname">` + esc(c.name) + "</span>"
+  	} else {
+  		title = `<span class="cname">` + "«" + esc(c.name) + "»</span> <span class=\"eq\">≡</span>"
+  	}
+  	nested := ""
+  	if depth > 0 {
+  		nested = " nested"
+  	}
+  	h := []string{fmt.Sprintf(`<section class="chunk%s" id="%s">`, nested, c.id),
+  		fmt.Sprintf(`<div class="chunk-head"><a class="num" href="#%s">§%d</a> %s</div>`, c.id, c.num, title), w.meta(c)}
+  	for _, it := range c.items {
+  		switch it.kind {
+  		case "prose":
+  			h = append(h, w.prose(it.kids))
+  		case "code":
+  			h = append(h, w.code(it.lines))
+  		case "chunk":
+  			h = append(h, w.chunk(it.chunk, depth+1))
+  		case "head":
+  			h = append(h, w.heading(it))
+  		case "img":
+  			h = append(h, w.figure(it))
+  		case "hint":
+  			h = append(h, w.hint(it))
+  		}
+  	}
+  	h = append(h, "</section>")
+  	var out []string
+  	for _, x := range h {
+  		if x != "" {
+  			out = append(out, x)
+  		}
+  	}
+  	return strings.Join(out, "\n")
+  }
+  ```
+}
+
+#html: hints, headings, figures{
+  An open hint is shown as a note. A figure that is SVG goes into the page as it is, with an
+  accessible label; other images are embedded.
+
+  ```
+  func (w *htmlWeaver) hint(it *item) string {
+  	return `<p class="hint"><b>to be filled in by an agent:</b> ` + esc(it.text) + "</p>"
+  }
+
+  func (w *htmlWeaver) heading(it *item) string {
+  	return fmt.Sprintf(`<h%d id="%s">%s</h%d>`, it.level, w.d.headID[it], w.inline(it.kids), it.level)
+  }
+
+  var (
+  	svgProlog = regexp.MustCompile(`(?s)<\?xml.*?\?>|<!DOCTYPE.*?>`)
+  )
+
+  func mimeOf(path string) string {
+  	switch strings.ToLower(filepath.Ext(path)) {
+  	case ".png":
+  		return "image/png"
+  	case ".jpg", ".jpeg":
+  		return "image/jpeg"
+  	case ".gif":
+  		return "image/gif"
+  	case ".webp":
+  		return "image/webp"
+  	case ".svg":
+  		return "image/svg+xml"
+  	}
+  	if t := mime.TypeByExtension(filepath.Ext(path)); t != "" {
+  		return t
+  	}
+  	return "application/octet-stream"
+  }
+
+  func (w *htmlWeaver) figure(it *item) string {
+  	path, cap := imgParts(it.bag)
+  	f := w.d.image(path)
+  	if f == nil {
+  		return `<p class="bad">missing figure ` + esc(path) + "</p>"
+  	}
+  	alt := cap
+  	if alt == "" {
+  		alt = path
+  	}
+  	var body string
+  	if strings.ToLower(filepath.Ext(path)) == ".svg" {
+  		svg := f.val
+  		if f.kind == "file" {
+  			b, _ := os.ReadFile(f.val)
+  			svg = string(b)
+  		}
+  		svg = strings.TrimSpace(svgProlog.ReplaceAllString(svg, ""))
+  		body = strings.Replace(svg, "<svg", `<svg role="img" aria-label="`+escAttr.Replace(alt)+`"`, 1)
+  	} else {
+  		data := []byte(f.val)
+  		if f.kind == "file" {
+  			data, _ = os.ReadFile(f.val)
+  		}
+  		body = fmt.Sprintf(`<img alt="%s" src="data:%s;base64,%s">`, escAttr.Replace(alt), mimeOf(path), base64.StdEncoding.EncodeToString(data))
+  	}
+  	s := `<figure class="fig">` + body
+  	if cap != "" {
+  		s += "<figcaption>" + esc(cap) + "</figcaption>"
+  	}
+  	return s + "</figure>"
+  }
+  ```
+}
+
+#html: bibliography and index{
+  The bibliography lists the cited works in order of first citation, each with a line saying where
+  it is cited; the index lists every chunk, where it is defined and where it is used.
+
+  ```
+  func (w *htmlWeaver) bibliography() string {
+  	d := w.d
+  	var rows []string
+  	for _, key := range d.citeOrder {
+  		src, ok := d.bibsrc[key]
+  		if !ok {
+  			continue
+  		}
+  		p := bibParts(parseBibtex(src))
+  		var parts []string
+  		if p.authors != "" {
+  			parts = append(parts, stop(esc(p.authors)))
+  		} else {
+  			parts = append(parts, "")
+  		}
+  		parts = append(parts, "“"+stop(esc(p.title))+"”")
+  		var tail []string
+  		if strings.TrimSpace(p.venue) != "" {
+  			tail = append(tail, "<i>"+esc(p.venue)+"</i>")
+  		}
+  		for _, x := range []string{esc(p.vol), esc(p.pages), esc(p.year)} {
+  			if x != "" {
+  				tail = append(tail, x)
+  			}
+  		}
+  		if len(tail) > 0 {
+  			parts = append(parts, strings.Join(tail, ", ")+".")
+  		} else {
+  			parts = append(parts, "")
+  		}
+  		if p.url != "" {
+  			parts = append(parts, fmt.Sprintf(`<a href="%s">%s</a>`, p.url, esc(p.url)))
+  		} else if p.hp != "" {
+  			parts = append(parts, stop(esc(p.hp)))
+  		}
+  		if p.arxiv != "" {
+  			parts = append(parts, fmt.Sprintf(`<a href="https://arxiv.org/abs/%s">arXiv:%s</a>`, p.arxiv, p.arxiv))
+  		}
+  		var back []string
+  		for _, r := range d.citedIn[key] {
+  			if strings.HasPrefix(r.id, "c-") {
+  				back = append(back, fmt.Sprintf(`<a class="pg" href="#%s">%s</a>`, r.id, label(r.name)))
+  			} else {
+  				back = append(back, fmt.Sprintf(`<a href="#%s">%s</a>`, r.id, esc(r.name)))
+  			}
+  		}
+  		var nonEmpty []string
+  		for _, x := range parts {
+  			if x != "" {
+  				nonEmpty = append(nonEmpty, x)
+  			}
+  		}
+  		rows = append(rows, fmt.Sprintf(`<li id="bib-%s" value="%d">%s<div class="meta">cited in %s</div></li>`,
+  			key, d.citeNo[key], strings.Join(nonEmpty, " "), strings.Join(back, ", ")))
+  	}
+  	return `<section class="backmatter" id="bibliography"><h2>Bibliography</h2>` + "\n" + `<ol class="bib">` + strings.Join(rows, "\n") + "</ol></section>"
+  }
+
+  func sortedNames(d *Doc) []string {
+  	names := append([]string(nil), d.defOrder...)
+  	sort.SliceStable(names, func(i, j int) bool { return strings.ToLower(names[i]) < strings.ToLower(names[j]) })
+  	return names
+  }
+
+  func (w *htmlWeaver) index() string {
+  	d := w.d
+  	var rows []string
+  	for _, name := range sortedNames(d) {
+  		c := d.defs[name][0]
+  		var us []string
+  		for _, u := range d.users(c) {
+  			us = append(us, fmt.Sprintf(`<a class="pg" href="#%s">§%d</a>`, u.id, u.num))
+  		}
+  		rows = append(rows, fmt.Sprintf(`<tr><td><a class="pg" href="#%s">%s</a></td><td class="n">§%d</td><td>%s</td></tr>`,
+  			c.id, label(name), c.num, strings.Join(us, ", ")))
+  	}
+  	return `<section class="backmatter" id="index"><h2>Chunk index</h2>` + "\n" +
+  		`<table class="index"><thead><tr><th>chunk</th><th>defined</th><th>used in</th></tr></thead><tbody>` +
+  		strings.Join(rows, "\n") + "</tbody></table></section>"
+  }
+  ```
+}
+
+#html: the page{
+  The page has a table of contents in the first screen and in a sidebar on a wide one, the list of
+  files, the chunks in order, the index and the bibliography, and the MathJax configuration. The
+  stylesheet is in the next chunk.
+
+  ```
+  func (w *htmlWeaver) render() string {
+  	d := w.d
+  	var body []string
+  	firstH1 := true
+  	for _, it := range d.root.items {
+  		switch it.kind {
+  		case "head":
+  			if it.level == 1 && firstH1 {
+  				firstH1 = false
+  				body = append(body, fmt.Sprintf(`<h1 class="title" id="%s">%s</h1><p class="sub">Woven from <code>%s</code> — code chunks are numbered and cross-linked</p>@@CONTENTS@@`,
+  					d.headID[it], w.inline(it.kids), esc(d.srcName)))
+  			} else {
+  				body = append(body, w.heading(it))
+  			}
+  		case "prose":
+  			body = append(body, w.prose(it.kids))
+  		case "code":
+  			body = append(body, w.code(it.lines))
+  		case "chunk":
+  			body = append(body, w.chunk(it.chunk, 0))
+  		case "img":
+  			body = append(body, w.figure(it))
+  		case "hint":
+  			body = append(body, w.hint(it))
+  		}
+  	}
+  	body = append(body, w.index(), w.bibliography())
+  	var toc []heading
+  	for _, h := range d.heads {
+  		if !(h.level == 1 && h.title == d.title) {
+  			toc = append(toc, h)
+  		}
+  	}
+  	toc = append(toc, heading{2, "Chunk index", "index"}, heading{2, "Bibliography", "bibliography"})
+  	var tocHTML strings.Builder
+  	for _, h := range toc {
+  		fmt.Fprintf(&tocHTML, `<li class="l%d"><a class="pg" href="#%s">%s</a></li>`, h.level, h.id, esc(h.title))
+  	}
+  	var files strings.Builder
+  	for _, n := range d.defOrder {
+  		if fileRe.MatchString(n) {
+  			fmt.Fprintf(&files, `<li><a class="pg" href="#%s">%s</a></li>`, d.defs[n][0].id, esc(n))
+  		}
+  	}
+  	contents := fmt.Sprintf(`<nav id="contents"><h2>Contents</h2><ul>%s</ul><h3>Files</h3><ul class="files">%s</ul></nav>`, tocHTML.String(), files.String())
+  	side := fmt.Sprintf(`<nav id="side"><div class="st">%s</div><ul>%s</ul><div class="st">Files</div><ul class="files">%s</ul></nav>`,
+  		esc(d.title), tocHTML.String(), files.String())
+  	css := weaveCSS
+  	mj := `<script>window.MathJax={tex:{inlineMath:[["\\(","\\)"]],displayMath:[["\\[","\\]"]]},` +
+  		`options:{skipHtmlTags:["script","noscript","style","textarea","pre","code"]}};</script>` +
+  		fmt.Sprintf(`<script async src="%s"></script>`, escAttr.Replace(w.mathjax))
+  	page := fmt.Sprintf(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s</title>%s<style>%s</style></head><body>%s<main>`,
+  		esc(d.title), mj, css, side)
+  	return page + strings.Replace(strings.Join(body, "\n"), "@@CONTENTS@@", contents, -1) + "</main></body></html>"
+  }
+  ```
+}
+
+#internal/lit/weavehtml.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<html: escaping and inline>>>
+
+  <<<html: prose and code>>>
+
+  <<<html: chunks>>>
+
+  <<<html: hints, headings, figures>>>
+
+  <<<html: bibliography and index>>>
+
+  <<<html: the page>>>
+  ```
+}
+
+#tex: escaping{
+  The LaTeX backend escapes the special characters and allows line breaks after underscores,
+  slashes and dots in names. Code goes into a verbatim environment where only the backslash and
+  the braces are special, and they are replaced in a single pass, so the replacement text is not
+  itself replaced.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"os"
+  	"os/exec"
+  	"path/filepath"
+  	"regexp"
+  	"strings"
+  )
+
+  var texSpecial = map[rune]string{'\\': `\textbackslash{}`, '{': `\{`, '}': `\}`, '$': `\$`, '&': `\&`, '#': `\#`, '_': `\_`,
+  	'%': `\%`, '~': `\textasciitilde{}`, '^': `\textasciicircum{}`, '<': `\textless{}`, '>': `\textgreater{}`, '|': `\textbar{}`}
+
+  func texEsc(s string) string {
+  	var sb strings.Builder
+  	for _, r := range s {
+  		if t, ok := texSpecial[r]; ok {
+  			sb.WriteString(t)
+  		} else {
+  			sb.WriteRune(r)
+  		}
+  	}
+  	return sb.String()
+  }
+
+  var breakRe = regexp.MustCompile(`(\\_|/|\.)`)
+
+  // texCodeEsc escapes for \texttt and allows line breaks after _ / .
+  func texCodeEsc(s string) string {
+  	return breakRe.ReplaceAllStringFunc(texEsc(s), func(m string) string { return m + `\allowbreak{}` })
+  }
+
+  func verbEsc(s string) string {
+  	return strings.NewReplacer(`\`, `\textbackslash{}`, "{", `\{`, "}", `\}`).Replace(s)
+  }
+
+  type texWeaver struct {
+  	d        *Doc
+  	outdir   string
+  	lab      map[string]string
+  	minLevel int
+  	warn     func(string)
+  }
+  ```
+}
+
+#tex: labels{
+  Chunk labels are hyphen-free, because a hyphen in a label is a trap inside verbatim text, and
+  the shallowest heading in the document is the section level.
+
+  ```
+  func newTexWeaver(d *Doc, outdir string, warn func(string)) *texWeaver {
+  	w := &texWeaver{d: d, outdir: outdir, lab: map[string]string{}, warn: warn}
+  	for _, cs := range d.defs {
+  		for _, c := range cs {
+  			w.lab[c.id] = fmt.Sprintf("chunk%d", c.num)
+  		}
+  	}
+  	w.minLevel = 0
+  	for _, h := range d.heads {
+  		if !(h.level == 1 && h.title == d.title) && (w.minLevel == 0 || h.level < w.minLevel) {
+  			w.minLevel = h.level
+  		}
+  	}
+  	if w.minLevel == 0 {
+  		w.minLevel = 1
+  	}
+  	return w
+  }
+
+  func (w *texWeaver) label(name string) string {
+  	if fileRe.MatchString(name) {
+  		return `\texttt{` + texCodeEsc(name) + `}`
+  	}
+  	return `\chunkname{` + texCodeEsc(name) + `}`
+  }
+
+  func (w *texWeaver) citeTex(m string) string {
+  	var known, out []string
+  	keys := citeKeys(m)
+  	for _, k := range keys {
+  		if _, ok := w.d.bibsrc[k]; ok {
+  			known = append(known, k)
+  		}
+  	}
+  	s := ""
+  	if len(known) > 0 {
+  		s = `\cite{` + strings.Join(known, ",") + `}`
+  	}
+  	for _, k := range keys {
+  		if _, ok := w.d.bibsrc[k]; !ok {
+  			out = append(out, `\textbf{?`+texEsc(k)+`}`)
+  		}
+  	}
+  	return s + strings.Join(out, "")
+  }
+
+  func codeSpanTex(k Code) string {
+  	if tex, ok := mathOf(k); ok {
+  		return `\(` + tex + `\)`
+  	}
+  	return `\texttt{` + texCodeEsc(k.Text()) + `}`
+  }
+
+  func (w *texWeaver) fill(s string, table []Code) string {
+  	s = quotes.ReplaceAllString(texEsc(s), "``$1''")
+  	s = citeRun.ReplaceAllStringFunc(s, w.citeTex)
+  	return subPlaceholders(s, table, codeSpanTex)
+  }
+
+  func (w *texWeaver) inline(kids []Node) string {
+  	text, table := runText(kids)
+  	return w.fill(strings.TrimSpace(text), table)
+  }
+  ```
+}
+
+#tex: prose and code{
+  Prose becomes paragraphs, itemize and display math, with citations as `\cite`. A reference line
+  in code becomes a link to the chunk's number, with the chunk's name defined once in the
+  preamble.
+
+  ```
+  func (w *texWeaver) prose(kids []Node) string {
+  	blocks, table := w.d.blocks(kids)
+  	var out []string
+  	for _, b := range blocks {
+  		switch b.kind {
+  		case "ul":
+  			var items []string
+  			for _, i := range b.items {
+  				items = append(items, `\item `+w.fill(i, table))
+  			}
+  			out = append(out, "\\begin{itemize}\n"+strings.Join(items, "\n")+"\n\\end{itemize}")
+  		case "math":
+  			out = append(out, "\\[\n"+b.text+"\n\\]")
+  		default:
+  			out = append(out, w.fill(b.text, table))
+  		}
+  	}
+  	return strings.Join(out, "\n\n")
+  }
+
+  func (w *texWeaver) code(lines []string) string {
+  	if len(lines) == 0 {
+  		return ""
+  	}
+  	d := w.d
+  	var segs, buf []string
+  	for _, ln := range lines {
+  		if m := refRe.FindStringSubmatch(ln); m != nil {
+  			if len(buf) > 0 {
+  				segs = append(segs, verbEsc(strings.Join(buf, "\n")))
+  				buf = nil
+  			}
+  			name := strings.TrimSpace(m[2])
+  			if cs, ok := d.defs[name]; ok {
+  				segs = append(segs, m[1]+`\chunkrefv{`+w.lab[cs[0].id]+`}`)
+  			} else {
+  				segs = append(segs, m[1]+`\textbf{??}`)
+  			}
+  		} else {
+  			buf = append(buf, Unescape(ln))
+  		}
+  	}
+  	if len(buf) > 0 {
+  		segs = append(segs, verbEsc(strings.Join(buf, "\n")))
+  	}
+  	return "\\begin{Verbatim}\n" + strings.Join(segs, "\n") + "\n\\end{Verbatim}"
+  }
+  ```
+}
+
+#tex: chunks and headings{
+  A chunk is a heading line with its number, a meta line of uses, and its items; a nested chunk is
+  indented in a list environment. Headings are real sections, so the table of contents works.
+
+  ```
+  func (w *texWeaver) link(c *chunk) string {
+  	return `\chunklink{` + w.lab[c.id] + `}{` + w.label(c.name) + `}`
+  }
+
+  func (w *texWeaver) meta(c *chunk) string {
+  	d := w.d
+  	var bits []string
+  	if users := d.users(c); len(users) > 0 {
+  		var l []string
+  		for _, u := range users {
+  			l = append(l, w.link(u))
+  		}
+  		bits = append(bits, "used in "+strings.Join(l, ", "))
+  	}
+  	if !fileRe.MatchString(c.name) && len(d.partof[c.name]) > 0 {
+  		var l []string
+  		for _, f := range d.partof[c.name] {
+  			l = append(l, `\hyperref[`+w.lab[d.defs[f][0].id]+`]{\texttt{`+texCodeEsc(f)+`}}`)
+  		}
+  		bits = append(bits, "part of "+strings.Join(l, ", "))
+  	}
+  	if len(bits) == 0 {
+  		return ""
+  	}
+  	return `\chunkmeta{` + strings.Join(bits, ` \textperiodcentered{} `) + `}`
+  }
+
+  func (w *texWeaver) chunk(c *chunk, depth int) string {
+  	var title string
+  	if fileRe.MatchString(c.name) {
+  		title = `\filebadge\ \textbf{\texttt{` + texCodeEsc(c.name) + `}}`
+  	} else {
+  		title = `\textbf{\ensuremath{\langle}\texttt{` + texCodeEsc(c.name) + `}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}`
+  	}
+  	var parts []string
+  	if depth > 0 {
+  		parts = append(parts, `\begin{nested}`)
+  	}
+  	parts = append(parts, `\chunkhead{`+w.lab[c.id]+`}{`+title+`}`, w.meta(c))
+  	for _, it := range c.items {
+  		switch it.kind {
+  		case "prose":
+  			parts = append(parts, w.prose(it.kids))
+  		case "code":
+  			parts = append(parts, w.code(it.lines))
+  		case "chunk":
+  			parts = append(parts, w.chunk(it.chunk, depth+1))
+  		case "head":
+  			parts = append(parts, w.heading(it))
+  		case "img":
+  			parts = append(parts, w.figure(it))
+  		case "hint":
+  			parts = append(parts, w.hint(it))
+  		}
+  	}
+  	if depth > 0 {
+  		parts = append(parts, `\end{nested}`)
+  	}
+  	return joinNonEmpty(parts, "\n")
+  }
+
+  func (w *texWeaver) hint(it *item) string {
+  	return `{\small\itshape to be filled in by an agent: ` + texEsc(it.text) + `\par}`
+  }
+
+  func joinNonEmpty(parts []string, sep string) string {
+  	var out []string
+  	for _, p := range parts {
+  		if p != "" {
+  			out = append(out, p)
+  		}
+  	}
+  	return strings.Join(out, sep)
+  }
+
+  func (w *texWeaver) heading(it *item) string {
+  	d := w.d
+  	hid := d.headID[it]
+  	depth := min(it.level-w.minLevel, 3)
+  	cmds := []string{"section", "subsection", "subsubsection", "paragraph"}
+  	cmd := cmds[max(depth, 0)]
+  	return `\hypertarget{` + hid + `}{}\phantomsection\addcontentsline{toc}{` + cmd + `}{` + texEsc(d.headTitle[hid]) + `}` +
+  		"\n" + `\` + cmd + `*{` + w.inline(it.kids) + `}`
+  }
+  ```
+}
+
+#tex: figures{
+  A figure is written beside the `.tex` as a PDF: SVG is converted with `rsvg-convert` or
+  `inkscape` if one is installed, raster images are copied. Without a converter the figure is left
+  out, with a note, and the document still compiles.
+
+  ```
+  // figure writes a figure environment; the picture is written beside the .tex as a PDF (or copied, if raster).
+  func (w *texWeaver) figure(it *item) string {
+  	path, cap := imgParts(it.bag)
+  	f := w.d.image(path)
+  	ext := filepath.Ext(path)
+  	stem := strings.TrimSuffix(filepath.Base(path), ext)
+  	target := ""
+  	if f != nil {
+  		os.MkdirAll(w.outdir, 0o755)
+  		if strings.ToLower(ext) == ".svg" {
+  			tool, _ := exec.LookPath("rsvg-convert")
+  			if tool == "" {
+  				tool, _ = exec.LookPath("inkscape")
+  			}
+  			if tool != "" {
+  				tmp, err := os.MkdirTemp("", "lit-fig")
+  				if err == nil {
+  					defer os.RemoveAll(tmp)
+  					src := filepath.Join(tmp, stem+".svg")
+  					text := f.val
+  					if f.kind == "file" {
+  						b, _ := os.ReadFile(f.val)
+  						text = string(b)
+  					}
+  					os.WriteFile(src, []byte(text), 0o644)
+  					out := filepath.Join(w.outdir, stem+".pdf")
+  					var cmd *exec.Cmd
+  					if strings.HasSuffix(tool, "rsvg-convert") {
+  						cmd = exec.Command(tool, "-f", "pdf", "-o", out, src)
+  					} else {
+  						cmd = exec.Command(tool, src, "--export-type=pdf", "--export-filename="+out)
+  					}
+  					if cmd.Run() == nil {
+  						target = stem + ".pdf"
+  					}
+  				}
+  			}
+  			if target == "" {
+  				w.warn(fmt.Sprintf("note: %s: no rsvg-convert or inkscape, so the figure is left out of the LaTeX\n", path))
+  			}
+  		} else {
+  			target = filepath.Base(path)
+  			data := []byte(f.val)
+  			if f.kind == "file" {
+  				data, _ = os.ReadFile(f.val)
+  			}
+  			os.WriteFile(filepath.Join(w.outdir, target), data, 0o644)
+  		}
+  	}
+  	pic := `\fbox{\texttt{` + texCodeEsc(path) + `} (figure not available)}`
+  	if target != "" {
+  		pic = `\includegraphics[width=\linewidth]{` + target + `}`
+  	}
+  	s := "\\begin{figure}[htbp]\n\\centering\n" + pic + "\n"
+  	if cap != "" {
+  		s += `{\small\itshape ` + texEsc(cap) + `\par}` + "\n"
+  	}
+  	return s + "\\end{figure}"
+  }
+  ```
+}
+
+#tex: bibliography and index{
+  The bibliography is a `thebibliography` with the same entries and back-references as the page,
+  and the index is a longtable.
+
+  ```
+  func (w *texWeaver) bibliography() string {
+  	d := w.d
+  	var items []string
+  	for _, key := range d.citeOrder {
+  		src, ok := d.bibsrc[key]
+  		if !ok {
+  			continue
+  		}
+  		p := bibParts(parseBibtex(src))
+  		var parts []string
+  		if p.authors != "" {
+  			parts = append(parts, stop(texEsc(p.authors)))
+  		}
+  		parts = append(parts, "``"+stop(texEsc(p.title))+"''")
+  		var tail []string
+  		if strings.TrimSpace(p.venue) != "" {
+  			tail = append(tail, `\emph{`+texEsc(p.venue)+`}`)
+  		}
+  		for _, x := range []string{texEsc(p.vol), texEsc(p.pages), texEsc(p.year)} {
+  			if x != "" {
+  				tail = append(tail, x)
+  			}
+  		}
+  		if len(tail) > 0 {
+  			parts = append(parts, strings.Join(tail, ", ")+".")
+  		}
+  		if p.url != "" {
+  			parts = append(parts, `\url{`+p.url+`}`)
+  		} else if p.hp != "" {
+  			parts = append(parts, stop(texEsc(p.hp)))
+  		}
+  		if p.arxiv != "" {
+  			parts = append(parts, `\href{https://arxiv.org/abs/`+p.arxiv+`}{arXiv:`+p.arxiv+`}`)
+  		}
+  		var back []string
+  		for _, r := range d.citedIn[key] {
+  			back = append(back, w.linkBack(r.id, r.name))
+  		}
+  		items = append(items, `\bibitem{`+key+`} `+strings.Join(parts, " ")+"\n"+
+  			`\par{\footnotesize\color{tuftegray}cited in `+strings.Join(back, ", ")+`}`)
+  	}
+  	return "\\clearpage\n\\phantomsection\\addcontentsline{toc}{section}{Bibliography}\n" +
+  		"\\renewcommand{\\refname}{Bibliography}\n\\begin{thebibliography}{99}\n" + strings.Join(items, "\n") + "\n\\end{thebibliography}"
+  }
+
+  func (w *texWeaver) linkBack(id, name string) string {
+  	if strings.HasPrefix(id, "c-") {
+  		return `\hyperref[` + w.lab[id] + `]{` + w.label(name) + `}`
+  	}
+  	return `\hyperlink{` + id + `}{` + texEsc(name) + `}`
+  }
+
+  func (w *texWeaver) index() string {
+  	d := w.d
+  	var rows []string
+  	for _, name := range sortedNames(d) {
+  		c := d.defs[name][0]
+  		var us []string
+  		for _, u := range d.users(c) {
+  			us = append(us, `\hyperref[`+w.lab[u.id]+`]{\ref*{`+w.lab[u.id]+`}}`)
+  		}
+  		rows = append(rows, `\hyperref[`+w.lab[c.id]+`]{`+w.label(name)+`} & \ref*{`+w.lab[c.id]+`} & `+strings.Join(us, ", ")+` \\`)
+  	}
+  	return "\\clearpage\n\\hypertarget{index}{}\\phantomsection\\addcontentsline{toc}{section}{Chunk index}\n" +
+  		"\\section*{Chunk index}\n\\begin{longtable}{@{}p{0.40\\textwidth}rp{0.42\\textwidth}@{}}\n" +
+  		"\\textbf{chunk} & \\textbf{defined} & \\textbf{used in} \\\\\\hline\n\\endhead\n" + strings.Join(rows, "\n") +
+  		"\n\\end{longtable}"
+  }
+  ```
+}
+
+#tex: the document{
+  The preamble is a constant with places for the title, the source name and the chunk names. The
+  first level-one heading is the title and not a section.
+
+  ```
+  func (w *texWeaver) render() string {
+  	d := w.d
+  	var names []string
+  	for _, n := range d.defOrder {
+  		names = append(names, `\expandafter\gdef\csname cn@`+w.lab[d.defs[n][0].id]+`\endcsname{`+texCodeEsc(n)+`}`)
+  	}
+  	r := strings.NewReplacer("@@STYLE@@", "", "@@TITLE@@", texEsc(d.title), "@@PDFTITLE@@", texEsc(d.title),
+  		"@@SOURCE@@", texCodeEsc(d.srcName), "@@NAMES@@", strings.Join(names, "\n"))
+  	head := r.Replace(texPreamble)
+  	var body []string
+  	firstH1 := true
+  	for _, it := range d.root.items {
+  		switch it.kind {
+  		case "head":
+  			if it.level == 1 && firstH1 {
+  				firstH1 = false
+  			} else {
+  				body = append(body, w.heading(it))
+  			}
+  		case "prose":
+  			body = append(body, w.prose(it.kids))
+  		case "code":
+  			body = append(body, w.code(it.lines))
+  		case "chunk":
+  			body = append(body, w.chunk(it.chunk, 0))
+  		case "img":
+  			body = append(body, w.figure(it))
+  		case "hint":
+  			body = append(body, w.hint(it))
+  		}
+  	}
+  	body = append(body, w.index(), w.bibliography(), `\end{document}`)
+  	return head + joinNonEmpty(body, "\n\n") + "\n"
+  }
+  ```
+}
+
+#internal/lit/weavetex.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<tex: escaping>>>
+
+  <<<tex: labels>>>
+
+  <<<tex: prose and code>>>
+
+  <<<tex: chunks and headings>>>
+
+  <<<tex: figures>>>
+
+  <<<tex: bibliography and index>>>
+
+  <<<tex: the document>>>
+  ```
+}
+
+#internal/lit/weave.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<weave: the command>>>
+  ```
+}

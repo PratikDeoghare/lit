@@ -1,0 +1,33 @@
+#h1{Where literate programming came from, and where this is going}
+
+Literate programming began as a way of writing a program to be read. In Knuth's account
+#cite{knuth1984lp} a program is a work of exposition: a web of parts, presented in the order
+that is best for a person, from which the order the machine needs is derived. As far as the
+author of this document knows, such programs were first worked out on paper, as a text for
+people, and only then entered into a computer, and Knuth's own programs are the model of the
+kind. The paper was the point; the computer was how the program got to run.
+
+The tools that followed were, for the most part, made by and for people who write papers and
+books. They put the document first and treat a program as an illustration in it, and they are a
+poor fit for a team that maintains software which already exists, in a language and a repository
+it did not choose. Ramsey's simplification #cite{ramsey1994lp} removed the dependence on a
+language, and that is the line this toolkit follows. What it adds is for the working programmer:
+tools for the day somebody edits the generated code, for programs that are being converted and
+not written, and for gaps that an assistant can fill.
+
+Notebooks are what most people meet today, and a notebook is not a literate program in the sense
+above. Its cells run in the order in which they are arranged, so the order of the explanation
+and the order of execution are one and the same, which is the constraint that literate
+programming exists to remove. There are no named parts that are defined in one place and used in
+another, nothing is tangled into the files of a program, and hidden state lets a notebook read
+well and still fail when it is run from the top. Notebooks are good for exploring data. They are
+a different thing, and this toolkit does not try to be one.
+
+Two things follow for the shape of this document. The paper is a first-class output: weave
+writes LaTeX, so the program can be printed and read away from a screen, which is how a book
+should be read, and the document is written to be read from the first page. And the order of the
+chapters is the order of importance. The ideas come first, and then the tools, with the
+gap-filling assistant near the end of the story. What a reader could write for themselves, the
+plain details of the program, is at the bottom, in the appendix: the entry point, the argument
+parser, a text comparison, the installer, the license of the parser, the files of the skill, the
+landing page and the small helper functions that are named by their use.

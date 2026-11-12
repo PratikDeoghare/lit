@@ -1,0 +1,359 @@
+#h1{Appendix: One command: install and the command line}
+
+The binary installs the skill that teaches an assistant the notation, removes it and itself, and
+dispatches the commands.
+
+#install: the skill in the binary{
+  The skill that teaches an assistant the notation is part of the program, embedded in the binary,
+  so installing it needs nothing but the program itself. It is installed into a directory named
+  after it, under the skills directory of the user, or of a project.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"io/fs"
+  	"os"
+  	"path/filepath"
+  	"runtime"
+  	"strings"
+
+  	"github.com/pratikdeoghare/brashtag-literate/internal/skill"
+  )
+
+  // Version is set at build time with -ldflags "-X .../internal/lit.Version=1.2.3".
+  var Version = "dev"
+
+  const (
+  	skillName = "brashtag-literate"
+  	marker    = ".installed-by-lit"
+  )
+
+  func skillsRoot(dest string) string {
+  	if dest == "" {
+  		home, _ := os.UserHomeDir()
+  		dest = filepath.Join(home, ".claude", "skills")
+  	}
+  	if strings.HasPrefix(dest, "~") {
+  		home, _ := os.UserHomeDir()
+  		dest = filepath.Join(home, dest[1:])
+  	}
+  	abs, err := filepath.Abs(dest)
+  	if err != nil {
+  		return dest
+  	}
+  	return abs
+  }
+
+  func skillTarget(dest string) string { return filepath.Join(skillsRoot(dest), skillName) }
+  ```
+}
+
+#install: the marker{
+  A small file marks a directory that `lit` created. An existing directory is replaced only if it
+  carries the marker, which makes upgrading safe and makes it impossible to overwrite a skill
+  someone else wrote by hand unless they say so with `--force`.
+
+  ```
+  func installedByUs(path string) bool {
+  	fi, err := os.Stat(filepath.Join(path, marker))
+  	return err == nil && fi.Mode().IsRegular()
+  }
+
+  func lexists(path string) bool { _, err := os.Lstat(path); return err == nil }
+
+  func removeAny(path string) error {
+  	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+  		return os.Remove(path)
+  	}
+  	return os.RemoveAll(path)
+  }
+  ```
+}
+
+#install: installing{
+  Installing walks the embedded files, writes them, and then the marker with the version.
+
+  ```
+  // InstallSkill copies the embedded skill to <dest>/brashtag-literate.
+  func InstallSkill(dest string, force bool, io IO) (string, error) {
+  	where := skillTarget(dest)
+  	if lexists(where) {
+  		if !installedByUs(where) && !force {
+  			return "", fmt.Errorf("%s exists and was not put there by lit; pass --force to replace it", where)
+  		}
+  		if err := removeAny(where); err != nil {
+  			return "", err
+  		}
+  	}
+  	err := fs.WalkDir(skill.FS, skill.Root, func(p string, d fs.DirEntry, err error) error {
+  		if err != nil {
+  			return err
+  		}
+  		rel := strings.TrimPrefix(strings.TrimPrefix(p, skill.Root), "/")
+  		out := filepath.Join(where, filepath.FromSlash(rel))
+  		if d.IsDir() {
+  			return os.MkdirAll(out, 0o755)
+  		}
+  		b, err := skill.FS.ReadFile(p)
+  		if err != nil {
+  			return err
+  		}
+  		return os.WriteFile(out, b, 0o644)
+  	})
+  	if err != nil {
+  		return "", err
+  	}
+  	if err := os.WriteFile(filepath.Join(where, marker), []byte(Version+"\n"), 0o644); err != nil {
+  		return "", err
+  	}
+  	fmt.Fprintf(io.Out, "installed the skill %s %s in %s\n", skillName, Version, where)
+  	return where, nil
+  }
+  ```
+}
+
+#install: removing the skill{
+  The same marker decides removal: a directory `lit` did not create is left alone.
+
+  ```
+  func UninstallSkill(dest string, force bool, io IO) (bool, error) {
+  	where := skillTarget(dest)
+  	if !lexists(where) {
+  		fmt.Fprintf(io.Out, "no skill at %s; nothing to remove\n", where)
+  		return false, nil
+  	}
+  	if !installedByUs(where) && !force {
+  		return false, fmt.Errorf("%s was not put there by lit, so it is left alone; pass --force to remove it", where)
+  	}
+  	if err := removeAny(where); err != nil {
+  		return false, err
+  	}
+  	fmt.Fprintf(io.Out, "removed %s\n", where)
+  	return true, nil
+  }
+  ```
+}
+
+#install: removing the program{
+  Removing the program is a second step, asked about unless `--yes` is given, and refused outright
+  when there is no terminal to ask on. A running program can delete itself on Unix; on Windows it
+  says which file to delete.
+
+  ```
+  func exePath() string {
+  	p, err := os.Executable()
+  	if err != nil {
+  		return ""
+  	}
+  	if r, err := filepath.EvalSymlinks(p); err == nil {
+  		p = r
+  	}
+  	return p
+  }
+
+  var installSpec = Spec{
+  	Opts:  map[string]bool{"dest": true, "force": false, "yes": false, "skill-only": false},
+  	Short: map[string]string{"y": "yes"},
+  }
+
+  func installCmd(which string) func([]string, IO) int {
+  	return func(argv []string, io IO) int {
+  		a, err := ParseArgs(argv, installSpec)
+  		if err != nil || len(a.Pos) != 0 {
+  			fmt.Fprintf(io.Err, "usage: lit %s [--dest DIR] [--force]\n", which)
+  			return 2
+  		}
+  		fail := func(err error) int { fmt.Fprintln(io.Err, "lit: "+err.Error()); return 2 }
+  		switch which {
+  		case "install-skill":
+  			if _, err := InstallSkill(a.Get("dest", ""), a.Has("force"), io); err != nil {
+  				return fail(err)
+  			}
+  		case "uninstall-skill":
+  			if _, err := UninstallSkill(a.Get("dest", ""), a.Has("force"), io); err != nil {
+  				return fail(err)
+  			}
+  		case "uninstall":
+  			if _, err := UninstallSkill(a.Get("dest", ""), false, io); err != nil {
+  				return fail(err)
+  			}
+  			if a.Has("skill-only") {
+  				return 0
+  			}
+  			exe := exePath()
+  			if !a.Has("yes") {
+  				if !io.IsTTY {
+  					return fail(fmt.Errorf("removing the program needs --yes when there is no terminal to ask on"))
+  				}
+  				fmt.Fprintf(io.Out, "remove the program %s as well? [y/N] ", exe)
+  				var ans string
+  				fmt.Fscanln(io.In, &ans)
+  				if strings.ToLower(strings.TrimSpace(ans)) != "y" {
+  					fmt.Fprintln(io.Out, "program kept; the skill is removed")
+  					return 0
+  				}
+  			}
+  			if runtime.GOOS == "windows" {
+  				fmt.Fprintf(io.Out, "delete %s yourself: a running program cannot remove itself on Windows\n", exe)
+  				return 0
+  			}
+  			if err := os.Remove(exe); err != nil {
+  				return fail(err)
+  			}
+  			fmt.Fprintf(io.Out, "removed %s\n", exe)
+  		}
+  		return 0
+  	}
+  }
+  ```
+}
+
+#install: saying what is installed{
+  The where command exists for the first thing anyone asks when something misbehaves: which
+  program and which skill is in use.
+
+  ```
+  // Where says what is installed and where.
+  func Where(argv []string, io IO) int {
+  	a, _ := ParseArgs(argv, installSpec)
+  	skillDir := skillTarget(a.Get("dest", ""))
+  	state := "not installed"
+  	switch {
+  	case installedByUs(skillDir):
+  		state = "installed"
+  	case lexists(skillDir):
+  		state = "present, but not installed by lit"
+  	}
+  	fmt.Fprintf(io.Out, "brashtag-literate %s\n  program   %s\n  skill     %s (%s)\n", Version, exePath(), skillDir, state)
+  	return 0
+  }
+  ```
+}
+
+#internal/lit/install.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<install: the skill in the binary>>>
+
+  <<<install: the marker>>>
+
+  <<<install: installing>>>
+
+  <<<install: removing the skill>>>
+
+  <<<install: removing the program>>>
+
+  <<<install: saying what is installed>>>
+  ```
+}
+
+#cli: the commands{
+  The table of commands is the whole of the command line: a name and a function that takes the
+  arguments and the streams and returns an exit status. Terminal detection is by the mode of the
+  file, which needs nothing outside the standard library.
+
+  ```
+  package lit
+
+  import (
+  	"fmt"
+  	"os"
+  )
+
+  // IsTerminal reports whether f is an interactive terminal.
+  func IsTerminal(f *os.File) bool {
+  	st, err := f.Stat()
+  	return err == nil && st.Mode()&os.ModeCharDevice != 0
+  }
+
+  type command struct {
+  	name string
+  	run  func(args []string, io IO) int
+  }
+
+  var commands = []command{
+  	{"tangle", Tangle},
+  	{"absorb", Absorb},
+  	{"addr", Addr},
+  	{"sync", Sync},
+  	{"watch", Watch},
+  	{"weave", Weave},
+  	{"lint", Lint},
+  	{"fill", Fill},
+  	{"review", Review},
+  	{"where", Where},
+  	{"install-skill", installCmd("install-skill")},
+  	{"uninstall-skill", installCmd("uninstall-skill")},
+  	{"uninstall", installCmd("uninstall")},
+  }
+  ```
+}
+
+#cli: help and dispatch{
+  The first argument chooses the command, so no option of a command is ever mistaken for one of
+  the program's own. A command with the wrong arguments prints its own usage and exits with status
+  2.
+
+  ```
+  const helpText = `lit: one program for literate programming in brashtag notation.
+
+    lit tangle  PROGRAM.lit [OUTDIR]              write the files a program describes
+    lit weave   PROGRAM.lit [-o DIR]              woven HTML and LaTeX
+    lit lint    PROGRAM.lit [--refs]              check a document before you hand it over
+    lit absorb  PROGRAM.lit [FILE ...] [-o DIR]   fold edits of generated files back into the .lit
+    lit sync    PROGRAM.lit COMMAND ... [-o DIR]  reconcile the .lit and its files, both ways
+    lit watch   PROGRAM.lit [-o DIR]              record changes to both sides; changes nothing
+    lit addr    PROGRAM.lit ADDRESS ...           translate FILE:LINE:COL between .lit and generated files
+    lit fill    PROGRAM.lit [--agent SPEC] ...    let an agent write the code at #agent-fill-in{} hints
+    lit review  PROGRAM.lit [--check CMD] [--ai]  check what agents filled in; approve or reject it
+
+    lit install-skill   [--dest DIR] [--force]    teach Claude the notation (default ~/.claude/skills)
+    lit uninstall-skill [--dest DIR] [--force]    remove it again
+    lit uninstall       [--dest DIR] [--yes] [--skill-only]
+                                                  remove the skill and then this program
+    lit where                                     what is installed, and where
+    lit --version
+
+  Every command prints its own usage when run with the wrong arguments.
+  `
+
+  // Main runs one lit command and returns the exit status.
+  func Main(args []string, io IO) int {
+  	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+  		w := io.Out
+  		if len(args) == 0 {
+  			w = io.Err
+  		}
+  		fmt.Fprint(w, helpText)
+  		if len(args) == 0 {
+  			return 2
+  		}
+  		return 0
+  	}
+  	if args[0] == "--version" || args[0] == "version" {
+  		fmt.Fprintln(io.Out, "lit "+Version)
+  		return 0
+  	}
+  	for _, c := range commands {
+  		if c.name == args[0] {
+  			return c.run(args[1:], io)
+  		}
+  	}
+  	fmt.Fprintf(io.Err, "lit: unknown command %q; lit --help lists them\n", args[0])
+  	return 2
+  }
+  ```
+}
+
+#internal/lit/cli.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<cli: the commands>>>
+
+  <<<cli: help and dispatch>>>
+  ```
+}

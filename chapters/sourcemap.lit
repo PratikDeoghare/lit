@@ -1,0 +1,399 @@
+#h1{Positions: the sourcemap}
+
+The sourcemap is what makes a literate program editable from both ends. It records, for every
+generated line, the document line that produced it and the indentation that references added.
+
+#sourcemap: types{
+  The map speaks in character offsets of the flat text. A block is one fenced block of code: its
+  chunk, its indentation and the offset of each of its lines. A segment says that a run of
+  generated lines comes from a run of lines of a block, each with the indentation that references
+  added in front. A segment is written as a JSON array of five numbers and a string, which keeps
+  the map small and diffable.
+
+  ```
+  package lit
+
+  import (
+  	"bytes"
+  	"crypto/sha256"
+  	"encoding/hex"
+  	"encoding/json"
+  	"fmt"
+  	"os"
+  	"path/filepath"
+  	"strings"
+  )
+
+  const mapVersion = 1
+  const mark = "\x00"
+
+  func sha256hex(s string) string {
+  	h := sha256.Sum256([]byte(s))
+  	return hex.EncodeToString(h[:])
+  }
+
+  // A Block is one fenced block of code in the program text: the chunk it belongs to, the indentation that was
+  // stripped from every line, the byte offsets [start,end) of each content line (end is before the newline),
+  // and whether a newline follows the last content line.
+  type Block struct {
+  	Chunk  string   `json:"chunk"`
+  	Indent string   `json:"indent"`
+  	Lines  [][2]int `json:"lines"`
+  	NlLast bool     `json:"nl_last"`
+  }
+
+  // A Seg says that generated lines At..At+N-1 (1-based) come from lines Line..Line+N-1 of block Block, each with
+  // Prefix (the indentation added by references) in front.
+  type Seg struct {
+  	At, N, Block, Line int
+  	Prefix             string
+  }
+
+  func (s Seg) MarshalJSON() ([]byte, error) {
+  	return json.Marshal([]any{s.At, s.N, s.Block, s.Line, s.Prefix})
+  }
+
+  func (s *Seg) UnmarshalJSON(b []byte) error {
+  	var a [5]json.RawMessage
+  	if err := json.Unmarshal(b, &a); err != nil {
+  		return err
+  	}
+  	for i, p := range []*int{&s.At, &s.N, &s.Block, &s.Line} {
+  		if err := json.Unmarshal(a[i], p); err != nil {
+  			return err
+  		}
+  	}
+  	return json.Unmarshal(a[4], &s.Prefix)
+  }
+
+  type FileEntry struct {
+  	Sha256   string `json:"sha256"`
+  	Lines    int    `json:"lines"`
+  	Segments []Seg  `json:"segments"`
+  }
+
+  // Map is the sourcemap: for every generated line, the line of the program that produced it.
+  type Map struct {
+  	Version      int                  `json:"version"`
+  	Source       string               `json:"source"`
+  	Sources      []string             `json:"sources"`
+  	SourceSha256 string               `json:"source_sha256"`
+  	Blocks       []Block              `json:"blocks"`
+  	Files        map[string]FileEntry `json:"files"`
+  	FileOrder    []string             `json:"-"`
+  }
+  ```
+}
+
+#sourcemap: building the map{
+  To learn which source line produced which generated line, every code line is tagged with an
+  invisible marker holding its block and line number, and the tagged chunks are expanded by
+  tangle's own expansion. Whatever precedes the original text after expansion is the indentation
+  that references added. The decoded result is compared, line by line, with tangle's untagged
+  expansion, so a disagreement stops the build instead of producing a map that lies. Consecutive
+  lines from consecutive source lines are merged into one segment.
+
+  ```
+  // BuildMap builds the sourcemap of a program and the generated files, which it checks against tangle's own
+  // expansion. Every code line is tagged with an invisible marker holding its block and line number and expanded
+  // with the same Expand tangle uses; the tag survives expansion, and whatever precedes the original text is the
+  // indentation contributed by references.
+  func BuildMap(src *Source) (*Map, map[string]string, error) {
+  	root, err := src.Parse()
+  	if err != nil {
+  		return nil, nil, err
+  	}
+  	offs := map[Code]int{}
+  	Walk(root, func(n Node, _ []Bag, start, _ int) bool {
+  		if c, ok := n.(Code); ok {
+  			offs[c] = start + len(c.Tag())
+  		}
+  		return true
+  	})
+  	m := &Map{Version: mapVersion, Sources: src.Order, SourceSha256: sha256hex(src.Text), Files: map[string]FileEntry{}}
+  	var texts [][]string
+  	marked := &Chunks{Lines: map[string][]string{}}
+  	var visit func(b Bag)
+  	visit = func(b Bag) {
+  		name := strings.TrimSpace(b.Tag())
+  		if Reserved[name] {
+  			return
+  		}
+  		if _, ok := marked.Lines[name]; !ok {
+  			marked.Order = append(marked.Order, name)
+  			marked.Lines[name] = nil
+  		}
+  		for _, k := range b.Kids() {
+  			switch k := k.(type) {
+  			case Code:
+  				if !isFence(k) {
+  					continue
+  				}
+  				indent, items, nlLast, err := layout(k, offs[k])
+  				if err != nil {
+  					panic(err)
+  				}
+  				bid := len(m.Blocks)
+  				blk := Block{Chunk: name, Indent: indent, NlLast: nlLast}
+  				var ts []string
+  				for li, it := range items {
+  					blk.Lines = append(blk.Lines, [2]int{it.start, it.end})
+  					ts = append(ts, it.text)
+  					if refRe.MatchString(it.text) {
+  						marked.Lines[name] = append(marked.Lines[name], it.text)
+  					} else {
+  						marked.Lines[name] = append(marked.Lines[name], fmt.Sprintf("%s%s%d,%d%s", it.text, mark, bid, li, mark))
+  					}
+  				}
+  				m.Blocks = append(m.Blocks, blk)
+  				texts = append(texts, ts)
+  			case Bag:
+  				visit(k)
+  			}
+  		}
+  	}
+  	for _, k := range root.Kids() {
+  		if b, ok := k.(Bag); ok {
+  			visit(b)
+  		}
+  	}
+  	chunks := Collect(root, false)
+  	generated := map[string]string{}
+  	for _, name := range marked.FileNames() {
+  		plain, err := chunks.Expand(name)
+  		if err != nil {
+  			return nil, nil, err
+  		}
+  		ml, err := marked.Expand(name)
+  		if err != nil {
+  			return nil, nil, err
+  		}
+  		var segs []Seg
+  		for i, line := range ml {
+  			j := strings.LastIndex(line, mark)
+  			k := strings.LastIndex(line[:j], mark)
+  			var bid, li int
+  			fmt.Sscanf(line[k+1:j], "%d,%d", &bid, &li)
+  			body := line[:k]
+  			t := texts[bid][li]
+  			want := ""
+  			if t != "" {
+  				want = Unescape(body)
+  			}
+  			if !strings.HasSuffix(body, t) || want != plain[i] {
+  				return nil, nil, fmt.Errorf("internal error: sourcemap for %s disagrees with tangle at line %d", name, i+1)
+  			}
+  			pfx := body[:len(body)-len(t)]
+  			if n := len(segs); n > 0 && segs[n-1].Block == bid && segs[n-1].Line+segs[n-1].N == li && segs[n-1].Prefix == pfx &&
+  				segs[n-1].At+segs[n-1].N == i+1 {
+  				segs[n-1].N++
+  			} else {
+  				segs = append(segs, Seg{i + 1, 1, bid, li, pfx})
+  			}
+  		}
+  		content := FileBody(plain)
+  		m.Files[name] = FileEntry{Sha256: sha256hex(content), Lines: len(plain), Segments: segs}
+  		m.FileOrder = append(m.FileOrder, name)
+  		generated[name] = content
+  	}
+  	return m, generated, nil
+  }
+  ```
+}
+
+#sourcemap: laying out a fence{
+  The layout of a fence repeats the rule of tangle, and records where each line lives in the text:
+  the lines of the fence with the offset of each and the indentation to strip. It insists that its
+  answer equals tangle's own, so the two cannot drift apart.
+
+  ```
+  type lineItem struct {
+  	text       string
+  	start, end int
+  }
+
+  // layout mirrors FenceText but also records where each line lives in the program text.
+  func layout(c Code, off int) (indent string, items []lineItem, nlLast bool, err error) {
+  	raw := strings.Split(c.Text(), "\n")
+  	starts := make([]int, len(raw))
+  	pos := off
+  	for i, r := range raw {
+  		starts[i] = pos
+  		pos += len(r) + 1
+  	}
+  	lo, hi := 0, len(raw)
+  	if strings.TrimSpace(raw[0]) == "" {
+  		lo = 1
+  	}
+  	if hi > lo && strings.TrimSpace(raw[hi-1]) == "" {
+  		indent, hi = raw[hi-1], hi-1
+  	}
+  	for i := lo; i < hi; i++ {
+  		r := raw[i]
+  		t := strings.TrimLeft(r, " \t")
+  		if strings.HasPrefix(r, indent) {
+  			t = r[len(indent):]
+  		}
+  		items = append(items, lineItem{t, starts[i], starts[i] + len(r)})
+  	}
+  	want := FenceText(c)
+  	for i := range want {
+  		if i >= len(items) || items[i].text != want[i] {
+  			return "", nil, false, fmt.Errorf("internal error: block layout differs from FenceText")
+  		}
+  	}
+  	return indent, items, hi < len(raw), nil
+  }
+  ```
+}
+
+#sourcemap: writing the map{
+  The map is JSON with one block and one file per line so that it diffs well, byte for byte like
+  the one the Python tools wrote. Writing it also records the generated files as the common base
+  for synchronisation, which is the one place where the two libraries meet.
+
+  ```
+  // MapPath is where the sourcemap of a program lives.
+  func MapPath(src, outdir string) string { return filepath.Join(outdir, filepath.Base(src)+".map") }
+
+  func (m *Map) dumps(source string) []byte {
+  	j := func(v any) string { b, _ := json.Marshal(v); return string(b) }
+  	var sb strings.Builder
+  	sb.WriteString("{\n")
+  	fmt.Fprintf(&sb, "\"version\":%d,\n\"source\":%s,\n\"sources\":%s,\n\"source_sha256\":%s,\n", m.Version, j(source), j(m.Sources), j(m.SourceSha256))
+  	sb.WriteString("\"blocks\":[\n")
+  	for i, b := range m.Blocks {
+  		if i > 0 {
+  			sb.WriteString(",\n")
+  		}
+  		sb.WriteString(j(b))
+  	}
+  	sb.WriteString("\n],\n\"files\":{\n")
+  	for i, n := range m.FileOrder {
+  		if i > 0 {
+  			sb.WriteString(",\n")
+  		}
+  		fmt.Fprintf(&sb, "%s:%s", j(n), j(m.Files[n]))
+  	}
+  	sb.WriteString("\n}\n}\n")
+  	return []byte(sb.String())
+  }
+
+  // WriteMap writes the sourcemap next to the generated files and records them as the common base for sync.
+  func WriteMap(srcPath, outdir string) (string, error) { return writeMap(srcPath, outdir, true) }
+
+  func writeMap(srcPath, outdir string, base bool) (string, error) {
+  	src, err := ReadSource(srcPath)
+  	if err != nil {
+  		return "", err
+  	}
+  	m, generated, err := BuildMap(src)
+  	if err != nil {
+  		return "", err
+  	}
+  	path := MapPath(srcPath, outdir)
+  	if err := os.MkdirAll(outdir, 0o755); err != nil {
+  		return "", err
+  	}
+  	abs1, _ := filepath.Abs(srcPath)
+  	abs2, _ := filepath.Abs(filepath.Dir(path))
+  	rel, err := filepath.Rel(abs2, abs1)
+  	if err != nil {
+  		rel = srcPath
+  	}
+  	if err := os.WriteFile(path, m.dumps(filepath.ToSlash(rel)), 0o644); err != nil {
+  		return "", err
+  	}
+  	if base {
+  		if err := NewStore(srcPath, outdir).SetBase(generated, src.Text, "tangle", src.Texts); err != nil {
+  			return "", err
+  		}
+  	}
+  	return path, nil
+  }
+  ```
+}
+
+#sourcemap: reading the map{
+  Reading checks the version and rebuilds the order of the files from the map itself.
+
+  ```
+  // LoadMap reads a sourcemap.
+  func LoadMap(path string) (*Map, error) {
+  	b, err := os.ReadFile(path)
+  	if err != nil {
+  		if os.IsNotExist(err) {
+  			return nil, fmt.Errorf("%s: no sourcemap; run lit tangle first", path)
+  		}
+  		return nil, err
+  	}
+  	m := &Map{}
+  	if err := json.Unmarshal(b, m); err != nil {
+  		return nil, fmt.Errorf("%s: %v", path, err)
+  	}
+  	if m.Version != mapVersion {
+  		return nil, fmt.Errorf("%s: unsupported sourcemap version %d", path, m.Version)
+  	}
+  	// Go maps forget the order of keys; the order of "files" in the text is the order tangle wrote them in
+  	var raw struct {
+  		Files json.RawMessage `json:"files"`
+  	}
+  	if err := json.Unmarshal(b, &raw); err != nil {
+  		return nil, err
+  	}
+  	dec := json.NewDecoder(bytes.NewReader(raw.Files))
+  	dec.Token() // {
+  	for dec.More() {
+  		k, _ := dec.Token()
+  		var skip json.RawMessage
+  		if err := dec.Decode(&skip); err != nil {
+  			return nil, err
+  		}
+  		m.FileOrder = append(m.FileOrder, k.(string))
+  	}
+  	return m, nil
+  }
+  ```
+}
+
+#sourcemap: origins{
+  Both directions of lookup start from the origin of every generated line, which is the segments
+  unrolled.
+
+  ```
+  // Origin is where one generated line came from: a block, a line of it, and the indentation references added.
+  type Origin struct {
+  	Block, Line int
+  	Prefix      string
+  }
+
+  // Origins lists one Origin for every generated line of a file.
+  func (e FileEntry) Origins() []Origin {
+  	var out []Origin
+  	for _, s := range e.Segments {
+  		for k := 0; k < s.N; k++ {
+  			out = append(out, Origin{s.Block, s.Line + k, s.Prefix})
+  		}
+  	}
+  	return out
+  }
+  ```
+}
+
+#internal/lit/sourcemap.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<sourcemap: types>>>
+
+  <<<sourcemap: building the map>>>
+
+  <<<sourcemap: laying out a fence>>>
+
+  <<<sourcemap: writing the map>>>
+
+  <<<sourcemap: reading the map>>>
+
+  <<<sourcemap: origins>>>
+  ```
+}

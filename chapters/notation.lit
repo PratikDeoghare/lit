@@ -1,0 +1,17 @@
+#h1{Reading the notation}
+
+Everything starts with the grammar. A document is a tree of bags, written with a hash, a tag and
+braces. A bag whose tag is not reserved defines a chunk; the reserved tags are the headings, a
+citation, a bibliography, an include, an image and an agent hint. Code is any run of three or
+more backticks; shorter runs are inline code and belong to the prose. The parser is the brashtag
+package, compiled into the program, and a small wrapper gives it one more function, which parses
+a bag and returns the rest of the input.
+
+Four rules make the text predictable. Chunk names are global, and defining a name twice
+concatenates the definitions, which is how a chunk can be explained in several places. A name
+that ends in an extension is a file. For programs too large for one file,
+`#include{chapter.lit}` is replaced by the text of that file, so a program can have a chapter
+for each module or subsystem. And a bag called `agent-fill-in` inside a chunk is a gap: it is
+not code, tangle skips it, and `lit fill` knows how to fill it. All four rules are about the
+whole document, so no tool looks at a chunk in isolation, and a chunk in one chapter may refer
+to a chunk in another.

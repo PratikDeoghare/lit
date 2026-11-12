@@ -1,0 +1,125 @@
+#h1{The tools at a glance}
+
+The figure shows the whole toolkit on one page. Text lives in three places: the document, which
+is the source of truth, the generated files, which the compiler and the rest of the team use,
+and the woven page, which is for reading. The arrows are the tools.
+
+Tangle writes the generated files from the document, and records where every line came from.
+Weave writes the page to read, as HTML and as LaTeX, and a LaTeX installation turns the second
+into a PDF. Lint checks the document without producing anything. Those three are the classic
+literate-programming tools.
+
+The rest exist because people edit the generated files. Absorb takes an edit of a generated file
+and writes it back into the right place in the document, using the record of where each line
+came from. Sync is for the day when both sides were edited: it merges the two against the last
+state they agreed on, and asks only about real conflicts. Watch records every edit on either
+side, so that nothing is lost between syncs, and addr answers the question an editor asks, which
+line of the other file is this.
+
+Claude, with the skill, is how an existing program becomes a document in the first place. The
+dashed box at the top right is paper: literate programs began there, written to be read, and the
+woven PDF is how this toolkit still ends up on it. Every tool is also a subcommand of the single
+command `lit`.
+
+#img{`internal/skill/files/docs/tools.svg` The tools at a glance: weave reads the document; tangle, sync and absorb move text between it and the generated files; the map and the sync base are what let them agree.}
+
+#internal/skill/files/docs/tools.svg{
+  The figure is a file chunk of this document, so it is tangled like code, and the woven HTML
+  inlines it from here. It is plain SVG with the colours of the text, so it follows the page in
+  light and dark and prints black on white. Every tool is a labelled arrow; the boxes are the
+  places text lives.
+
+  ```
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 590" width="980" height="590">
+    <title>How the tools move text between the literate document, the generated files and the woven page</title>
+    <style>
+      .fx-box { fill: currentColor; fill-opacity: .05; stroke: currentColor; stroke-opacity: .55; stroke-width: 1.5 }
+      .fx-out { stroke-dasharray: 7 5; fill-opacity: .02 }
+      .fx-t { font: 600 18px system-ui, Helvetica, Arial, sans-serif; fill: currentColor }
+      .fx-s { font: 13px system-ui, Helvetica, Arial, sans-serif; fill: currentColor; fill-opacity: .72 }
+      .fx-tool { font: 700 16px ui-monospace, Menlo, Consolas, monospace; fill: #c2410c }
+      .fx-arrow { stroke: #c2410c; stroke-width: 2.6; fill: none }
+      .fx-thin { stroke: currentColor; stroke-opacity: .5; stroke-width: 1.4; stroke-dasharray: 3 4; fill: none }
+      .fx-note { font: italic 13px system-ui, Helvetica, Arial, sans-serif; fill: currentColor; fill-opacity: .72 }
+    </style>
+    <defs>
+      <marker id="fx-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0 0L10 5L0 10z" fill="#c2410c"/>
+      </marker>
+      <marker id="fx-l" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M10 0L0 5L10 10z" fill="#c2410c"/>
+      </marker>
+    </defs>
+
+    <!-- the three places text lives -->
+    <rect class="fx-box fx-out" x="10" y="200" width="160" height="140" rx="12"/>
+    <text class="fx-t" x="90" y="262" text-anchor="middle">existing code</text>
+    <text class="fx-s" x="90" y="284" text-anchor="middle">legacy, or written</text>
+    <text class="fx-s" x="90" y="302" text-anchor="middle">by an agent</text>
+
+    <rect class="fx-box" x="290" y="200" width="230" height="140" rx="12"/>
+    <text class="fx-t" x="405" y="252" text-anchor="middle">the document</text>
+    <text class="fx-s" x="405" y="276" text-anchor="middle">one .lit root</text>
+    <text class="fx-s" x="405" y="294" text-anchor="middle">plus a chapter file</text>
+    <text class="fx-s" x="405" y="312" text-anchor="middle">for each subsystem</text>
+
+    <rect class="fx-box" x="700" y="200" width="230" height="140" rx="12"/>
+    <text class="fx-t" x="815" y="252" text-anchor="middle">generated files</text>
+    <text class="fx-s" x="815" y="276" text-anchor="middle">.py  .js  .go  .toml ...</text>
+    <text class="fx-s" x="815" y="294" text-anchor="middle">what the compiler and</text>
+    <text class="fx-s" x="815" y="312" text-anchor="middle">your teammates see</text>
+
+    <!-- reading: lit -> woven -> pdf -->
+    <rect class="fx-box" x="500" y="30" width="200" height="64" rx="12"/>
+    <text class="fx-t" x="600" y="58" text-anchor="middle">woven page</text>
+    <text class="fx-s" x="600" y="78" text-anchor="middle">.html and .tex</text>
+    <rect class="fx-box fx-out" x="770" y="30" width="190" height="64" rx="12"/>
+    <text class="fx-t" x="865" y="58" text-anchor="middle">pdf</text>
+    <text class="fx-s" x="865" y="78" text-anchor="middle">to read or print</text>
+    <path class="fx-arrow" d="M405 200 V62 H498" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="452" y="52" text-anchor="middle">weave</text>
+    <path class="fx-arrow" d="M702 62 H768" marker-end="url(#fx-r)" stroke-dasharray="7 5"/>
+    <text class="fx-s" x="735" y="52" text-anchor="middle">xelatex</text>
+    <path class="fx-arrow" d="M865 96 V128" marker-end="url(#fx-r)" stroke-dasharray="7 5" stroke-width="1.8"/>
+    <rect class="fx-box fx-out" x="770" y="130" width="190" height="56" rx="12"/>
+    <text class="fx-t" x="865" y="154" text-anchor="middle">paper</text>
+    <text class="fx-s" x="865" y="173" text-anchor="middle">where the tradition began</text>
+
+    <!-- checking -->
+    <rect class="fx-box" x="40" y="30" width="170" height="64" rx="12"/>
+    <text class="fx-t" x="125" y="58" text-anchor="middle">lint</text>
+    <text class="fx-s" x="125" y="78" text-anchor="middle">structure, citations</text>
+    <path class="fx-arrow" d="M125 94 V150 H340 V198" marker-end="url(#fx-r)" stroke-width="1.8"/>
+
+    <!-- writing: existing code -> lit -->
+    <path class="fx-arrow" d="M172 270 H288" marker-end="url(#fx-r)" stroke-dasharray="7 5"/>
+    <text class="fx-tool" x="230" y="256" text-anchor="middle">Claude</text>
+    <text class="fx-s" x="230" y="292" text-anchor="middle">with the skill</text>
+
+    <!-- the three ways between document and files -->
+    <path class="fx-arrow" d="M522 236 H698" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="610" y="228" text-anchor="middle">tangle</text>
+    <path class="fx-arrow" d="M522 270 H698" marker-start="url(#fx-l)" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="610" y="262" text-anchor="middle">sync</text>
+    <path class="fx-arrow" d="M698 304 H522" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="610" y="326" text-anchor="middle">absorb</text>
+
+    <!-- shared state -->
+    <path class="fx-thin" d="M200 410 V385 H900 V410 M340 385 V342 M800 385 V342 M605 385 V400"/>
+    <rect class="fx-box" x="415" y="400" width="380" height="84" rx="12"/>
+    <text class="fx-t" x="605" y="428" text-anchor="middle">what the tools remember</text>
+    <text class="fx-s" x="605" y="452" text-anchor="middle">.map: which line of the document wrote each generated line</text>
+    <text class="fx-s" x="605" y="470" text-anchor="middle">.sync/: the last agreed state, every version, a journal</text>
+
+    <rect class="fx-box" x="60" y="410" width="210" height="64" rx="12"/>
+    <text class="fx-tool" x="165" y="438" text-anchor="middle">watch</text>
+    <text class="fx-s" x="165" y="458" text-anchor="middle">records edits on both sides</text>
+    <rect class="fx-box" x="830" y="410" width="140" height="64" rx="12"/>
+    <text class="fx-tool" x="900" y="438" text-anchor="middle">addr</text>
+    <text class="fx-s" x="900" y="458" text-anchor="middle">line to line</text>
+
+    <text class="fx-note" x="490" y="530" text-anchor="middle">Solid arrows: a tool that writes. Dotted lines: the shared state that tangle, absorb, sync, watch and addr read.</text>
+    <text class="fx-note" x="490" y="550" text-anchor="middle">Dashed boxes and arrows: not part of the toolkit. Every tool is also a subcommand of lit.</text>
+  </svg>
+  ```
+}

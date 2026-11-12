@@ -1,0 +1,416 @@
+#h1{Watching: the recorder}
+
+The watcher exists so that nothing is ever lost even when nobody runs sync in time.
+
+#watch: what is watched{
+  The watcher exists so that nothing is ever lost even when nobody runs sync in time. It never
+  modifies a file. It watches the document, every chapter and every generated file the map names.
+  Polling is used so that nothing needs installing; the cost is one `stat` for each file each
+  interval.
+
+  ```
+  package lit
+
+  import (
+  	"encoding/json"
+  	"fmt"
+  	"os"
+  	"os/signal"
+  	"path/filepath"
+  	"strconv"
+  	"strings"
+  	"time"
+  )
+
+  type watcher struct {
+  	source, outdir string
+  	quiet          bool
+  	settle         time.Duration
+  	store          *Store
+  	stat           map[string]string
+  	dirty          map[string]time.Time
+  	seen           map[string]string
+  	seenPath       string
+  	litName        string
+  	oursSha        string
+  	ours           map[string]string
+  	io             IO
+  	color          bool
+  }
+
+  type target struct{ side, name, path string }
+
+  func newWatcher(source, outdir string, quiet bool, settle time.Duration, io IO) *watcher {
+  	w := &watcher{source: source, outdir: outdir, quiet: quiet, settle: settle, store: NewStore(source, outdir),
+  		stat: map[string]string{}, dirty: map[string]time.Time{}, seen: map[string]string{}, litName: filepath.Base(source), io: io}
+  	w.color = io.Out == os.Stdout && IsTerminal(os.Stdout) && os.Getenv("NO_COLOR") == ""
+  	os.MkdirAll(w.store.Dir, 0o755)
+  	w.seenPath = w.store.p("watch.json")
+  	if b, err := os.ReadFile(w.seenPath); err == nil {
+  		json.Unmarshal(b, &w.seen)
+  	}
+  	return w
+  }
+
+  func (w *watcher) paint(s, code string) string {
+  	if !w.color {
+  		return s
+  	}
+  	return "\033[" + code + "m" + s + "\033[0m"
+  }
+
+  func (w *watcher) targets() ([]target, error) {
+  	m, err := LoadMap(MapPath(w.source, w.outdir))
+  	if err != nil {
+  		return nil, err
+  	}
+  	base := filepath.Dir(w.source)
+  	srcs := m.Sources
+  	if len(srcs) == 0 {
+  		srcs = []string{w.litName}
+  	}
+  	var out []target
+  	for _, n := range srcs {
+  		out = append(out, target{"lit", n, filepath.Join(base, filepath.FromSlash(n))})
+  	}
+  	for _, n := range m.FileOrder {
+  		out = append(out, target{"gen", n, filepath.Join(w.outdir, filepath.FromSlash(n))})
+  	}
+  	return out, nil
+  }
+
+  func (w *watcher) saveSeen() {
+  	b, _ := json.Marshal(w.seen)
+  	os.WriteFile(w.seenPath, b, 0o644)
+  }
+
+  func (w *watcher) oursFiles() map[string]string {
+  	src, err := ReadSource(w.source)
+  	if err != nil {
+  		return nil
+  	}
+  	if h := sha256hex(src.Text); h != w.oursSha {
+  		w.oursSha = h
+  		w.ours, _, err = TangleText(src.Text)
+  		if err != nil {
+  			w.ours = nil // the .lit is mid-edit and does not parse
+  		}
+  	}
+  	return w.ours
+  }
+  ```
+}
+
+#watch: classifying a change{
+  An event is an edit if a person changed the file, tangled if a generated file now equals what
+  the document produces, and synced if the document is the version recorded at the last sync. A
+  document that does not parse is mid-edit, and nothing can be said about the files.
+
+  ```
+  func (w *watcher) classify(side, name string, text *string) string {
+  	if text == nil {
+  		return "deleted"
+  	}
+  	if side == "lit" {
+  		st := w.store.State()
+  		want, ok := st.LitFiles[name]
+  		if !ok {
+  			want = st.LitSha
+  		}
+  		if sha256hex(*text) == want {
+  			return "synced"
+  		}
+  		return "edit"
+  	}
+  	if ours := w.oursFiles(); ours != nil {
+  		if o, ok := ours[name]; ok && o == *text {
+  			return "tangled"
+  		}
+  	}
+  	return "edit"
+  }
+
+  func delta(old, new string) (plus, minus int) {
+  	for _, h := range Hunks(splitLines(old), splitLines(new)) {
+  		plus += h.B1 - h.B0
+  		minus += h.A1 - h.A0
+  	}
+  	return
+  }
+
+  func splitLines(s string) []string { return strings.Split(s, "\n") }
+
+  func (w *watcher) vsBase(side, name string, text *string) string {
+  	if text == nil {
+  		return ""
+  	}
+  	var base string
+  	var ok bool
+  	if side == "lit" {
+  		base, ok = w.store.BaseLit(name)
+  	} else {
+  		var err error
+  		base, err = ReadDisk(w.store.p("base", name))
+  		ok = err == nil
+  	}
+  	if !ok {
+  		return ""
+  	}
+  	p, m := delta(base, *text)
+  	if p == 0 && m == 0 {
+  		return "same as base"
+  	}
+  	return fmt.Sprintf("+%d -%d vs base", p, m)
+  }
+
+  func (w *watcher) say(line string) {
+  	if !w.quiet {
+  		fmt.Fprintln(w.io.Out, line)
+  	}
+  }
+
+  var kindColor = map[string]string{"edit": "33", "tangled": "32", "synced": "32", "deleted": "31"}
+  ```
+}
+
+#watch: recording{
+  A change is recorded as a snapshot and a journal line, and printed with how many lines it adds
+  and removes against the base. The hash of what was last seen is remembered on disk, so a change
+  made while the watcher was not running is found when it starts.
+
+  ```
+  func (w *watcher) record(t target) bool {
+  	key := t.side + ":" + t.name
+  	var text *string
+  	h := "deleted"
+  	if c, err := ReadDisk(t.path); err == nil {
+  		text = &c
+  		h = sha256hex(c)
+  	}
+  	if w.seen[key] == h {
+  		return false
+  	}
+  	prev := w.seen[key]
+  	if prev == "deleted" {
+  		prev = ""
+  	}
+  	kind := w.classify(t.side, t.name, text)
+  	ev := w.store.Log(kind, t.side, t.name, text, map[string]any{"prev": prev})
+  	w.seen[key] = h
+  	w.saveSeen()
+  	snap := ""
+  	if ev.Sha != "" {
+  		snap = "[snapshot " + ev.Sha[:8] + "]"
+  	}
+  	col := kindColor[kind]
+  	if col == "" {
+  		col = "0"
+  	}
+  	w.say(fmt.Sprintf("%s  %-3s  %-28s %s %-18s %s", time.Unix(int64(ev.T), 0).Format("15:04:05"), t.side, t.name,
+  		w.paint(fmt.Sprintf("%-8s", kind), col), w.vsBase(t.side, t.name, text), snap))
+  	return true
+  }
+  ```
+}
+
+#watch: the summary{
+  After every recorded change the watcher says what is now waiting: how many changes come from the
+  document, how many were made in generated files, and how many conflict.
+
+  ```
+  func (w *watcher) summary() {
+  	an, err := NewAnalysis(w.source, w.outdir)
+  	if err != nil {
+  		w.say(fmt.Sprintf("          (cannot compare the two sides right now: %v)", err))
+  		return
+  	}
+  	var nl, ng, nc int
+  	for _, fs := range an.Files {
+  		for _, r := range fs.Regions {
+  			switch r.Kind {
+  			case "lit":
+  				nl++
+  			case "gen":
+  				ng++
+  			case "conflict":
+  				nc++
+  			}
+  		}
+  	}
+  	if nl+ng+nc == 0 {
+  		w.say("          both sides agree")
+  		return
+  	}
+  	var bits []string
+  	if nl > 0 {
+  		bits = append(bits, fmt.Sprintf("%d change(s) from the .lit", nl))
+  	}
+  	if ng > 0 {
+  		bits = append(bits, fmt.Sprintf("%d edit(s) in generated files", ng))
+  	}
+  	if nc > 0 {
+  		bits = append(bits, w.paint(fmt.Sprintf("%d CONFLICT(s)", nc), "31"))
+  	}
+  	w.say("          waiting: " + joinComma(bits) + fmt.Sprintf("   ->  lit sync %s status", w.source))
+  }
+
+  func joinComma(b []string) string {
+  	s := ""
+  	for i, x := range b {
+  		if i > 0 {
+  			s += ", "
+  		}
+  		s += x
+  	}
+  	return s
+  }
+  ```
+}
+
+#watch: the loop{
+  A file is recorded when it has stopped changing for the settle time, so a half-saved file is not
+  recorded. `--once` records whatever changed since the last run and exits, and `--for` stops
+  after a time, which is what scripts want.
+
+  ```
+  func statKey(path string) string {
+  	if fi, err := os.Stat(path); err == nil {
+  		return fmt.Sprintf("%d:%d", fi.ModTime().UnixNano(), fi.Size())
+  	}
+  	return ""
+  }
+
+  func (w *watcher) start() error {
+  	ts, err := w.targets()
+  	if err != nil {
+  		return err
+  	}
+  	changed := false
+  	for _, t := range ts {
+  		key := t.side + ":" + t.name
+  		if _, ok := w.seen[key]; !ok { // first sight: a baseline, not an event
+  			if c, err := ReadDisk(t.path); err == nil {
+  				w.seen[key] = sha256hex(c)
+  			} else {
+  				w.seen[key] = "deleted"
+  			}
+  		} else if w.record(t) { // changed while we were not watching
+  			changed = true
+  		}
+  		w.stat[key] = statKey(t.path)
+  	}
+  	w.saveSeen()
+  	w.store.Log("watch", "lit", w.litName, nil, map[string]any{"note": "started"})
+  	if changed {
+  		w.summary()
+  	}
+  	return nil
+  }
+
+  func (w *watcher) scan(now time.Time) {
+  	ts, err := w.targets()
+  	if err != nil {
+  		return
+  	}
+  	recorded := false
+  	for _, t := range ts {
+  		key := t.side + ":" + t.name
+  		cur := statKey(t.path)
+  		if cur != w.stat[key] {
+  			w.stat[key] = cur
+  			w.dirty[key] = now // still changing: wait for it to settle
+  		} else if d, ok := w.dirty[key]; ok && now.Sub(d) >= w.settle {
+  			delete(w.dirty, key)
+  			if w.record(t) {
+  				recorded = true
+  			}
+  		}
+  	}
+  	if recorded {
+  		w.summary()
+  	}
+  }
+
+  func (w *watcher) flush() {
+  	ts, err := w.targets()
+  	if err != nil {
+  		return
+  	}
+  	for _, t := range ts {
+  		delete(w.dirty, t.side+":"+t.name)
+  		w.record(t)
+  	}
+  }
+
+  var watchSpec = Spec{
+  	Opts:  map[string]bool{"outdir": true, "interval": true, "settle": true, "once": false, "for": true, "quiet": false},
+  	Short: map[string]string{"o": "outdir"},
+  }
+
+  func seconds(a *Args, name string, def float64) float64 {
+  	if v := a.Get(name, ""); v != "" {
+  		if f, err := strconv.ParseFloat(v, 64); err == nil {
+  			return f
+  		}
+  	}
+  	return def
+  }
+
+  // Watch records every change to a .lit and to the files generated from it. It never modifies any of them.
+  func Watch(argv []string, io IO) int {
+  	a, err := ParseArgs(argv, watchSpec)
+  	if err != nil || len(a.Pos) != 1 {
+  		fmt.Fprintln(io.Err, "usage: lit watch SOURCE.lit [-o OUTDIR] [--interval 0.5] [--settle 0.4] [--once] [--for SECONDS] [--quiet]")
+  		return 2
+  	}
+  	d := func(f float64) time.Duration { return time.Duration(f * float64(time.Second)) }
+  	w := newWatcher(a.Pos[0], a.Get("outdir", "."), a.Has("quiet"), d(seconds(a, "settle", 0.4)), io)
+  	if err := w.start(); err != nil {
+  		fmt.Fprintln(io.Err, "watch: "+err.Error())
+  		return 2
+  	}
+  	if a.Has("once") {
+  		w.flush()
+  		w.summary()
+  		return 0
+  	}
+  	w.say(fmt.Sprintf("watching %s and its generated files in %s (Ctrl-C to stop); nothing is modified", a.Pos[0], w.outdir))
+  	var end time.Time
+  	if a.Has("for") {
+  		end = time.Now().Add(d(seconds(a, "for", 0)))
+  	}
+  	interrupt := make(chan os.Signal, 1)
+  	signal.Notify(interrupt, os.Interrupt)
+  	tick := time.NewTicker(d(seconds(a, "interval", 0.5)))
+  	defer tick.Stop()
+  	for end.IsZero() || time.Now().Before(end) {
+  		select {
+  		case <-interrupt:
+  			w.flush()
+  			fmt.Fprintf(io.Out, "\nstopped; %d events are in %s\n", len(w.store.Events()), filepath.Join(w.store.Dir, "journal.jsonl"))
+  			return 0
+  		case now := <-tick.C:
+  			w.scan(now)
+  		}
+  	}
+  	w.flush()
+  	return 0
+  }
+  ```
+}
+
+#internal/lit/watch.go{
+  The file is its parts, in the order of the source.
+
+  ```
+  <<<watch: what is watched>>>
+
+  <<<watch: classifying a change>>>
+
+  <<<watch: recording>>>
+
+  <<<watch: the summary>>>
+
+  <<<watch: the loop>>>
+  ```
+}
