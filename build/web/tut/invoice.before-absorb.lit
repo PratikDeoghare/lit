@@ -1,0 +1,131 @@
+#h1{Invoicing}
+
+This program turns a list of purchased items into a printed invoice. It is a small script that grew
+in place: three functions and a demo. This document explains what each part does and, where the code
+does not say, what is unknown. The code has not been changed. Tangling this document reproduces
+`invoice.py` exactly.
+
+An item is a triple of name, quantity and unit price. An invoice is the priced lines, a subtotal, a
+tax and a total. Every amount is a Python float rounded to cents, which matters in the section on
+rounding.
+
+#h2{Volume pricing}
+
+#price_for{
+  The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
+  from 100 units a 15 percent discount. The discount applies to the unit price, not to the line,
+  and the thresholds are the first match in order, so a quantity of 100 gets the larger discount
+  only and the two never combine.
+
+  ```
+  def price_for(qty, unit):
+      # volume pricing
+      <<<discount tiers>>>
+      return unit
+  ```
+
+  #discount tiers{
+    ```
+    if qty >= 100:
+        unit = unit * 0.85
+    elif qty >= 10:
+        unit = unit * 0.95
+    ```
+  }
+}
+
+#h2{Pricing a whole invoice}
+
+#invoice{
+  Each item is priced, its line amount rounded to cents, and the rounded amounts are summed. Rounding
+  each line before summing means the subtotal is the sum of what the customer sees on the page, which
+  is usually what an invoice should do, but it can differ by a cent from rounding the unscaled sum.
+
+  The function returns the lines too, because printing needs the discounted unit price, not the
+  original.
+
+  ```
+  def invoice(items, region="TX"):
+      sub = 0
+      lines = []
+      for name, qty, unit in items:
+          p = price_for(qty, unit)
+          amt = round(p * qty, 2)
+          lines.append((name, qty, p, amt))
+          sub += amt
+      <<<tax and total>>>
+      return lines, sub, tax, total
+  ```
+
+  #tax and total{
+    Tax is a flat rate on the subtotal, except in region OR, where it is zero. Oregon has no
+    state sales tax, which is the likely reason for the exception. Nothing in the code says so, and
+    no other region is special, so this is an open question for whoever owns the tax rules.
+
+    ```
+    tax = 0 if region == "OR" else round(sub * TAX, 2)
+    total = round(sub + tax, 2)
+    ```
+  }
+}
+
+#h2{Printing}
+
+#render{
+  The layout is fixed-width text: name, quantity, discounted unit price and line amount on each
+  line, then three summary lines whose amounts line up under the line amounts. The widths are
+  literal numbers in the format strings, so changing a width means changing every line that
+  shares it.
+
+  ```
+  def render(lines, sub, tax, total):
+      out = []
+      for name, qty, p, amt in lines:
+          out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+      out.append("%-12s %29.2f" % ("subtotal", sub))
+      out.append("%-12s %29.2f" % ("tax", tax))
+      out.append("%-12s %29.2f" % ("TOTAL", total))
+      return "\n".join(out)
+  ```
+}
+
+#h2{Running it}
+
+#demo{
+  Run as a script, the module prices three sample items and prints the invoice. An optional first
+  argument is the region.
+
+  ```
+  if __name__ == "__main__":
+      items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+      print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
+  ```
+}
+
+#h2{Open questions}
+
+The tax rate is a module constant, `0.0825`, with no note of where it comes from or whether it
+varies by region. The region check treats exactly the string `OR` as exempt and every other string,
+including a typo, as taxable at the default rate. Neither is changed here.
+
+#h2{Assembly}
+
+#invoice.py{
+  ```
+  import sys
+
+  TAX = 0.0825
+
+
+  <<<price_for>>>
+
+
+  <<<invoice>>>
+
+
+  <<<render>>>
+
+
+  <<<demo>>>
+  ```
+}

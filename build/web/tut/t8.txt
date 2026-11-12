@@ -1,0 +1,41 @@
+$ lit lint shop.lit
+3 chunks, 11 code lines, 109 words of prose, 0 citations, 0 bibliography entries; 0 error(s), 0 warning(s)
+[exit 0]
+
+$ lit tangle shop.lit .
+wrote shop.py
+wrote shop.lit.map
+[exit 0]
+
+$ python3 shop.py
+widget       12 x    3.32 =    39.84
+gizmo         1 x   19.99 =    19.99
+[exit 0]
+
+$ lit addr shop.lit shop.py:3
+pricing.lit:9:3  «pricing»
+[exit 0]
+
+$ lit addr shop.lit report.lit:8
+shop.py:6:1  «report»
+[exit 0]
+
+# (a teammate lowers the threshold from 12 to 10 in shop.py)
+
+$ lit absorb shop.lit
+  shop.py:2  «pricing», pricing.lit:8: 1 changed
+--- a/pricing.lit
++++ b/pricing.lit
+@@ -7,3 +7,3 @@
+   def unit_price(qty, price):
+-      if qty >= 12:
++      if qty >= 10:
+           return round(price * 0.95, 2)
+
+absorbed edits from 1 file(s) into shop.lit; sourcemap refreshed
+[exit 0]
+
+$ lit tangle shop.lit .
+wrote shop.py
+wrote shop.lit.map
+[exit 0]

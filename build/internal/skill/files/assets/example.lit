@@ -1,0 +1,181 @@
+#h1{Merge sort}
+
+Merge sort sorts a list by splitting it in half, sorting the halves recursively, and merging the
+two sorted halves into one. Splitting is free and merging is linear, so the running time obeys the
+recurrence
+
+`$T(n) = 2\,T(n/2) + \Theta(n)$`
+
+which solves to `$\Theta(n \log n)$` in the best, average and worst case #cite{cormen2022}. It is one
+of the oldest sorting algorithms and Knuth traces its history #cite{knuth1998sorting}. This document
+is a literate program #cite{knuth1984lp}: the explanation and the source are the same text, and the
+code is presented in the order that is easiest to understand, not the order Python needs.
+
+The program has three parts: the merge step, the recursive sort around it, and tests. They are
+assembled into files at the end.
+
+#h2{The merge step}
+
+#merge{
+  To merge two sorted lists we repeatedly compare their first unused elements and move the smaller
+  one to the result. When one list runs out, everything left in the other is already in order, so
+  it is appended as it is. Taking from the left list on ties makes the sort stable: equal elements
+  keep their original order. That is why the comparison is `<=` and not `<`.
+
+  Each element is moved exactly once, so merging lists of lengths `$p$` and `$q$` takes
+  `$\Theta(p+q)$` time.
+
+  ```
+  def merge(a, b):
+      res = []
+      i = j = 0
+      while i < len(a) and j < len(b):
+          <<<take the smaller head>>>
+      res.extend(a[i:])
+      res.extend(b[j:])
+      return res
+  ```
+
+  #take the smaller head{
+    ```
+    if a[i] <= b[j]:
+        res.append(a[i])
+        i += 1
+    else:
+        res.append(b[j])
+        j += 1
+    ```
+  }
+}
+
+#h2{The recursive sort}
+
+#merge sort{
+  Lists with at most one element are already sorted. Otherwise we cut the list in the middle,
+  sort each half, and merge. Returning a new list, rather than sorting in place, keeps the
+  function easy to reason about at the price of `$O(n)$` extra memory.
+
+  ```
+  def merge_sort(xs):
+      <<<base case>>>
+      <<<recursive step>>>
+  ```
+
+  #base case{
+    ```
+    if len(xs) <= 1:
+        return list(xs)
+    ```
+  }
+
+  #recursive step{
+    The midpoint is rounded down, so the two halves differ in length by at most one and the
+    recursion depth is `$\lceil \log_2 n \rceil$`.
+
+    ```
+    mid = len(xs) // 2
+    return merge(merge_sort(xs[:mid]), merge_sort(xs[mid:]))
+    ```
+  }
+}
+
+#h2{Tests}
+
+#tests{
+  Two properties are enough to catch most mistakes: the result is sorted, and it agrees with
+  Python's own `sorted`. Random inputs of many lengths, including the empty list and lists full of
+  duplicates, exercise both.
+
+  ```
+  def test_random_lists():
+      rng = random.Random(0)
+      for n in list(range(12)) + [100, 1000]:
+          for _ in range(20):
+              xs = [rng.randrange(10) for _ in range(n)]
+              assert merge_sort(xs) == sorted(xs)
+
+
+  def test_input_is_not_modified():
+      xs = [3, 1, 2]
+      merge_sort(xs)
+      assert xs == [3, 1, 2]
+  ```
+}
+
+#h2{Assembly}
+
+The code chunks above are placed into files here.
+
+#mergesort.py{
+  ```
+  """Merge sort. Generated from example.lit; edit that file, not this one."""
+
+
+  <<<merge>>>
+
+
+  <<<merge sort>>>
+  ```
+}
+
+#test_mergesort.py{
+  ```
+  import random
+
+  from mergesort import merge_sort
+
+
+  <<<tests>>>
+  ```
+}
+
+#README.md{
+  The README uses a four-backtick fence so that it can contain ordinary three-backtick blocks.
+
+  ````
+  # Merge sort
+
+  Literate source: example.lit.
+
+  ```
+  lit tangle example.lit out
+  python -m pytest out
+  ```
+  ````
+}
+
+#bibliography{
+  #knuth1984lp{
+    ```
+    @article{knuth1984lp,
+      author  = {Donald E. Knuth},
+      title   = {Literate Programming},
+      journal = {The Computer Journal},
+      volume  = {27}, number = {2}, pages = {97--111}, year = {1984},
+      doi     = {10.1093/comjnl/27.2.97}
+    }
+    ```
+  }
+  #knuth1998sorting{
+    ```
+    @book{knuth1998sorting,
+      author    = {Donald E. Knuth},
+      title     = {The Art of Computer Programming, Volume 3: Sorting and Searching},
+      publisher = {Addison-Wesley},
+      edition   = {2nd}, year = {1998},
+      isbn      = {978-0-201-89685-5}
+    }
+    ```
+  }
+  #cormen2022{
+    ```
+    @book{cormen2022,
+      author    = {Thomas H. Cormen and Charles E. Leiserson and Ronald L. Rivest and Clifford Stein},
+      title     = {Introduction to Algorithms},
+      publisher = {MIT Press},
+      edition   = {4th}, year = {2022},
+      isbn      = {978-0-262-04630-5}
+    }
+    ```
+  }
+}

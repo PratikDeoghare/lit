@@ -1,0 +1,13 @@
+#h1{The report}
+
+An order is a list of (name, quantity, price) triples. Each line is printed with its total. The
+chapter on pricing says how the unit price is worked out; this one only uses it.
+
+#report{
+  ```
+  ORDER = [("widget", 12, 3.50), ("gizmo", 1, 19.99)]
+  for name, qty, price in ORDER:
+      unit = unit_price(qty, price)
+      print(f"{name:10s} {qty:4d} x {unit:7.2f} = {qty * unit:8.2f}")
+  ```
+}

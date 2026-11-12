@@ -1,0 +1,31 @@
+#h1{One chunk, two files}
+
+The greeting is written once. Tangle pastes it into the module and into the test, and each paste
+keeps the indentation of the reference that asked for it.
+
+#greeting{
+  ```
+  return f"Hello, {name}!"
+  ```
+}
+
+#hello.py{
+  ```
+  def hello(name):
+      <<<greeting>>>
+  ```
+}
+
+#test_hello.py{
+  ```
+  from hello import hello
+
+
+  def expected(name):
+      <<<greeting>>>
+
+
+  def test_hello():
+      assert hello("Ada") == expected("Ada")
+  ```
+}

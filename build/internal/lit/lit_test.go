@@ -1,0 +1,467 @@
+package lit
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// run executes a command in memory and returns its exit status and the two output streams.
+func run(t *testing.T, stdin string, args ...string) (int, string, string) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	rc := Main(args, IO{In: strings.NewReader(stdin), Out: &out, Err: &errb})
+	return rc, out.String(), errb.String()
+}
+
+func write(t *testing.T, dir, name, text string) string {
+	t.Helper()
+	p := filepath.Join(dir, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func read(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+const book = "#h1{Book}\nIntro.\n#include{ch/a.lit}\n#include{ch/b.lit}\n"
+const chA = "#h2{A}\n#a.py{\n```\nprint(\"A\")\n<<<shared>>>\n```\n}\n"
+const chB = "#shared{\n```\nprint(\"B\")\n```\n}\n"
+
+func project(t *testing.T) (dir, src string) {
+	dir = t.TempDir()
+	src = write(t, dir, "book.lit", book)
+	write(t, dir, "ch/a.lit", chA)
+	write(t, dir, "ch/b.lit", chB)
+	return
+}
+
+func TestTangleAcrossChapters(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "out")
+	if rc, _, e := run(t, "", "tangle", src, out); rc != 0 {
+		t.Fatalf("rc=%d %s", rc, e)
+	}
+	if got := read(t, filepath.Join(out, "a.py")); got != "print(\"A\")\nprint(\"B\")\n" {
+		t.Fatalf("a.py = %q", got)
+	}
+}
+
+func TestAddrBothWays(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "out")
+	run(t, "", "tangle", src, out)
+	rc, o, e := run(t, "", "addr", src, "-o", out, filepath.Join(out, "a.py")+":2")
+	if rc != 0 || !strings.Contains(o, "b.lit:3:1") {
+		t.Fatalf("rc=%d out=%q err=%q", rc, o, e)
+	}
+	rc, o, _ = run(t, "", "addr", src, "-o", out, filepath.Join(dir, "ch/b.lit")+":3")
+	if rc != 0 || !strings.Contains(o, "a.py:2") {
+		t.Fatalf("lit->gen: rc=%d out=%q", rc, o)
+	}
+}
+
+func TestAbsorbEditedFile(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "out")
+	run(t, "", "tangle", src, out)
+	write(t, out, "a.py", "print(\"A\")\nprint(\"B2\")\n")
+	if rc, o, e := run(t, "", "absorb", src, "-o", out); rc != 0 {
+		t.Fatalf("rc=%d %s %s", rc, o, e)
+	}
+	if got := read(t, filepath.Join(dir, "ch/b.lit")); !strings.Contains(got, "print(\"B2\")") {
+		t.Fatalf("chapter b not updated: %q", got)
+	}
+}
+
+func TestSyncMergesBothDirections(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "out")
+	run(t, "", "tangle", src, out)
+	// the .lit side changes line 1, the generated file gets a line at the end
+	write(t, dir, "ch/a.lit", strings.Replace(chA, `print("A")`, `print("A2")`, 1))
+	write(t, out, "a.py", "print(\"A\")\nprint(\"B\")\n# edit\n")
+	if rc, o, _ := run(t, "", "sync", src, "status", "-o", out, "--check"); rc != 1 || !strings.Contains(o, "from the .lit") {
+		t.Fatalf("status rc=%d %q", rc, o)
+	}
+	if rc, o, e := run(t, "", "sync", src, "merge", "-o", out); rc != 0 {
+		t.Fatalf("merge rc=%d %s %s", rc, o, e)
+	}
+	if got := read(t, filepath.Join(out, "a.py")); got != "print(\"A2\")\nprint(\"B\")\n# edit\n" {
+		t.Fatalf("a.py = %q", got)
+	}
+	if got := read(t, filepath.Join(dir, "ch/b.lit")); !strings.Contains(got, "# edit") {
+		t.Fatalf("the edit did not reach the chapter: %q", got)
+	}
+	if rc, _, _ := run(t, "", "sync", src, "status", "-o", out, "--check"); rc != 0 {
+		t.Fatal("not in sync after merge")
+	}
+}
+
+func TestSyncConflictNeedsAChoice(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "out")
+	run(t, "", "tangle", src, out)
+	write(t, dir, "ch/a.lit", strings.Replace(chA, `print("A")`, `print("lit")`, 1))
+	write(t, out, "a.py", "print(\"gen\")\nprint(\"B\")\n")
+	if rc, _, _ := run(t, "", "sync", src, "merge", "-o", out); rc != 1 {
+		t.Fatalf("a conflict must leave rc=1, got %d", rc)
+	}
+	if rc, _, e := run(t, "", "sync", src, "merge", "--prefer", "gen", "-o", out); rc != 0 {
+		t.Fatalf("rc=%d %s", rc, e)
+	}
+	if got := read(t, filepath.Join(dir, "ch/a.lit")); !strings.Contains(got, `print("gen")`) {
+		t.Fatalf("gen did not win: %q", got)
+	}
+}
+
+func TestTangleKeepsEditsItWouldReplace(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "out")
+	run(t, "", "tangle", src, out)
+	write(t, out, "a.py", "print(\"mine\")\n")
+	run(t, "", "tangle", src, out)
+	_, o, _ := run(t, "", "sync", src, "log", "-o", out)
+	if !strings.Contains(o, "backup") {
+		t.Fatalf("no backup in the journal:\n%s", o)
+	}
+}
+
+func TestWeaveAndLint(t *testing.T) {
+	dir, src := project(t)
+	out := filepath.Join(dir, "w")
+	if rc, _, e := run(t, "", "weave", src, "-o", out); rc != 0 {
+		t.Fatalf("%d %s", rc, e)
+	}
+	html := read(t, filepath.Join(out, "book.html"))
+	if !strings.Contains(html, "\u00a71") || !strings.Contains(html, "\u00abshared\u00bb") {
+		t.Fatal("html lacks chunk numbers or references")
+	}
+	tex := read(t, filepath.Join(out, "book.tex"))
+	if !strings.Contains(tex, `\begin{Verbatim}`) || strings.Contains(tex, `\PY`) {
+		t.Fatal("tex must be plain verbatim text")
+	}
+	if rc, o, _ := run(t, "", "lint", src); rc != 0 || !strings.Contains(o, "0 error(s)") {
+		t.Fatalf("lint rc=%d %s", rc, o)
+	}
+	write(t, dir, "ch/b.lit", "#shared{\n```\n<<<missing>>>\n```\n}\n")
+	if rc, o, _ := run(t, "", "lint", src); rc != 1 || !strings.Contains(o, "no chunk of that name") {
+		t.Fatalf("lint should fail: rc=%d %s", rc, o)
+	}
+}
+
+func TestFigureFromFileChunk(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "p.lit", "#h1{P}\n#fig.svg{\n```\n<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"4\" height=\"4\"/></svg>\n```\n}\n#img{`fig.svg` A box.}\n")
+	run(t, "", "weave", src, "-o", dir, "--only", "html")
+	h := read(t, filepath.Join(dir, "p.html"))
+	if !strings.Contains(h, "<figure") || !strings.Contains(h, "<rect") || !strings.Contains(h, "A box.") {
+		t.Fatal("figure missing from html")
+	}
+}
+
+func TestInstallSkillRoundTrip(t *testing.T) {
+	dest := t.TempDir()
+	if rc, _, e := run(t, "", "install-skill", "--dest", dest); rc != 0 {
+		t.Fatalf("%d %s", rc, e)
+	}
+	if _, err := os.Stat(filepath.Join(dest, "brashtag-literate", "SKILL.md")); err != nil {
+		t.Fatal("SKILL.md not installed")
+	}
+	if rc, _, _ := run(t, "", "uninstall-skill", "--dest", dest); rc != 0 {
+		t.Fatal("uninstall-skill failed")
+	}
+	if _, err := os.Stat(filepath.Join(dest, "brashtag-literate")); err == nil {
+		t.Fatal("skill still there")
+	}
+	// a directory not put there by lit is left alone
+	write(t, dest, "brashtag-literate/x", "mine")
+	if rc, _, _ := run(t, "", "uninstall-skill", "--dest", dest); rc == 0 {
+		t.Fatal("removed a directory it did not create")
+	}
+}
+
+// ---- agent hints
+
+const hinted = `#h1{Counter}
+Counts things.
+
+#main.go{
+` + "```" + `
+package main
+
+import "fmt"
+
+func main() {
+	total := 0
+	<<<sum>>>
+	fmt.Println(total)
+}
+` + "```" + `
+}
+
+#sum{
+Add the numbers one to ten.
+#agent-fill-in{ loop i from 1 to 10 adding i to total }
+}
+`
+
+func TestHintsAreNotTangled(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	rc, _, e := run(t, "", "tangle", src, filepath.Join(dir, "o"), "--no-map")
+	if rc != 0 || !strings.Contains(e, "unfilled") {
+		t.Fatalf("rc=%d err=%q", rc, e)
+	}
+	if strings.Contains(read(t, filepath.Join(dir, "o", "main.go")), "\x00") {
+		t.Fatal("a hole marker leaked into the output")
+	}
+}
+
+func TestFillListAndContext(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	_, o, _ := run(t, "", "fill", src, "--list")
+	if !strings.Contains(o, "loop i from 1 to 10") {
+		t.Fatalf("list: %q", o)
+	}
+	_, o, _ = run(t, "", "fill", src, "--dry-run")
+	for _, want := range []string{"Counter", "Add the numbers one to ten", "\u27e6 FILL IN HERE", "fmt.Println(total)", "Ends up in: main.go", "<<<sum>>>"} {
+		if !strings.Contains(o, want) {
+			t.Errorf("the prompt lacks %q:\n%s", want, o)
+		}
+	}
+}
+
+func TestFillWritesCodeAndRecordsIt(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	var seen []string
+	AgentOverride = AgentFunc(func(system, prompt string) (string, error) {
+		seen = append(seen, prompt)
+		return "Here you go:\n```go\nfor i := 1; i <= 10; i++ {\n\ttotal += i\n}\n```\n", nil
+	})
+	defer func() { AgentOverride = nil }()
+	rc, o, e := run(t, "", "fill", src)
+	if rc != 0 {
+		t.Fatalf("rc=%d %s %s", rc, o, e)
+	}
+	out := filepath.Join(dir, "o")
+	run(t, "", "tangle", src, out, "--no-map")
+	if got := read(t, filepath.Join(out, "main.go")); !strings.Contains(got, "\t\ttotal += i") {
+		t.Fatalf("the filled code is missing or mis-indented:\n%s", got)
+	}
+	if strings.Contains(read(t, src), "agent-fill-in") {
+		t.Fatal("the hint is still in the source")
+	}
+	if !strings.Contains(read(t, src), "loop i from 1 to 10 adding i to total") {
+		t.Fatal("the hint's words were not kept as prose")
+	}
+	rc, o, _ = run(t, "", "review", src)
+	if rc != 0 || !strings.Contains(o, "as written") {
+		t.Fatalf("review rc=%d\n%s", rc, o)
+	}
+	if rc, _, _ := run(t, "", "review", src, "--approve-all"); rc != 0 {
+		t.Fatal("approve failed")
+	}
+	if _, o, _ := run(t, "", "review", src); !strings.Contains(o, "no fills to review") {
+		t.Fatalf("approved fills should not be listed:\n%s", o)
+	}
+}
+
+func TestFillRetriesWithTheError(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	calls := 0
+	var second string
+	AgentOverride = AgentFunc(func(system, prompt string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "```\nfor i := 1; i <= 10; i++ {\n\ttotal += i\n```", nil // unbalanced braces: a syntax error in the Go file
+		}
+		second = prompt
+		return "```\nfor i := 1; i <= 10; i++ {\n\ttotal += i\n}\n```", nil
+	})
+	defer func() { AgentOverride = nil }()
+	if rc, o, e := run(t, "", "fill", src); rc != 0 {
+		t.Fatalf("rc=%d %s %s", rc, o, e)
+	}
+	if calls != 2 || !strings.Contains(second, "rejected") || !strings.Contains(second, "syntax error") {
+		t.Fatalf("calls=%d; the second prompt did not carry the error:\n%s", calls, second)
+	}
+}
+
+func TestFillGivesUpAndLeavesTheHint(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	AgentOverride = AgentFunc(func(system, prompt string) (string, error) { return "```\nfor {\n```", nil })
+	defer func() { AgentOverride = nil }()
+	rc, _, _ := run(t, "", "fill", src)
+	if rc != 1 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if got := read(t, src); got != hinted {
+		t.Fatal("a failed fill changed the source")
+	}
+}
+
+func TestFillCannot(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	AgentOverride = AgentFunc(func(system, prompt string) (string, error) { return "CANNOT: the hint does not say what to add", nil })
+	defer func() { AgentOverride = nil }()
+	rc, _, e := run(t, "", "fill", src)
+	if rc != 1 || !strings.Contains(e, "the hint does not say") {
+		t.Fatalf("rc=%d %q", rc, e)
+	}
+}
+
+func TestFillCheckCommandAndReviewReject(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	AgentOverride = AgentFunc(func(system, prompt string) (string, error) {
+		return "```\nfor i := 1; i <= 10; i++ {\n\ttotal += i\n}\n```", nil
+	})
+	defer func() { AgentOverride = nil }()
+	if rc, _, _ := run(t, "", "fill", src, "--check", "grep -q total main.go"); rc != 0 {
+		t.Fatal("fill with a passing check failed")
+	}
+	if rc, _, _ := run(t, "", "review", src, "--check", "false"); rc != 1 {
+		t.Fatal("a failing check must fail the review")
+	}
+	fills, _ := LoadFills(mustSource(t, src))
+	if len(fills) != 1 {
+		t.Fatalf("%d fills", len(fills))
+	}
+	if rc, _, e := run(t, "", "review", src, "--reject", fills[0].ID); rc != 0 {
+		t.Fatalf("reject: %d %s", rc, e)
+	}
+	if got := read(t, src); !strings.Contains(got, "#agent-fill-in{ loop i from 1 to 10 adding i to total }") {
+		t.Fatalf("the hint did not come back:\n%s", got)
+	}
+}
+
+func TestReviewAIVerdict(t *testing.T) {
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	AgentOverride = AgentFunc(func(system, prompt string) (string, error) {
+		if strings.Contains(system, "review code") {
+			return "VERDICT: reject\n- sums 1..9", nil
+		}
+		return "```\nfor i := 1; i <= 10; i++ {\n\ttotal += i\n}\n```", nil
+	})
+	defer func() { AgentOverride = nil }()
+	run(t, "", "fill", src)
+	rc, o, _ := run(t, "", "review", src, "--ai")
+	if rc != 1 || !strings.Contains(o, "sums 1..9") {
+		t.Fatalf("rc=%d\n%s", rc, o)
+	}
+}
+
+func mustSource(t *testing.T, path string) *Source {
+	t.Helper()
+	s, err := ReadSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestPlaceholdersAreFlagged(t *testing.T) {
+	fs := CheckFillCode([]string{"// TODO later", "x := 1"}, "")
+	if len(fs) == 0 || fs[0].Level != "warn" {
+		t.Fatalf("%v", fs)
+	}
+	if !hasError(CheckFillCode([]string{"  "}, "")) {
+		t.Fatal("empty code must be an error")
+	}
+}
+
+func TestExtractCode(t *testing.T) {
+	cases := []struct{ in, want, cannot string }{
+		{"```go\na\nb\n```", "a\nb", ""},
+		{"text\n````\nx ``` y\n````\nmore", "x ``` y", ""},
+		{"just code", "just code", ""},
+		{"CANNOT: no idea", "", "no idea"},
+	}
+	for _, c := range cases {
+		code, cannot, err := ExtractCode(c.in)
+		if err != nil || strings.Join(code, "\n") != c.want || cannot != c.cannot {
+			t.Errorf("%q -> %q %q %v", c.in, code, cannot, err)
+		}
+	}
+	if _, _, err := ExtractCode("```\nnever closed"); err == nil {
+		t.Error("an unclosed fence must be an error")
+	}
+}
+
+func TestInsertionUsesALongerFence(t *testing.T) {
+	site := HintSite{Start: 0, End: 5, Raw: ""}
+	got := Insertion("#x{ }", site, []string{"a ``` b"}, true)
+	if !strings.HasPrefix(got, "````\n") {
+		t.Fatalf("%q", got)
+	}
+}
+
+func TestAPIAgent(t *testing.T) {
+	var gotKey, gotVersion string
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey, gotVersion = r.Header.Get("x-api-key"), r.Header.Get("anthropic-version")
+		json.NewDecoder(r.Body).Decode(&body)
+		fmt.Fprint(w, "{\"content\":[{\"type\":\"text\",\"text\":\"```\\nx := 1\\n```\"}]}")
+	}))
+	defer srv.Close()
+	t.Setenv("ANTHROPIC_API_KEY", "k123")
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	a, err := NewAgent("anthropic:some-model", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := a.Ask(t.Context(), "sys", "prompt")
+	if err != nil || !strings.Contains(reply, "x := 1") {
+		t.Fatalf("%q %v", reply, err)
+	}
+	if gotKey != "k123" || gotVersion == "" || body["model"] != "some-model" || body["system"] != "sys" {
+		t.Fatalf("request: key=%q version=%q body=%v", gotKey, gotVersion, body)
+	}
+}
+
+func TestNoAgentIsAnError(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("LIT_AGENT", "")
+	dir := t.TempDir()
+	src := write(t, dir, "c.lit", hinted)
+	rc, _, e := run(t, "", "fill", src)
+	if rc != 2 || !strings.Contains(e, "no agent") {
+		t.Fatalf("rc=%d %q", rc, e)
+	}
+}
+
+func TestCommandAgent(t *testing.T) {
+	a := CommandAgent{Cmd: "cat"}
+	got, err := a.Ask(t.Context(), "S", "P")
+	if err != nil || !strings.Contains(got, "S") || !strings.Contains(got, "P") {
+		t.Fatalf("%q %v", got, err)
+	}
+	if _, err := (CommandAgent{Cmd: "exit 3"}).Ask(t.Context(), "", ""); err == nil {
+		t.Fatal("a failing command must be an error")
+	}
+}

@@ -1,0 +1,249 @@
+<header class="top wrap">
+  <a class="mark" href="#top" id="top"><b>#</b>brashtag<b>{</b>literate<b>}</b></a>
+  <nav aria-label="Sections"><a href="#understand">Why</a><a href="#agents">Gaps</a><a href="#notation">Notation</a><a href="#chapters">Chapters</a><a href="#scenario">Sync lab</a><a href="#tutorial">Tutorial</a><a href="#install">Install</a></nav>
+  <button class="lamp" id="lamp" aria-label="Switch the lamp: light or dark" title="Light or dark">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/></svg>
+  </button>
+</header>
+
+<main class="wrap">
+  <section class="hero">
+    <span class="label">Brashtag · a notation for trees · a literate programming toolkit</span>
+    <h1>Write the story. The <em>code</em> falls out.</h1>
+    <p class="lede">Brashtag is a very small notation for writing trees: you surround text with hints that programs can use later. This page shows one thing built on it, literate programming, and the tools around it. You keep one document that explains the program, while your team goes on editing the code the ordinary way, in any editor. Everything is one program, <code>lit</code>: a single binary with nothing to install around it.</p>
+    <div class="install">
+      <div class="cmd"><code>lit install-skill</code><button class="btn" data-copy="lit install-skill">Copy</button></div>
+      <a class="btn primary" href="#tutorial" style="text-decoration:none;padding:.5rem 1rem">Follow the tutorial</a><a class="btn" href="#notation" style="text-decoration:none;padding:.5rem 1rem">See the notation</a>
+    </div>
+    <p class="small-note">Everything on this page runs in your browser, on the JavaScript build of the brashtag parser. The editors are live: what they print follows the same rules as the <code>lit</code> binary.</p>
+  </section>
+
+  <section class="block" id="new">
+    <div class="intro">
+      <h2>What the tools add</h2>
+      <p>Literate programming has a known weak spot: the moment someone edits the generated code, the document is out of date. These pieces are about that moment.</p>
+    </div>
+    <div class="feats">
+      <div class="feat"><h3>Your own literate fork</h3><p>Nobody has to agree on a narrative. With an assistant, anyone can turn a codebase into their own literate version, written the way they want to read it, and customise it as they like. The one thing that is shared is the tangled output: the code.</p><a href="#understand">How it works</a></div>
+      <div class="feat"><h3>Gaps for an assistant</h3><p>Leave <code>#agent-fill-in{what this must do}</code> inside a chunk. <code>lit fill</code> gathers the context from the whole document, asks an assistant for the code, checks it and writes it in. <code>lit review</code> checks it again.</p><a href="#agents">See a run</a></div>
+      <div class="feat"><h3>Not everyone has to be literate</h3><p>Be the literate programmer while your team works on the code in the traditional way: absorb. Their edits to a generated file are folded back into your document, into the right chunk, with the right indentation.</p><a href="#scenario">Try it in the lab</a></div>
+      <div class="feat"><h3>Sync</h3><p>Edit the document and the code on the same day. A three-way merge against the last agreed state brings every separate change across, both ways, and asks you only about real conflicts. Nothing is lost; replaced edits are kept.</p><a href="#scenario">Try it in the lab</a></div>
+      <div class="feat"><h3>Sourcemaps</h3><p>Tangle records where every generated line came from. Ask in either direction: this line of <code>app.py</code>, which line of the document wrote it? This line of the document, where does it end up? Absorb and sync are built on the same map.</p><a href="#try">Hover a line</a></div>
+      <div class="feat"><h3>A notation that goes further</h3><p>Brashtag is small enough to learn in a minute and powerful enough to write tools with. Literate programming is one use. The same trees drive flashcards, HTML pages and diagrams.</p><a href="#notation">See the notation</a></div>
+      <div class="feat"><h3>Any editor</h3><p>A document is plain text and the tools are one command-line program, so there is no plugin to install and no editor to switch to. Addresses come out as path, line and column, the form editors and grep already read.</p><a href="#tools">See the tools</a></div>
+    </div>
+  </section>
+
+  <section class="block" id="understand">
+    <div class="intro">
+      <h2>Get the understanding back</h2>
+      <p>Agents write code faster than people read it, and old code outlives the people who understood it. Either way you end up owning a program you can run but cannot explain. Claude can read a codebase and write the explanation down, so make the explanation the program. This works on legacy code too: the tutorial below starts from a script with no comments worth the name.</p>
+      <p>It also means you do not have to adopt anyone else's explanation. A literate version is a <b>fork</b> that costs one prompt: you can have your own, in your own order and your own words, and a colleague can have a different one of the same code. Because tangling is a function of the document, every fork produces the same files, so the tangled output is the only thing that has to be agreed upon. And nobody is obliged to work in the document at all: a teammate who edits the generated code is folded in by absorb.</p>
+    </div>
+    <ol class="flow">
+      <li><h3>Install the skill</h3><p>The binary carries the skill inside it; one command puts it where Claude looks.</p><div class="cmd"><code>lit install-skill</code><button class="btn" data-copy="lit install-skill">Copy</button></div></li>
+      <li><h3>Ask Claude to literate it</h3><p>Point it at a file, a module or a whole codebase. It reads the code, plans a narrative, and cuts the code into named chunks without changing a line.</p></li>
+      <li><h3>Read it, and check it</h3><p>Weave gives you a page to read in the order that teaches the code. Tangle writes the code back, and a diff against the original comes out empty. The explanation is Claude's reading, so review it as you would a pull request. Where the code does not say why, the document lists an open question.</p></li>
+      <li><h3>Work in it</h3><p>Edit the document. Teammates and agents can keep editing the code the usual way. Absorb and sync carry changes across, so the document stays true.</p></li>
+    </ol>
+    <div class="prompt">
+      <span class="label">A prompt that works</span>
+      <p id="promptText">Use the brashtag-literate skill. Turn invoice.py into invoice.lit. Keep every line of code exactly as it is, explain what each part does and why, and list anything you could not tell from the code as an open question. Do not change behaviour.</p>
+      <button class="btn" data-copy="Use the brashtag-literate skill. Turn invoice.py into invoice.lit. Keep every line of code exactly as it is, explain what each part does and why, and list anything you could not tell from the code as an open question. Do not change behaviour.">Copy</button>
+    </div>
+  </section>
+
+  <section class="block" id="notation">
+    <div class="intro">
+      <h2>Brashtag: a tree in plain text</h2>
+      <p>There are three kinds of node. A <b>blob</b> holds text. A <b>bag</b> holds blobs, codes and other bags, and can be tagged. A <b>code</b> holds text too, but is shielded: anything between its ticks is taken literally. Edit the text below and watch the tree it makes.</p>
+    </div>
+    <div class="kinds">
+      <div class="kind-card"><span class="nk blob">blob</span><p>Plain text. Any text except <code>#</code>, <code>{</code>, <code>}</code> and the tick character.</p></div>
+      <div class="kind-card"><span class="nk bag">bag</span><p>A hash, a tag, braces, and whatever is inside: <code>#card{ ... }</code>. Bags nest.</p></div>
+      <div class="kind-card"><span class="nk code">code</span><p>Text between runs of ticks, for anything that would otherwise be read as notation. Use more ticks than the longest run inside. Three is usually enough, but one or two or ten are all valid.</p></div>
+    </div>
+    <div class="chips" id="treeChips" role="group" aria-label="Tree examples"></div>
+    <div class="panes">
+      <div class="pane">
+        <div class="pane-head"><span>any text</span><span class="sp" id="treeStatus"></span></div>
+        <textarea id="treeSrc" class="plain" spellcheck="false" wrap="off" aria-label="Brashtag text"></textarea>
+      </div>
+      <div class="pane">
+        <div class="pane-head"><span>the tree</span></div>
+        <div class="outbody" id="treeOut" style="height:18rem"></div>
+      </div>
+    </div>
+    <p class="small-note" style="margin-top:.9rem">The parser is the one in the <a href="https://github.com/PratikDeoghare/brashtag">brashtag repository</a>; this page runs its JavaScript build. Programs written on it include a Markdown-like converter to HTML, a flashcard program and a tree-to-Graphviz tool. The repository also has an Emacs mode.</p>
+  </section>
+
+  <section class="block" id="try">
+    <div class="intro">
+      <h2>Literate programming on top</h2>
+      <p>Now give the nodes meaning. In this toolkit a bag is a chunk of the program, a code node is program text, and a reference line pastes one chunk into another. Left is a <code>.lit</code> file. Right is what tangle writes. Hover a generated line and the line that produced it lights up in the document. Put your cursor in the document and its output lights up on the right. That two-way map is the sourcemap behind <code>addr.py</code> and <code>absorb.py</code>.</p>
+    </div>
+    <div class="chips" id="presets" role="group" aria-label="Examples"></div>
+    <div class="panes">
+      <div class="pane">
+        <div class="pane-head"><span id="srcName">merge_sort.lit</span><span class="sp" id="srcStatus"></span></div>
+        <div class="ed" id="ed">
+          <div class="gut"><div class="gut-in" id="gut"></div></div>
+          <div class="hl"><div class="hl-in" id="hl"></div></div>
+          <textarea id="src" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="Literate source"></textarea>
+        </div>
+        <div class="legend"><span><i class="c"></i>code node</span><span><i class="r"></i>reference</span><span><i class="h"></i>traced line</span></div>
+      </div>
+      <div class="pane">
+        <div class="tabs" role="tablist" id="tabs">
+          <button class="tab" role="tab" aria-selected="true" data-tab="tangled">Tangled</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="chunks">Chunks</button>
+          <button class="tab" role="tab" aria-selected="false" data-tab="woven">Woven</button>
+        </div>
+        <div class="outbody" id="out-tangled"></div>
+        <div class="outbody" id="out-chunks" hidden></div>
+        <div class="outbody woven" id="out-woven" hidden></div>
+      </div>
+    </div>
+    <div class="trace" id="trace" aria-live="polite"></div>
+  </section>
+
+  <section class="block" id="conventions">
+    <div class="intro">
+      <h2>Seven conventions for programs</h2>
+      <p>Brashtag only says what a tree looks like. These conventions are what the literate tools do with it. Press a button to load an example into the editor above.</p>
+    </div>
+    <div class="rules" id="rules"></div>
+    <div class="gotcha">
+      <h3>Four characters to keep out of blobs and tags</h3>
+      <ul>
+        <li>A <code>#</code>, <code>{</code>, <code>}</code> or tick in running text is read as notation. Put it in a code node.</li>
+        <li>Tangle reads the whole file as one document, so a stray brace on line 3 can hide an error on line 300. The message names the line it noticed.</li>
+        <li>Want to see one? <button class="btn" data-load="oops.lit">Load a broken document</button></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block" id="chapters">
+    <div class="intro">
+      <h2>Big programs: chapters</h2>
+      <p>A literate program can be spread over many files. <code>#include{pricing.lit}</code> in one file is replaced by the text of that file, so a large codebase can have a chapter for each module or subsystem, and the root file reads as the introduction. The tools are given the root and see one document: chunk names stay global, so one chapter can use a chunk written in another.</p>
+    </div>
+    <div>
+      [[code:shop/shop.lit:shop.lit (the root)]]
+      [[code:shop/pricing.lit:pricing.lit]]
+      [[code:shop/report.lit:report.lit]]
+    </div>
+    <p>Here is that project through the tools. Every message and every address names the chapter file and the line in it, and absorb writes only the chapter that changed. It does not touch the prose, which still says 12: after absorbing, the author reads the diff and fixes the sentence.</p>
+    [[term:t8:lit tangle shop.lit .]]
+    [[term:t8:lit addr shop.lit shop.py:3]]
+    [[term:t8:lit addr shop.lit report.lit:8]]
+    [[term:t8:lit absorb shop.lit]]
+    <div class="gotcha">
+      <h3>Rules for chapters</h3>
+      <ul>
+        <li>Each chapter must be balanced on its own: every <code>#tag{</code> is closed in the same file.</li>
+        <li>A file may be included once, and cycles are refused. A missing file is an error naming the file and the line of the directive.</li>
+        <li>In the woven page the first <code>h1</code> is the title and later ones are chapters. Weave and lint treat the whole as one document.</li>
+        <li>The live editors on this page read a single text, so they do not follow includes. The run above is real output of the <code>lit</code> binary.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block" id="scenario">
+    <div class="intro">
+      <h2>The sync lab</h2>
+      <p>You keep the literate document. A teammate opens <code>tip.py</code> in their editor and fixes a line, without knowing the document exists. Meanwhile you changed the document. Used to be, whichever tool you ran first decided whose edit survived. Make edits on both sides with the buttons, or type your own, then use the tools.</p>
+    </div>
+    <div class="lab">
+      <div class="lab-grid">
+        <div class="pane"><div class="pane-head"><span>tip.lit</span><span class="tag" id="litState">in sync</span></div><textarea id="labLit" spellcheck="false" wrap="off" aria-label="Document"></textarea></div>
+        <div class="pane"><div class="pane-head"><span>tip.py</span><span class="tag" id="genState">in sync</span></div><textarea id="labGen" spellcheck="false" wrap="off" aria-label="Generated file"></textarea></div>
+      </div>
+      <div class="actions edits" id="edits"><span class="label">Make an edit</span></div>
+      <div class="actions">
+        <button class="btn primary" id="bMerge" title="lit sync merge">Merge both ways</button>
+        <button class="btn" id="bTangle" title="lit tangle">Tangle</button>
+        <button class="btn" id="bAbsorb" title="lit absorb">Absorb</button>
+        <span class="sep"></span>
+        <button class="btn" id="bReset">Start over</button>
+      </div>
+      <div class="lab-out">
+        <div class="panel"><h3>Waiting to be reconciled</h3><div id="pending"></div></div>
+        <div class="panel"><h3>What happened</h3><ul class="log" id="log"></ul><div class="backups" id="backups"></div></div>
+      </div>
+      <p class="small-note" style="margin-top:1rem"><b>Tangle</b> rewrites the file from the document and keeps a copy of any edit it replaces. <b>Absorb</b> folds file edits into the document, and refuses if the document changed too. <b>Merge</b> compares both sides with what they were at the last sync, brings every separate change across in both directions, and asks you about the rest.</p>
+    </div>
+  </section>
+
+  <section class="block" id="agents">
+    <div class="intro">
+      <h2>Leave gaps for an assistant</h2>
+      <p>Sometimes you know what a chunk must do and have not written it. Say so in the document: put a bag inside the chunk, <code>#agent-fill-in{what the code must do}</code>. Tangle ignores it, so the program still builds around the gap. <code>lit fill</code> then does what you would do before writing the code: it reads the section's prose, the headings above it, the chunks that use this one up to the files, the chunks it uses, the other gaps, and the generated file around the hole. It sends that to an assistant, checks what comes back, and writes it into the document.</p>
+    </div>
+    <div class="two">
+      <div class="panel">
+        <h3>The document, with two gaps</h3>
+        [[code:words.lit:words.lit]]
+      </div>
+      <div class="panel">
+        <h3>What the assistant is given</h3>
+        <p>Each gap becomes a prompt of ten sections, general first and specific last. When the document is large, the distant ones are trimmed first and the task and the chunk never are. Look at one without calling anybody:</p>
+        [[term:t9:lit fill words.lit --list]]
+        [[term:t9:lit fill words.lit --dry-run --show-context]]
+      </div>
+    </div>
+    <p>The assistant is anything that reads a prompt on standard input and prints a reply, or the Anthropic API when <code>ANTHROPIC_API_KEY</code> is set. In the run below it is a canned shell script, so that the example is reproducible; a model takes its place with <code>--agent anthropic</code> or <code>--agent 'claude -p'</code>. Each answer is checked before it is written: the whole program must still parse and tangle, generated Go and JSON files must be valid, and a reply with <code>TODO</code> in it is not an answer. A check of your own, such as <code>go vet</code>, runs on the tangled program in a scratch directory once the last gap is filled, and a failure goes back to the assistant with its error.</p>
+    [[term:t9:lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go']]
+    <p>The code is in the document now, with your words kept as prose above it, and every fill is recorded beside it. Review is for the person who comes back later. It checks again, optionally asks a second assistant, and lets you approve each fill, or reject it, which puts your original gap back.</p>
+    [[term:t9:lit review words.lit --ai --agent 'sh review.sh']]
+    [[term:t9:lit review words.lit --approve-all]]
+    [[term:t9:lit tangle words.lit .]]
+    [[term:t9:go run main.go < sample.txt]]
+    <div class="gotcha">
+      <h3>What this does and does not do</h3>
+      <ul>
+        <li>The assistant writes code for a gap. It never edits your prose, and it never touches code outside the gap.</li>
+        <li>A fill is not trusted because it passed checks. <code>lit review</code> exists so that a person looks at each one, and the second opinion is a model, which can be wrong.</li>
+        <li>The scripts in this demo are fakes. Against a real model the code, and the number of retries, will differ.</li>
+      </ul>
+    </div>
+  </section>
+
+[[TUTORIAL]]
+[[INSTALL]]
+  <section class="block" id="tools">
+    <div class="intro">
+      <h2>The toolbelt</h2>
+      <p>Each tool is a subcommand of one Go binary, <code>lit</code>, built from the standard library and the brashtag parser and nothing else. The skill that teaches an assistant the notation is inside the binary too, and it carries the same tools a second time as Python scripts that need only Python's standard library, so an assistant with just the skill folder can write literate programs and run every tool, including fill and review, with <code>python3</code>.</p>
+    </div>
+    [[svg:../internal/skill/files/docs/tools.svg|How the tools move text between the document, the generated files and the woven page.]]
+    <div class="tools" id="toolgrid"></div>
+  </section>
+
+  <section class="block" id="itself">
+    <div class="intro">
+      <h2>It tangles itself</h2>
+      <p>The tools are themselves a literate program, split into thirty-one files: a root and a chapter for each tool or subsystem, ordered by importance, with the plain details in an appendix at the end. Tangling it writes every Go source, the skill's files, the tests, the build script and this page: the page you are reading is one of the chapters. The build vets and tests the Go program, then tangles the document a second time with the binary it just built. The two outputs must be identical. Last, the build runs the tests of the Python scripts and checks that they tangle the document to the same files as the binary.</p>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>__CHUNKS__</b><span>chunks</span></div>
+      <div class="stat"><b>__CODE__</b><span>lines of code</span></div>
+      <div class="stat"><b>__PROSE__</b><span>words of prose</span></div>
+      <div class="stat"><b>29</b><span>files, one root and twenty-eight chapters</span></div>
+    </div>
+    <div class="build" aria-label="Output of build.sh"><span class="m">$</span> sh build.sh
+<span class="m">== tangle</span>
+<span class="m">== vet and test</span> <span class="g">go vet clean, go test ok</span>
+<span class="m">== build</span>        bin/lit, bin/mkpage
+<span class="m">== fixed point</span>  <span class="g">identical</span>
+<span class="m">== lint</span>         __LINT__
+<span class="m">== weave</span>        lit.html, lit.tex
+<span class="m">== page</span>        <span class="g">15 JavaScript checks passed</span></div>
+    <p class="small-note">Counts are from the linter run on the root and its chapters.</p>
+  </section>
+</main>
+
+<footer><div class="wrap">
+  <span>Notation and parser: <a href="https://github.com/PratikDeoghare/brashtag">brashtag</a> by Pratik Deoghare, MIT license.</span>
+  <span>Ideas: Knuth, <i>Literate Programming</i>, 1984; Ramsey, <i>Literate Programming Simplified</i>, 1994.</span>
+</div></footer>

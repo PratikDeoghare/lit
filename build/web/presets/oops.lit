@@ -1,0 +1,10 @@
+#h1{A document that does not parse}
+
+Prose may not contain a stray } like this one, nor a bare hash or an opening brace. Delete the
+brace in the line above and the document comes back. Inside backticks they are fine: `} # {`.
+
+#oops.txt{
+  ```
+  still fine in here
+  ```
+}

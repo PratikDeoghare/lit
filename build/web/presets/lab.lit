@@ -1,0 +1,24 @@
+#h1{Splitting a bill}
+
+Divide the total by the number of people, after adding the tip.
+
+#split{
+  ```
+  def split(total, people, tip=0.15):
+      <<<add the tip>>>
+      return round(total / people, 2)
+  ```
+  #add the tip{
+    ```
+    total = total * (1 + tip)
+    ```
+  }
+}
+
+#tip.py{
+  ```
+  <<<split>>>
+
+  print(split(84.0, 4))
+  ```
+}

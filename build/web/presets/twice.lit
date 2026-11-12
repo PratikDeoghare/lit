@@ -1,0 +1,45 @@
+#h1{Imports, explained where they matter}
+
+Chunks with the same name are joined in document order. A program can introduce each import
+next to the code that needs it, and tangle collects them at the top.
+
+#imports{
+  We need `json` to read the settings.
+  ```
+  import json
+  ```
+}
+
+#load settings{
+  ```
+  def load(path):
+      with open(path) as f:
+          return json.load(f)
+  ```
+}
+
+#imports{
+  Later, `time` is needed to stamp the log.
+  ```
+  import time
+  ```
+}
+
+#stamp{
+  ```
+  def stamp(msg):
+      return f"{time.strftime('%H:%M')} {msg}"
+  ```
+}
+
+#app.py{
+  ```
+  <<<imports>>>
+
+
+  <<<load settings>>>
+
+
+  <<<stamp>>>
+  ```
+}

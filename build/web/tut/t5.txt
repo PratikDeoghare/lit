@@ -1,0 +1,27 @@
+$ lit sync invoice.lit restore invoice.py --list
+19:35:20  backup    4171669d  before sync
+19:35:20  backup    ab79045c  before sync
+[exit 0]
+
+$ lit sync invoice.lit log -n 6
+2026-11-09 19:35:20  sync      lit  invoice.lit                  -  invoice.py
+2026-11-09 19:35:20  base      lit  invoice.lit                  1ada16f0  sync
+2026-11-09 19:35:20  sync      lit  invoice.lit                  -  
+2026-11-09 19:35:20  backup    gen  invoice.py                   ab79045c  before sync
+2026-11-09 19:35:20  base      lit  invoice.lit                  1ada16f0  sync
+2026-11-09 19:35:20  sync      lit  invoice.lit                  -  invoice.py
+[exit 0]
+
+# (the teammate edits invoice.py again, and you run tangle before syncing)
+
+$ lit tangle invoice.lit .
+wrote invoice.py
+wrote invoice.lit.map
+warning: invoice.py had edits that are not in the .lit; tangle replaced them, but a copy is kept (snapshot ba30967a; see lit sync invoice.lit log / restore)
+[exit 0]
+
+$ lit sync invoice.lit restore invoice.py --list
+19:35:20  backup    4171669d  before sync
+19:35:20  backup    ab79045c  before sync
+19:35:21  backup    ba30967a  replaced by tangle
+[exit 0]

@@ -1,0 +1,39 @@
+$ lit sync invoice.lit pick
+
+== invoice.py  region 1/2  (base lines 18-18)  made in the .lit; the generated file does not have it
+     15 | def invoice(items, region="TX"):
+     16 |     if not items:
+     17 |         raise ValueError("no items")
+ -     |     sub = 0
+ +     |     sub = 0.0
+     19 |     lines = []
+     20 |     for name, qty, unit in items:
+     21 |         p = price_for(qty, unit)
+apply to the generated file? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
+== invoice.py  region 2/2  (base lines 33-33)  made in the generated file; the .lit does not have it
+     30 | def render(lines, sub, tax, total):
+     31 |     out = []
+     32 |     for name, qty, p, amt in lines:
+ -     |         out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+ +     |         out.append("%-14s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+     34 |     out.append("%-12s %29.2f" % ("subtotal", sub))
+     35 |     out.append("%-12s %29.2f" % ("tax", tax))
+     36 |     out.append("%-12s %29.2f" % ("TOTAL", total))
+apply to the .lit? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
+the .lit would not change
+generated files rewritten: invoice.py
+left pending: 1 region(s)
+
+Write these changes? [y/n] > 
+synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).
+[exit 0]
+
+$ lit sync invoice.lit status
+  invoice.py                   1 edited in the file
+
+1 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
+[exit 0]
+
+$ lit uninstall-skill
+removed /tmp/rec/home/.claude/skills/brashtag-literate
+[exit 0]

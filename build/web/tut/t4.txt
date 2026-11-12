@@ -1,0 +1,64 @@
+# (you set TAX = 0.0925 in the .lit; the teammate sets TAX = 0.09 in invoice.py)
+
+$ lit sync invoice.lit merge
+
+the .lit would not change
+generated files rewritten: none
+left pending: 1 region(s)
+
+synced. .lit unchanged; wrote: no generated files. Previous versions are kept (see `log`).
+1 conflict(s) left pending; resolve with `pick` or `merge --prefer ...`
+[exit 1]
+
+$ lit sync invoice.lit merge --prefer lit
+
+the .lit would not change
+generated files rewritten: invoice.py
+
+synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).
+[exit 0]
+
+$ cat invoice.py
+import sys
+
+TAX = 0.0925
+
+
+def price_for(qty, unit):
+    # volume pricing
+    if qty >= 100:
+        unit = unit * 0.85
+    elif qty >= 12:
+        unit = unit * 0.95
+    return unit
+
+
+def invoice(items, region="TX"):
+    if not items:
+        raise ValueError("no items")
+    sub = 0
+    lines = []
+    for name, qty, unit in items:
+        p = price_for(qty, unit)
+        amt = round(p * qty, 2)
+        lines.append((name, qty, p, amt))
+        sub += amt
+    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+    total = round(sub + tax, 2)
+    return lines, sub, tax, total
+
+
+def render(lines, sub, tax, total):
+    out = []
+    for name, qty, p, amt in lines:
+        out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+    out.append("%-12s %29.2f" % ("subtotal", sub))
+    out.append("%-12s %29.2f" % ("tax", tax))
+    out.append("%-12s %29.2f" % ("TOTAL", total))
+    return "\n".join(out)
+
+
+if __name__ == "__main__":
+    items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+    print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
+[exit 0]

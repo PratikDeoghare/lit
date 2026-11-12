@@ -1,0 +1,67 @@
+$ lit addr invoice.lit invoice.lit:66
+invoice.py:23:5  «tax and total»
+[exit 0]
+
+# (a teammate edits invoice.py in their editor: threshold 10 -> 12, plus an empty-list guard)
+
+$ diff ../invoice.orig.py invoice.py
+10c10
+<     elif qty >= 10:
+---
+>     elif qty >= 12:
+15a16,17
+>     if not items:
+>         raise ValueError("no items")
+[exit 1]
+
+$ lit absorb invoice.lit --dry-run
+  invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
+  invoice.py:15+  2 line(s) added
+--- a/invoice.lit
++++ b/invoice.lit
+@@ -30,3 +30,3 @@
+         unit = unit * 0.85
+-    elif qty >= 10:
++    elif qty >= 12:
+         unit = unit * 0.95
+@@ -48,2 +48,4 @@
+   def invoice(items, region="TX"):
++      if not items:
++          raise ValueError("no items")
+       sub = 0
+
+(dry run: nothing written)
+[exit 0]
+
+$ lit absorb invoice.lit
+  invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
+  invoice.py:15+  2 line(s) added
+--- a/invoice.lit
++++ b/invoice.lit
+@@ -30,3 +30,3 @@
+         unit = unit * 0.85
+-    elif qty >= 10:
++    elif qty >= 12:
+         unit = unit * 0.95
+@@ -48,2 +48,4 @@
+   def invoice(items, region="TX"):
++      if not items:
++          raise ValueError("no items")
+       sub = 0
+
+absorbed edits from 1 file(s) into invoice.lit; sourcemap refreshed
+[exit 0]
+
+$ diff ../invoice.before-absorb.lit invoice.lit
+31c31
+<     elif qty >= 10:
+---
+>     elif qty >= 12:
+48a49,50
+>       if not items:
+>           raise ValueError("no items")
+[exit 1]
+
+$ grep -n From 10 units invoice.lit
+15:  The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
+[exit 0]

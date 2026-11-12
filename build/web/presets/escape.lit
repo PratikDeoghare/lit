@@ -1,0 +1,20 @@
+#h1{Writing about the notation}
+
+A reference alone on a line is replaced by its chunk. To show one literally, put a backslash in
+front of it. Tangle removes exactly one backslash.
+
+#shout{
+  ```
+  LOUD
+  ```
+}
+
+#NOTATION.md{
+  ```
+  The real thing, expanded:
+  <<<shout>>>
+
+  The literal thing, escaped:
+  \<<<shout>>>
+  ```
+}

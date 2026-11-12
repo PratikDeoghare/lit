@@ -1,0 +1,441 @@
+package lit
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ---- the record of fills: <root>.fills.jsonl, next to the root file
+
+// A FillRecord is one gap an agent filled, with what was there before and what was put in.
+type FillRecord struct {
+	ID       string   `json:"id"`
+	Status   string   `json:"status"` // pending | approved | rejected
+	T        float64  `json:"t"`
+	Chunk    string   `json:"chunk"`
+	File     string   `json:"file"`
+	Line     int      `json:"line"`
+	Hint     string   `json:"hint"`
+	Orig     string   `json:"orig"`     // the #agent-fill-in{...} bag as it was written
+	Inserted string   `json:"inserted"` // the exact text that replaced it
+	Code     string   `json:"code"`
+	Agent    string   `json:"agent"`
+	Attempts int      `json:"attempts"`
+	Verdict  string   `json:"verdict,omitempty"`
+	Notes    []string `json:"notes,omitempty"`
+}
+
+type fillEvent struct {
+	Event string `json:"event"` // fill | status
+	FillRecord
+}
+
+func FillsPath(src *Source) string {
+	return filepath.Join(src.Base, filepath.Base(src.Root)+".fills.jsonl")
+}
+
+func appendFillEvent(path string, ev fillEvent) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	b, _ := json.Marshal(ev)
+	_, err = f.Write(append(b, '\n'))
+	return err
+}
+
+// LoadFills reads the record; later status events update earlier fills.
+func LoadFills(src *Source) ([]*FillRecord, error) {
+	b, err := os.ReadFile(FillsPath(src))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var order []*FillRecord
+	byID := map[string]*FillRecord{}
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		var ev fillEvent
+		if json.Unmarshal([]byte(l), &ev) != nil {
+			continue
+		}
+		switch ev.Event {
+		case "fill":
+			f := ev.FillRecord
+			byID[f.ID] = &f
+			order = append(order, &f)
+		case "status":
+			if f := byID[ev.ID]; f != nil {
+				if ev.Status != "" {
+					f.Status = ev.Status
+				}
+				if ev.Verdict != "" {
+					f.Verdict = ev.Verdict
+				}
+				f.Notes = append(f.Notes, ev.Notes...)
+			}
+		}
+	}
+	return order, nil
+}
+
+func recordStatus(src *Source, id, status, verdict string, notes ...string) error {
+	return appendFillEvent(FillsPath(src), fillEvent{Event: "status", FillRecord: FillRecord{ID: id, Status: status, T: now(), Verdict: verdict, Notes: notes}})
+}
+
+// ---- reading the agent's reply
+
+var (
+	fenceOpen  = regexp.MustCompile("^\\s*(`{3,})[^`]*$")
+	cannotLine = regexp.MustCompile(`(?m)^\s*CANNOT:\s*(.*)$`)
+)
+
+// ExtractCode takes the code from a reply: the first fenced block, or the whole reply if it has no fence. A
+// reply that says CANNOT: gives the reason instead.
+func ExtractCode(reply string) (code []string, cannot string, err error) {
+	reply = strings.ReplaceAll(reply, "\r\n", "\n")
+	lines := strings.Split(reply, "\n")
+	for i, l := range lines {
+		if m := fenceOpen.FindStringSubmatch(l); m != nil {
+			closing := regexp.MustCompile("^\\s*`{" + strconv.Itoa(len(m[1])) + ",}\\s*$")
+			for j := i + 1; j < len(lines); j++ {
+				if closing.MatchString(lines[j]) {
+					return trimBlank(lines[i+1 : j]), "", nil
+				}
+			}
+			return nil, "", fmt.Errorf("the reply opens a code fence but never closes it")
+		}
+	}
+	if m := cannotLine.FindStringSubmatch(reply); m != nil && len(strings.TrimSpace(reply)) == len(strings.TrimSpace(m[0])) {
+		return nil, strings.TrimSpace(m[1]), nil
+	}
+	if strings.TrimSpace(reply) == "" {
+		return nil, "", fmt.Errorf("the reply is empty")
+	}
+	return trimBlank(lines), "", nil
+}
+
+func trimBlank(lines []string) []string {
+	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = strings.TrimRight(l, " \t\r")
+	}
+	return out
+}
+
+// ---- putting the code into the program
+
+var tickRun = regexp.MustCompile("`+")
+
+// Insertion is the text that replaces a hint: the hint's own words as prose (unless dropped) and the code
+// as a fenced block. A fence longer than any run of backticks in the code keeps the code intact.
+func Insertion(text string, site HintSite, code []string, dropHint bool) string {
+	n := 3
+	for _, l := range code {
+		for _, r := range tickRun.FindAllString(l, -1) {
+			n = max(n, len(r)+1)
+		}
+	}
+	fence := strings.Repeat("`", n)
+	var sb strings.Builder
+	if site.Start > 0 && text[site.Start-1] != '\n' {
+		sb.WriteString("\n")
+	}
+	if raw := strings.TrimSpace(site.Raw); raw != "" && !dropHint {
+		sb.WriteString(raw + "\n\n")
+	}
+	sb.WriteString(fence + "\n" + strings.Join(code, "\n") + "\n" + fence)
+	if site.End < len(text) && text[site.End] != '\n' {
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+func newID(chunk, hint, code string) string {
+	h := sha256.Sum256([]byte(chunk + "\x00" + hint + "\x00" + code + "\x00" + strconv.FormatInt(time.Now().UnixNano(), 10)))
+	return "f-" + hex.EncodeToString(h[:])[:6]
+}
+
+// ---- the command
+
+var fillSpec = Spec{
+	Opts: map[string]bool{"list": false, "dry-run": false, "show-context": false, "agent": true, "model": true, "chunk": true, "only": true,
+		"limit": true, "check": true, "check-each": false, "retries": true, "budget": true, "drop-hint": false, "timeout": true},
+}
+
+const fillUsage = `usage: lit fill SOURCE.lit [--list] [--dry-run] [--chunk NAME] [--only N] [--limit N]
+                [--agent SPEC] [--model M] [--check 'CMD'] [--retries N] [--budget CHARS] [--drop-hint]
+
+Fills the #agent-fill-in{...} hints of a program: for each, gathers the context (the section's prose, the chunk,
+the chunks that use it up to the files, the chunks it uses or the hint names, the tangled file around the gap),
+asks the agent for the code, checks the result, and puts it into the .lit. Every fill is recorded in
+SOURCE.lit.fills.jsonl for lit review.
+
+  --list           show the hints and stop
+  --dry-run        print the prompt for the first hint and stop; --show-context lists its sections only
+  --agent SPEC     "anthropic" or "anthropic:MODEL" (needs ANTHROPIC_API_KEY), or a shell command that reads the
+                   prompt on stdin and prints the reply (e.g. 'claude -p'); default $LIT_AGENT
+  --check 'CMD'    run CMD (go vet ./... say) on the tangled program in a scratch directory when a fill closes the
+                   last open hint (--check-each: after every fill); a fill that makes it fail is retried with the
+                   error, then dropped
+  --retries N      attempts after the first that fail a check (default 1)
+  --only N         fill just hint number N of --list;  --chunk NAME  only hints inside that chunk
+  --limit N        stop after N hints;  --budget CHARS  size of the prompt (default 24000)
+  --drop-hint      do not keep the hint's words as prose above the code`
+
+// AgentOverride lets tests and embedders supply the agent instead of --agent.
+var AgentOverride Agent
+
+func atoiOr(s string, def int) int {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return def
+}
+
+// Fill fills the agent hints of a program.
+func Fill(argv []string, io IO) int {
+	a, err := ParseArgs(argv, fillSpec)
+	if err != nil || len(a.Pos) != 1 {
+		fmt.Fprintln(io.Err, fillUsage)
+		return 2
+	}
+	path := a.Pos[0]
+	budget := atoiOr(a.Get("budget", ""), 24000)
+	list := func(src *Source, root Bag) []HintSite { return FindHints(src, root) }
+	src, err := ReadSource(path)
+	if err != nil {
+		fmt.Fprintln(io.Err, err)
+		return 2
+	}
+	root, err := src.Parse()
+	if err != nil {
+		fmt.Fprintln(io.Err, err)
+		return 2
+	}
+	sites := list(src, root)
+	if a.Has("list") {
+		if len(sites) == 0 {
+			fmt.Fprintln(io.Out, "no #agent-fill-in hints")
+		}
+		for _, s := range sites {
+			fmt.Fprintf(io.Out, "%3d  %s\n", s.Index, s.Describe())
+		}
+		return 0
+	}
+	if len(sites) == 0 {
+		fmt.Fprintln(io.Out, "no #agent-fill-in hints to fill")
+		return 0
+	}
+	if a.Has("dry-run") || a.Has("show-context") {
+		k := atoiOr(a.Get("only", ""), 0)
+		p, err := BuildPrompt(src, root, k, budget)
+		if err != nil {
+			fmt.Fprintln(io.Err, "fill: "+err.Error())
+			return 2
+		}
+		if a.Has("show-context") {
+			fmt.Fprintf(io.Out, "hint %d: %s\nsections: %s\nprompt: %d characters\n", k, sites[k].Describe(), strings.Join(p.Sections, "; "), len(p.User))
+			return 0
+		}
+		fmt.Fprintf(io.Out, "--- system ---\n%s\n--- prompt ---\n%s", p.System, p.User)
+		return 0
+	}
+	agent := AgentOverride
+	if agent == nil {
+		agent, err = NewAgent(a.Get("agent", ""), a.Get("model", ""))
+		if err != nil {
+			fmt.Fprintln(io.Err, "fill: "+err.Error())
+			return 2
+		}
+	}
+	retries := atoiOr(a.Get("retries", ""), 1)
+	limit := atoiOr(a.Get("limit", ""), 1<<30)
+	only := -1
+	if a.Has("only") {
+		only = atoiOr(a.Get("only", ""), -1)
+		if only < 0 || only >= len(sites) {
+			fmt.Fprintf(io.Err, "fill: no hint number %s; lit fill --list shows them\n", a.Get("only", ""))
+			return 2
+		}
+	}
+	wantChunk := a.Get("chunk", "")
+	ctx := context.Background()
+	if t := atoiOr(a.Get("timeout", ""), 0); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(t)*time.Second)
+		defer cancel()
+	}
+
+	// Hints are filled one at a time, re-reading the program each time, so that what one fill adds is context
+	// for the next. A hint that could not be filled is skipped by its place in the text, not its number.
+	filled, failed := 0, 0
+	skip := map[string]bool{}
+	key := func(s HintSite) string { return s.Chunk + "\x00" + s.Raw + "\x00" + fmt.Sprint(s.Line) }
+	first := only
+	for filled+failed < limit {
+		src, err = ReadSource(path)
+		if err != nil {
+			fmt.Fprintln(io.Err, err)
+			return 2
+		}
+		if root, err = src.Parse(); err != nil {
+			fmt.Fprintln(io.Err, err)
+			return 2
+		}
+		sites = list(src, root)
+		pick := -1
+		for _, s := range sites {
+			if first >= 0 && s.Index != first {
+				continue
+			}
+			if wantChunk != "" && s.Chunk != wantChunk {
+				continue
+			}
+			if skip[key(s)] {
+				continue
+			}
+			pick = s.Index
+			break
+		}
+		if pick < 0 {
+			break
+		}
+		first = -1
+		if only >= 0 && filled+failed >= 1 {
+			break
+		}
+		site := sites[pick]
+		fmt.Fprintf(io.Out, "filling %s\n", site.Describe())
+		fill, notes, err := fillOne(ctx, agent, src, root, pick, site, budget, retries, checkFor(a, len(sites)), a.Has("drop-hint"), io)
+		if err != nil {
+			fmt.Fprintf(io.Err, "  not filled: %v\n", err)
+			skip[key(site)] = true
+			failed++
+			if only >= 0 {
+				break
+			}
+			continue
+		}
+		for _, n := range notes {
+			fmt.Fprintf(io.Out, "  %s\n", n)
+		}
+		fmt.Fprintf(io.Out, "  filled as %s (%d line(s)); lit review shows it\n", fill.ID, strings.Count(fill.Code, "\n")+1)
+		filled++
+		if only >= 0 {
+			break
+		}
+	}
+	left := len(FindHints(src, root))
+	if filled > 0 {
+		src2, _ := ReadSource(path)
+		if r2, err := src2.Parse(); err == nil {
+			left = len(FindHints(src2, r2))
+		}
+	}
+	fmt.Fprintf(io.Out, "%d filled, %d failed, %d hint(s) still open\n", filled, failed, left)
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+// checkFor decides whether the --check command runs for this fill. Unfilled hints leave holes in the tangled
+// program (an import nobody uses yet, say), so the command runs only when this fill closes the last open hint,
+// unless --check-each asks for it every time.
+func checkFor(a *Args, open int) string {
+	if a.Has("check-each") || open <= 1 {
+		return a.Get("check", "")
+	}
+	return ""
+}
+
+// fillOne asks for the code of one hint and, if it passes the checks, writes it into the program.
+func fillOne(ctx context.Context, agent Agent, src *Source, root Bag, k int, site HintSite, budget, retries int, check string, dropHint bool, io IO) (*FillRecord, []string, error) {
+	prompt, err := BuildPrompt(src, root, k, budget)
+	if err != nil {
+		return nil, nil, err
+	}
+	user := prompt.User
+	var lastProblem string
+	attempts := 0
+	var notes []string
+	for attempt := 0; attempt <= retries; attempt++ {
+		attempts++
+		reply, err := agent.Ask(ctx, prompt.System, user)
+		if err != nil {
+			return nil, nil, err
+		}
+		code, cannot, err := ExtractCode(reply)
+		if err != nil {
+			lastProblem = err.Error()
+		} else if cannot != "" {
+			return nil, nil, fmt.Errorf("the agent could not do it: %s", cannot)
+		} else {
+			ins := Insertion(src.Text, site, code, dropHint)
+			newText := src.Text[:site.Start] + ins + src.Text[site.End:]
+			fs := CheckFillCode(code, site.Text)
+			fs = append(fs, CheckProgram(src, newText)...)
+			if check != "" && !hasError(fs) {
+				fs = append(fs, RunCheck(newText, check, 5*time.Minute)...)
+			}
+			if !hasError(fs) {
+				for _, f := range fs {
+					if f.Level == "warn" {
+						notes = append(notes, f.String())
+					}
+				}
+				orig := src.Text[site.Start:site.End] // WriteBack replaces src.Text, so take this first
+				if _, err := src.WriteBack(newText); err != nil {
+					return nil, nil, err
+				}
+				rec := &FillRecord{ID: newID(site.Chunk, site.Text, strings.Join(code, "\n")), Status: "pending", T: now(), Chunk: site.Chunk,
+					File: site.File, Line: site.Line, Hint: site.Text, Orig: orig, Inserted: ins,
+					Code: strings.Join(code, "\n"), Agent: agent.Name(), Attempts: attempts, Notes: notes}
+				if err := appendFillEvent(FillsPath(src), fillEvent{Event: "fill", FillRecord: *rec}); err != nil {
+					return nil, nil, err
+				}
+				return rec, notes, nil
+			}
+			var msgs []string
+			for _, f := range fs {
+				if f.Level == "error" {
+					msgs = append(msgs, f.Msg)
+				}
+			}
+			lastProblem = strings.Join(msgs, "\n")
+			fmt.Fprintf(io.Out, "  attempt %d failed its checks:\n    %s\n", attempts, strings.ReplaceAll(trunc(lastProblem, 600), "\n", "\n    "))
+			user = prompt.User + "\n\nYour previous answer was rejected:\n" + lastProblem + "\n\nYour previous code was:\n```\n" + strings.Join(code, "\n") + "\n```\nWrite the corrected code for the gap."
+			continue
+		}
+		user = prompt.User + "\n\nYour previous answer could not be used: " + lastProblem + "\nFollow the reply format exactly."
+	}
+	return nil, nil, fmt.Errorf("after %d attempt(s): %s", attempts, firstLine(lastProblem))
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}

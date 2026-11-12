@@ -1,0 +1,76 @@
+$ lit fill words.lit --list
+  0  words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+  1  words.lit:35  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
+[exit 0]
+
+$ lit fill words.lit --dry-run --show-context
+hint 0: words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+sections: task; where in the document; what the program is; prose of this section; where this chunk is used; other unfilled hints; the chunk, with the gap marked; the tangled file main.go around the gap
+prompt: 1208 characters
+[exit 0]
+
+$ lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go'
+filling words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+  filled as f-ea0cf1 (6 line(s)); lit review shows it
+filling words.lit:45  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
+  filled as f-663c33 (17 line(s)); lit review shows it
+2 filled, 0 failed, 0 hint(s) still open
+[exit 0]
+
+$ lit review words.lit --ai --agent 'sh review.sh'
+== f-ea0cf1  «read the words»  words.lit:28  [pending, as written]
+   hint:  count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts
+   agent: command: sh agent.sh
+   | sc := bufio.NewScanner(os.Stdin)
+   | for sc.Scan() {
+   | 	for _, w := range strings.Fields(sc.Text()) {
+   | 		counts[strings.ToLower(w)]++
+   | 	}
+   | }
+   ok: parses, tangles, no placeholders
+   second opinion:
+     VERDICT: concerns
+     - the error of the scanner is never looked at
+     - fine otherwise: it does what the hint says
+== f-663c33  «print the top ten»  words.lit:45  [pending, as written]
+   hint:  print at most ten lines of count and word, most frequent first, ties alphabetical
+   agent: command: sh agent.sh
+   | type kv struct {
+   | 	word string
+   | 	n    int
+   | }
+   | var all []kv
+   | for w, n := range counts {
+   | 	all = append(all, kv{w, n})
+   | }
+   | sort.Slice(all, func(i, j int) bool {
+   | 	if all[i].n != all[j].n {
+   | 		return all[i].n > all[j].n
+   | 	}
+   | … (5 more line(s); --full shows all)
+   ok: parses, tangles, no placeholders
+   second opinion:
+     VERDICT: concerns
+     - the error of the scanner is never looked at
+     - fine otherwise: it does what the hint says
+
+the checks passed, but a second opinion raised concerns; read them above. lit review --approve ID records that you looked.
+[exit 0]
+
+$ lit review words.lit --approve-all
+approved f-ea0cf1
+approved f-663c33
+[exit 0]
+
+$ lit tangle words.lit .
+wrote main.go
+wrote words.lit.map
+[exit 0]
+
+$ go run main.go < sample.txt
+3 the
+2 and
+1 bird
+1 cat
+1 dog
+[exit 0]

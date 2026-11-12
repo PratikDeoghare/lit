@@ -1,0 +1,60 @@
+#h1{Merge sort}
+
+Split the list in half, sort each half, merge the two. The running time obeys
+`$T(n) = 2T(n/2) + \Theta(n)$`
+which solves to `$\Theta(n \log n)$` #cite{cormen2022}.
+
+#merge{
+  To merge two sorted lists, repeatedly move the smaller head to the result. Taking from the
+  left on ties keeps the sort stable, which is why the test is `<=` and not `<`.
+
+  ```
+  def merge(a, b):
+      res = []
+      i = j = 0
+      while i < len(a) and j < len(b):
+          <<<take the smaller head>>>
+      return res + a[i:] + b[j:]
+  ```
+
+  #take the smaller head{
+    ```
+    if a[i] <= b[j]:
+        res.append(a[i]); i += 1
+    else:
+        res.append(b[j]); j += 1
+    ```
+  }
+}
+
+#sort{
+  Lists of length one or less are already sorted. Otherwise cut in the middle, sort the halves, merge.
+
+  ```
+  def merge_sort(xs):
+      if len(xs) <= 1:
+          return xs
+      mid = len(xs) // 2
+      return merge(merge_sort(xs[:mid]), merge_sort(xs[mid:]))
+  ```
+}
+
+#merge_sort.py{
+  ```
+  <<<merge>>>
+
+
+  <<<sort>>>
+  ```
+}
+
+#bibliography{
+  #cormen2022{
+    ```
+    @book{cormen2022,
+      author = {Thomas H. Cormen and Charles E. Leiserson and Ronald L. Rivest and Clifford Stein},
+      title = {Introduction to Algorithms}, publisher = {MIT Press}, edition = {4th}, year = {2022}
+    }
+    ```
+  }
+}

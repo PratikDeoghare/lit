@@ -1,0 +1,39 @@
+#h1{Softmax, carefully}
+
+The softmax of a vector `$x$` is
+
+`$\mathrm{softmax}(x)_i = \frac{e^{x_i}}{\sum_j e^{x_j}}$`
+
+Subtracting the maximum first changes nothing mathematically and avoids overflow; see the
+discussion of overflow and underflow in #cite{goodfellow2016}. A paragraph that holds nothing but
+one math span becomes display math when woven.
+
+#softmax{
+  ```
+  import math
+
+
+  def softmax(x):
+      m = max(x)
+      e = [math.exp(v - m) for v in x]
+      s = sum(e)
+      return [v / s for v in e]
+  ```
+}
+
+#softmax.py{
+  ```
+  <<<softmax>>>
+  ```
+}
+
+#bibliography{
+  #goodfellow2016{
+    ```
+    @book{goodfellow2016,
+      author = {Ian Goodfellow and Yoshua Bengio and Aaron Courville},
+      title = {Deep Learning}, publisher = {MIT Press}, year = {2016}
+    }
+    ```
+  }
+}
