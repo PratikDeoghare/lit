@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/pratikdeoghare/brashtag-literate/internal/skill"
+	"github.com/pratikdeoghare/lit/internal/skill"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/lit.Version=1.2.3".

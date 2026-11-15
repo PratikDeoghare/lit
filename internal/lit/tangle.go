@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/pratikdeoghare/brashtag-literate/internal/brashtag"
+	"github.com/pratikdeoghare/lit/internal/brashtag"
 )
 
 type (

@@ -14,7 +14,7 @@ page. Each is what its name says.
   import (
   	"os"
 
-  	"github.com/pratikdeoghare/brashtag-literate/internal/lit"
+  	"github.com/pratikdeoghare/lit/internal/lit"
   )
 
   func main() {
@@ -414,7 +414,7 @@ page. Each is what its name says.
   The module has no requirements: the parser is part of it.
 
   ```
-  module github.com/pratikdeoghare/brashtag-literate
+  module github.com/pratikdeoghare/lit
 
   go 1.27
   ```
