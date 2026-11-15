@@ -77,3 +77,4 @@ that is given this file reads them all as one text.
 #include{chapters/landing-page.lit}
 #include{chapters/utilities.lit}
 #include{chapters/references.lit}
+#include{chapters/readme.lit}
