@@ -1,5 +1,7 @@
 # lit
 
+## NOTE: This is coded by Claude. I am testing it and reviewing. Seems to work.
+
 ### Install
 ```
 go install github.com/pratikdeoghare/lit/cmd/lit@latest
