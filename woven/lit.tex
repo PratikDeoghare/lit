@@ -379,6 +379,8 @@
 \expandafter\gdef\csname cn@chunk331\endcsname{hints: describing a gap}
 \expandafter\gdef\csname cn@chunk332\endcsname{context: small helpers}
 \expandafter\gdef\csname cn@chunk333\endcsname{check: findings}
+\expandafter\gdef\csname cn@chunk334\endcsname{}
+\expandafter\gdef\csname cn@chunk335\endcsname{README.\allowbreak{}md}
 \begin{document}
 \maketitle
 \tableofcontents
@@ -19266,12 +19268,34 @@ func spotOf(src *Source, text string, m *Map, file string, line int) string \{
 
 The works this document cites, with the identifiers the weaver links.
 
+\chunkhead{chunk334}{\textbf{\ensuremath{\langle}\texttt{}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
+README for github
+
+\chunkhead{chunk335}{\filebadge\ \textbf{\texttt{README.\allowbreak{}md}}}
+\begin{Verbatim}
+# lit
+
+### Install
+```
+go install github.com/pratikdeoghare/lit/cmd/lit@latest
+```
+
+### Tangle itself
+lit tangle book/lit.lit .
+
+### Weave itself
+lit weave book/lit.lit -o woven
+
+
+\end{Verbatim}
+
 \clearpage
 \hypertarget{index}{}\phantomsection\addcontentsline{toc}{section}{Chunk index}
 \section*{Chunk index}
 \begin{longtable}{@{}p{0.40\textwidth}rp{0.42\textwidth}@{}}
 \textbf{chunk} & \textbf{defined} & \textbf{used in} \\\hline
 \endhead
+\hyperref[chunk334]{\chunkname{}} & \ref*{chunk334} &  \\
 \hyperref[chunk32]{\chunkname{absorb: applying the plan}} & \ref*{chunk32} & \hyperref[chunk34]{\ref*{chunk34}} \\
 \hyperref[chunk29]{\chunkname{absorb: from generated text to the document}} & \ref*{chunk29} & \hyperref[chunk34]{\ref*{chunk34}} \\
 \hyperref[chunk27]{\chunkname{absorb: hunks and edits}} & \ref*{chunk27} & \hyperref[chunk34]{\ref*{chunk34}} \\
@@ -19504,6 +19528,7 @@ The works this document cites, with the identifiers the weaver links.
 \hyperref[chunk253]{\chunkname{py weave: the chunk tree}} & \ref*{chunk253} & \hyperref[chunk270]{\ref*{chunk270}} \\
 \hyperref[chunk255]{\chunkname{py weave: the document model}} & \ref*{chunk255} & \hyperref[chunk270]{\ref*{chunk270}} \\
 \hyperref[chunk268]{\chunkname{py weave: the style sheet}} & \ref*{chunk268} & \hyperref[chunk270]{\ref*{chunk270}} \\
+\hyperref[chunk335]{\texttt{README.\allowbreak{}md}} & \ref*{chunk335} &  \\
 \hyperref[chunk130]{\chunkname{review: reading the record}} & \ref*{chunk130} & \hyperref[chunk133]{\ref*{chunk133}} \\
 \hyperref[chunk129]{\chunkname{review: the command}} & \ref*{chunk129} & \hyperref[chunk133]{\ref*{chunk133}} \\
 \hyperref[chunk132]{\chunkname{review: the prose of a chunk}} & \ref*{chunk132} & \hyperref[chunk133]{\ref*{chunk133}} \\
