@@ -1,3 +1,3 @@
-module github.com/pratikdeoghare/brashtag-literate
+module github.com/pratikdeoghare/lit
 
 go 1.27
