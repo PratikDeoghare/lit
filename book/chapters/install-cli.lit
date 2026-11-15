@@ -19,7 +19,7 @@ dispatches the commands.
   	"runtime"
   	"strings"
 
-  	"github.com/pratikdeoghare/lit/internal/skill"
+  	"github.com/pratikdeoghare/brashtag-literate/internal/skill"
   )
 
   // Version is set at build time with -ldflags "-X .../internal/lit.Version=1.2.3".

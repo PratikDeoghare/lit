@@ -17,343 +17,71 @@ inline, so the page makes no request other than for fonts and, after first paint
 
 #h2{Assembling the page}
 
-The builder is a small Go program, built next to `lit`. It reads the pieces, runs the
-transcripts through a small parser, replaces the placeholders in the body, and writes one file.
+The page is a single file, `landing.html`, and tangling this document writes it. Nothing has to
+be run afterwards: the file is only an assembly of chunks, in the order the browser needs them.
+The style comes first, then the text of the page, then the examples that the editors can load,
+each in a script element that the browser does not run, and last one script that holds, in this
+order, the brashtag parser, the core and the interface. The script is a module because the
+parser is used exactly as it is published, with its `export` keywords, and a module may contain
+them; being a module also keeps its names out of the page. The parser is the JavaScript build of
+the one the Go program uses, copied from the brashtag repository, and the page's tests in the
+next sections run on the same three files, put one after the other: `cat web/parser.js
+web/core.js web/core.tests.mjs > t.mjs && node t.mjs`.
 
-#page build: transcripts{
-  The recorded runs, t1 to t8, are plain text: a line that starts with a dollar sign begins a
-  command, the lines after it are its output, and a line `[exit N]` ends it. The home directory is
-  replaced by a tilde, so that the recordings do not say where they were made.
-
-  ```
-  // Command mkpage builds the landing page, one self-contained HTML file, from the pieces tangled into web/.
-  //
-  //	cd web && BRASHTAG_JS=path/to/parser.js LIT_STATS="$(lit lint ../book.lit | tail -n 1)" mkpage > landing.html
-  //
-  // It needs nothing but the standard library.
-  package main
-
-  import (
-  	"fmt"
-  	"html"
-  	"os"
-  	"path/filepath"
-  	"regexp"
-  	"strconv"
-  	"strings"
-  )
-
-  var (
-  	escText = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
-  	escAttr = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#x27;")
-  )
-
-  func esc(s string) string { return escText.Replace(s) }
-
-  func read(path string) string {
-  	b, err := os.ReadFile(path)
-  	if err != nil {
-  		fatal("%v", err)
-  	}
-  	return string(b)
-  }
-
-  func fatal(f string, a ...any) {
-  	fmt.Fprintf(os.Stderr, "mkpage: "+f+"\n", a...)
-  	os.Exit(1)
-  }
-
-  // A run is one recorded command: what was typed, what it printed and how it ended.
-  type run struct {
-  	cmd  string
-  	out  []string
-  	code int
-  	has  bool
-  }
-
-  var (
-  	homeRe = regexp.MustCompile(`/[^\s'"]*/home\b`)
-  	exitRe = regexp.MustCompile(`^\[exit (\d+)\]$`)
-  )
-
-  // scrub: the recorded runs used a scratch home directory; show it as ~.
-  func scrub(s string) string { return homeRe.ReplaceAllString(s, "~") }
-
-  // transcripts reads t1.txt .. t9.txt: a line that starts with "$ " begins a command, the lines after it are its
-  // output, and a line "[exit N]" ends it. Lines that start with "# (" are comments for the reader of the file.
-  func transcripts() map[string]*run {
-  	T := map[string]*run{}
-  	for n := 1; n <= 9; n++ {
-  		var cur *run
-  		for _, line := range strings.Split(read(fmt.Sprintf("tut/t%d.txt", n)), "\n") {
-  			switch {
-  			case strings.HasPrefix(line, "$ "):
-  				cur = &run{cmd: line[2:]}
-  				T[fmt.Sprintf("t%d:%s", n, cur.cmd)] = cur
-  			case strings.HasPrefix(line, "# ("):
-  				cur = nil
-  			case cur != nil:
-  				if m := exitRe.FindStringSubmatch(line); m != nil {
-  					cur.code, _ = strconv.Atoi(m[1])
-  					cur.has = true
-  					cur = nil
-  				} else {
-  					cur.out = append(cur.out, line)
-  				}
-  			}
-  		}
-  	}
-  	return T
-  }
-
-  func trimTrailingBlank(l []string) []string {
-  	for len(l) > 0 && l[len(l)-1] == "" {
-  		l = l[:len(l)-1]
-  	}
-  	return l
-  }
-
-  func termBlock(cmd string, out string, badge string) string {
-  	s := fmt.Sprintf(`<div class="term"><button class="btn copy" data-copy="%s">Copy</button><pre><span class="p">$ </span><span class="c">%s</span>`, escAttr.Replace(cmd), esc(cmd))
-  	if out != "" {
-  		s += fmt.Sprintf("\n"+`<span class="o">%s</span>`, esc(scrub(out)))
-  	}
-  	return s + "</pre>" + badge + "</div>"
-  }
-
-  func term(T map[string]*run, key, shown string) string {
-  	r, ok := T[key]
-  	if !ok {
-  		fatal("no transcript %s", key)
-  	}
-  	out := trimTrailingBlank(append([]string(nil), r.out...))
-  	cmd := r.cmd
-  	if shown != "" {
-  		cmd = shown
-  	}
-  	badge := ""
-  	if r.code != 0 && strings.HasPrefix(cmd, "lit ") {
-  		badge = fmt.Sprintf(`<span class="exit">exit %d</span>`, r.code)
-  	}
-  	return termBlock(cmd, strings.Join(out, "\n"), badge)
-  }
-
-  func codefile(text, name string) string {
-  	n := len(strings.Split(strings.TrimRight(text, "\n"), "\n"))
-  	if strings.TrimSpace(text) == "" {
-  		n = 0
-  	}
-  	return fmt.Sprintf(`<div class="codefile"><div class="file-head"><span>%s</span><span>%d lines</span></div><pre>%s</pre></div>`, esc(name), n, esc(strings.TrimRight(text, "\n")))
-  }
-
-  // pick rebuilds the interactive session of `lit sync pick`: the recording ran without a terminal, so the answers
-  // the tutorial gives are put after the prompts, and the closing line comes from the run that wrote the files.
-  func pick(T map[string]*run) string {
-  	r, ok := T["t6:lit sync invoice.lit pick"]
-  	r2, ok2 := T["t7:lit sync invoice.lit pick"]
-  	if !ok || !ok2 {
-  		fatal("no transcripts of lit sync pick")
-  	}
-  	answers := []string{"y", "n"}
-  	var res []string
-  	for _, l := range r.out {
-  		switch {
-  		case strings.HasPrefix(l, "apply to the") && strings.HasSuffix(l, "> "):
-  			l += answers[0]
-  			answers = answers[1:]
-  		case strings.HasPrefix(l, "Write these changes? [y/n] > nothing written."):
-  			l = "Write these changes? [y/n] > y"
-  		}
-  		res = append(res, l)
-  	}
-  	last := ""
-  	for _, l := range r2.out {
-  		if strings.HasPrefix(l, "synced.") {
-  			last = l
-  			break
-  		}
-  	}
-  	res = trimTrailingBlank(append(res, "", last))
-  	return termBlock("lit sync invoice.lit pick", strings.Trim(strings.Join(res, "\n"), "\n"), "")
-  }
-
-  var (
-  	placeholder = regexp.MustCompile(`\[\[(.+?)\]\]`)
-  	prologRe    = regexp.MustCompile(`(?s)<\?xml.*?\?>|<!DOCTYPE.*?>`)
-  )
-  ```
-}
-
-#page build: placeholders{
-  The tutorial text and the chapters section of the body are written with placeholders in double
-  brackets: a figure with a caption, a terminal block showing a recorded run, a file block, and
-  the picker. The builder replaces them with the recorded output or the text of the file.
+#landing.html{
+  The file is its parts. A reference to a file chunk expands to the whole of that file, which is
+  how the style, the examples and the three scripts come in.
 
   ```
-  func expand(T map[string]*run, t string) string {
-  	return placeholder.ReplaceAllStringFunc(t, func(m string) string {
-  		tok := m[2 : len(m)-2]
-  		if tok == "pick" {
-  			return pick(T)
-  		}
-  		kind, rest, _ := strings.Cut(tok, ":")
-  		switch kind {
-  		case "term":
-  			key, shown, _ := strings.Cut(rest, "|")
-  			return term(T, key, shown)
-  		case "svg":
-  			f, cap, ok := strings.Cut(rest, "|")
-  			if !ok {
-  				fatal("bad svg placeholder %s", tok)
-  			}
-  			s := strings.TrimSpace(prologRe.ReplaceAllString(read(f), ""))
-  			s = strings.Replace(s, "<svg", `<svg role="img" aria-label="`+html.EscapeString(cap)+`"`, 1)
-  			return fmt.Sprintf(`<figure class="diagram"><div class="scroll">%s</div><figcaption>%s</figcaption></figure>`, s, esc(cap))
-  		case "cmd":
-  			return termBlock(rest, "", "")
-  		case "code":
-  			p := strings.Split(rest, ":")
-  			if len(p) != 2 {
-  				fatal("bad code placeholder %s", tok)
-  			}
-  			return codefile(read("tut/"+p[0]), p[1])
-  		case "file":
-  			p := strings.Split(rest, ":")
-  			if len(p) != 4 {
-  				fatal("bad file placeholder %s", tok)
-  			}
-  			a, _ := strconv.Atoi(p[1])
-  			z, _ := strconv.Atoi(p[2])
-  			L := strings.Split(read("tut/"+p[0]), "\n")
-  			return codefile(strings.Join(L[a-1:z], "\n"), p[3]+" (excerpt)")
-  		}
-  		fatal("unknown placeholder %s", tok)
-  		return ""
-  	})
-  }
-  ```
-}
-
-#page build: numbers and parser{
-  The numbers about the program itself come from the linter's summary line, so the page states
-  what the document is, not what it was. The parser is inlined as plain script.
-
-  ```
-  var statsRe = regexp.MustCompile(`(\d+) chunks, (\d+) code lines, (\d+) words of prose.*?(\d+) error\(s\), (\d+) warning\(s\)`)
-
-  func commas(n int) string {
-  	s := strconv.Itoa(n)
-  	for i := len(s) - 3; i > 0; i -= 3 {
-  		s = s[:i] + "," + s[i:]
-  	}
-  	return s
-  }
-
-  // inlineParser makes the JavaScript build of the brashtag parser usable as plain script: the export keyword goes,
-  // and the parser's error for a stray opening brace gets the rest of the text, so the page can say where it is.
-  func inlineParser(path string) string {
-  	s := strings.ReplaceAll(read(path), "export ", "")
-  	old := "error: \"unexpected {\"\n        };"
-  	if !strings.Contains(s, old) {
-  		fatal("%s: the parser's error for an unexpected { has changed; update inlineParser", path)
-  	}
-  	return strings.Replace(s, old, "error: \"unexpected {\",\n          rest: text.slice(j)\n        };", 1)
-  }
-  ```
-}
-
-#page build: assembly{
-  Assembly puts the tutorial and the install text into the body, expands the placeholders, adds
-  the examples and writes one file to the standard output. With `--parser-only` it prints the
-  inlined parser, for the tests that run in Node.
-
-  ```
-  var presetNames = []struct{ id, name, file string }{
-  	{"merge", "Merge sort", "merge_sort.lit"}, {"twice", "Same name twice", "imports.lit"}, {"files", "One chunk, two files", "hello.lit"},
-  	{"escape", "Escape a reference", "notation.lit"}, {"math", "Math and a citation", "softmax.lit"}, {"oops", "Break it", "oops.lit"},
-  	{"lab", "lab", "tip.lit"},
-  }
-
-  func main() {
-  	css, body := read("page.css"), read("page.body.html")
-  	T := transcripts()
-  	body = strings.Replace(body, "[[TUTORIAL]]", read("tutorial.html"), 1)
-  	body = strings.Replace(body, "[[INSTALL]]", read("install.html"), 1)
-  	body = expand(T, body)
-  	// numbers about the program itself: the build passes the linter's summary line in LIT_STATS
-  	if m := statsRe.FindStringSubmatch(os.Getenv("LIT_STATS")); m != nil {
-  		n := make([]int, 5)
-  		for i := range n {
-  			n[i], _ = strconv.Atoi(m[i+1])
-  		}
-  		for _, kv := range [][2]string{{"__CHUNKS__", commas(n[0])}, {"__CODE__", commas(n[1])}, {"__PROSE__", commas(n[2])}, {"__LINT__", fmt.Sprintf("%d error(s), %d warning(s)", n[3], n[4])}} {
-  			body = strings.ReplaceAll(body, kv[0], kv[1])
-  		}
-  	} else {
-  		for _, k := range []string{"__CHUNKS__", "__CODE__", "__PROSE__", "__LINT__"} {
-  			body = strings.ReplaceAll(body, k, "…")
-  		}
-  	}
-  	var pre strings.Builder
-  	for _, p := range presetNames {
-  		t := read(filepath.Join("presets", p.id+".lit"))
-  		if strings.Contains(t, "</script") {
-  			fatal("preset %s contains </script", p.id)
-  		}
-  		fmt.Fprintf(&pre, "<script type=\"text/plain\" data-preset=\"%s\" data-id=\"%s\" data-file=\"%s\">\n%s</script>\n", p.name, p.id, p.file, t)
-  	}
-  	parser := os.Getenv("BRASHTAG_JS")
-  	if parser == "" {
-  		parser = "node_modules/brashtag/parser.js"
-  	}
-  	core := inlineParser(parser) + "\n" + read("core.js") + "\n" + read("ui.js")
-  	if len(os.Args) > 1 && os.Args[1] == "--parser-only" {
-  		fmt.Print(inlineParser(parser))
-  		return
-  	}
-  	fmt.Printf(`<title>Brashtag Literate</title>
+  <title>Brashtag Literate</title>
   <meta name="claude:viewport-fit-sides" content="cover">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&family=Young+Serif&display=swap">
   <style>
-  %s
+  <<<web/page.css>>>
   </style>
-  %s
-  %s
-  <script>
-  (function(){
-  "use strict";
-  %s
-  })();
+  <<<landing page: text>>>
+  <script type="text/plain" data-preset="Merge sort" data-id="merge" data-file="merge_sort.lit">
+  <<<web/presets/merge.lit>>>
   </script>
-  `, css, body, pre.String(), core)
-  }
-  ```
-}
-
-#cmd/mkpage/main.go{
-  The file is its parts, in the order of the source.
-
-  ```
-  <<<page build: transcripts>>>
-
-  <<<page build: placeholders>>>
-
-  <<<page build: numbers and parser>>>
-
-  <<<page build: assembly>>>
+  <script type="text/plain" data-preset="Same name twice" data-id="twice" data-file="imports.lit">
+  <<<web/presets/twice.lit>>>
+  </script>
+  <script type="text/plain" data-preset="One chunk, two files" data-id="files" data-file="hello.lit">
+  <<<web/presets/files.lit>>>
+  </script>
+  <script type="text/plain" data-preset="Escape a reference" data-id="escape" data-file="notation.lit">
+  <<<web/presets/escape.lit>>>
+  </script>
+  <script type="text/plain" data-preset="Math and a citation" data-id="math" data-file="softmax.lit">
+  <<<web/presets/math.lit>>>
+  </script>
+  <script type="text/plain" data-preset="Break it" data-id="oops" data-file="oops.lit">
+  <<<web/presets/oops.lit>>>
+  </script>
+  <script type="text/plain" data-preset="lab" data-id="lab" data-file="tip.lit">
+  <<<web/presets/lab.lit>>>
+  </script>
+  <script type="module">
+  <<<web/parser.js>>>
+  <<<web/core.js>>>
+  <<<web/ui.js>>>
+  </script>
   ```
 }
 
 #h2{The page's text}
 
-The body is plain HTML in sections, with two placeholders that the builder fills in. Each
-section is a chunk, in reading order.
+The text is HTML in sections. Its terminal blocks show what `lit` printed when it was run on a
+small legacy script in a scratch directory, and its figure is the diagram of the tools; they are
+kept as they were recorded and drawn, and so are the numbers about this document in the section
+about the program, which are the ones the linter reported when the page was last written. Where
+a block shows the same thing the program would show today it can be checked by running the
+command; where the tools change, the block is recorded again and the text here replaced.
 
-#page: top bar and hero{
-  The top bar, the lamp that switches between light and dark, and the hero: the pitch, the install
-  line, and a sentence that says what runs in the browser.
+#landing page: text{
+  The body of the page, after its header, up to the end of its footer.
 
-  ```
+  ````
   <header class="top wrap">
     <a class="mark" href="#top" id="top"><b>#</b>brashtag<b>{</b>literate<b>}</b></a>
     <nav aria-label="Sections"><a href="#understand">Why</a><a href="#agents">Gaps</a><a href="#notation">Notation</a><a href="#chapters">Chapters</a><a href="#scenario">Sync lab</a><a href="#tutorial">Tutorial</a><a href="#install">Install</a></nav>
@@ -373,14 +101,7 @@ section is a chunk, in reading order.
       </div>
       <p class="small-note">Everything on this page runs in your browser, on the JavaScript build of the brashtag parser. The editors are live: what they print follows the same rules as the <code>lit</code> binary.</p>
     </section>
-  ```
-}
 
-#page: what the tools add{
-  The four things the tools add to literate programming: absorb, sync, sourcemaps, and the
-  notation itself.
-
-  ```
     <section class="block" id="new">
       <div class="intro">
         <h2>What the tools add</h2>
@@ -396,14 +117,7 @@ section is a chunk, in reading order.
         <div class="feat"><h3>Any editor</h3><p>A document is plain text and the tools are one command-line program, so there is no plugin to install and no editor to switch to. Addresses come out as path, line and column, the form editors and grep already read.</p><a href="#tools">See the tools</a></div>
       </div>
     </section>
-  ```
-}
 
-#page: getting the understanding back{
-  The reason to convert a codebase, the four-step workflow that uses the skill, and a prompt that
-  works.
-
-  ```
     <section class="block" id="understand">
       <div class="intro">
         <h2>Get the understanding back</h2>
@@ -422,13 +136,7 @@ section is a chunk, in reading order.
         <button class="btn" data-copy="Use the brashtag-literate skill. Turn invoice.py into invoice.lit. Keep every line of code exactly as it is, explain what each part does and why, and list anything you could not tell from the code as an open question. Do not change behaviour.">Copy</button>
       </div>
     </section>
-  ```
-}
 
-#page: the notation{
-  Brashtag in its own terms: bag, blob and code, shown on a tree the reader can edit.
-
-  ```
     <section class="block" id="notation">
       <div class="intro">
         <h2>Brashtag: a tree in plain text</h2>
@@ -452,14 +160,7 @@ section is a chunk, in reading order.
       </div>
       <p class="small-note" style="margin-top:.9rem">The parser is the one in the <a href="https://github.com/PratikDeoghare/brashtag">brashtag repository</a>; this page runs its JavaScript build. Programs written on it include a Markdown-like converter to HTML, a flashcard program and a tree-to-Graphviz tool. The repository also has an Emacs mode.</p>
     </section>
-  ```
-}
 
-#page: the playground{
-  The live editor: a document on the left, the files it tangles to, the chunks, and the woven page
-  on the right, with tracing between the two.
-
-  ```
     <section class="block" id="try">
       <div class="intro">
         <h2>Literate programming on top</h2>
@@ -489,14 +190,7 @@ section is a chunk, in reading order.
       </div>
       <div class="trace" id="trace" aria-live="polite"></div>
     </section>
-  ```
-}
 
-#page: conventions{
-  The conventions the literate tools put on top of the notation, and the characters to keep out of
-  text.
-
-  ```
     <section class="block" id="conventions">
       <div class="intro">
         <h2>Seven conventions for programs</h2>
@@ -512,29 +206,74 @@ section is a chunk, in reading order.
         </ul>
       </div>
     </section>
-  ```
-}
 
-#page: chapters{
-  The chapter mechanism, shown with a small project in three files and the recorded output of the
-  tools on it. The placeholders are replaced by the builder with the files and with real runs.
-
-  ```
     <section class="block" id="chapters">
       <div class="intro">
         <h2>Big programs: chapters</h2>
         <p>A literate program can be spread over many files. <code>#include{pricing.lit}</code> in one file is replaced by the text of that file, so a large codebase can have a chapter for each module or subsystem, and the root file reads as the introduction. The tools are given the root and see one document: chunk names stay global, so one chapter can use a chunk written in another.</p>
       </div>
       <div>
-        [[code:shop/shop.lit:shop.lit (the root)]]
-        [[code:shop/pricing.lit:pricing.lit]]
-        [[code:shop/report.lit:report.lit]]
+        <div class="codefile"><div class="file-head"><span>shop.lit (the root)</span><span>16 lines</span></div><pre>#h1{A small shop}
+
+  This program prices an order and prints it. It is split into chapters, one for each part of the
+  program: how a unit price is worked out, and how an order is reported. This file is the root: it says
+  what the program is, lists the chapters in reading order, and assembles the one file they produce.
+
+  #include{pricing.lit}
+  #include{report.lit}
+
+  #shop.py{
+    ```
+    &lt;&lt;&lt;pricing&gt;&gt;&gt;
+
+    &lt;&lt;&lt;report&gt;&gt;&gt;
+    ```
+  }</pre></div>
+        <div class="codefile"><div class="file-head"><span>pricing.lit</span><span>12 lines</span></div><pre>#h1{Pricing}
+
+  The unit price falls with the quantity bought: from 12 units there is a discount of 5 percent.
+
+  #pricing{
+    ```
+    def unit_price(qty, price):
+        if qty &gt;= 12:
+            return round(price * 0.95, 2)
+        return price
+    ```
+  }</pre></div>
+        <div class="codefile"><div class="file-head"><span>report.lit</span><span>13 lines</span></div><pre>#h1{The report}
+
+  An order is a list of (name, quantity, price) triples. Each line is printed with its total. The
+  chapter on pricing says how the unit price is worked out; this one only uses it.
+
+  #report{
+    ```
+    ORDER = [("widget", 12, 3.50), ("gizmo", 1, 19.99)]
+    for name, qty, price in ORDER:
+        unit = unit_price(qty, price)
+        print(f"{name:10s} {qty:4d} x {unit:7.2f} = {qty * unit:8.2f}")
+    ```
+  }</pre></div>
       </div>
       <p>Here is that project through the tools. Every message and every address names the chapter file and the line in it, and absorb writes only the chapter that changed. It does not touch the prose, which still says 12: after absorbing, the author reads the diff and fixes the sentence.</p>
-      [[term:t8:lit tangle shop.lit .]]
-      [[term:t8:lit addr shop.lit shop.py:3]]
-      [[term:t8:lit addr shop.lit report.lit:8]]
-      [[term:t8:lit absorb shop.lit]]
+      <div class="term"><button class="btn copy" data-copy="lit tangle shop.lit .">Copy</button><pre><span class="p">$ </span><span class="c">lit tangle shop.lit .</span>
+  <span class="o">wrote shop.py
+  wrote shop.lit.map</span></pre></div>
+      <div class="term"><button class="btn copy" data-copy="lit addr shop.lit shop.py:3">Copy</button><pre><span class="p">$ </span><span class="c">lit addr shop.lit shop.py:3</span>
+  <span class="o">pricing.lit:9:3  «pricing»</span></pre></div>
+      <div class="term"><button class="btn copy" data-copy="lit addr shop.lit report.lit:8">Copy</button><pre><span class="p">$ </span><span class="c">lit addr shop.lit report.lit:8</span>
+  <span class="o">shop.py:6:1  «report»</span></pre></div>
+      <div class="term"><button class="btn copy" data-copy="lit absorb shop.lit">Copy</button><pre><span class="p">$ </span><span class="c">lit absorb shop.lit</span>
+  <span class="o">  shop.py:2  «pricing», pricing.lit:8: 1 changed
+  --- a/pricing.lit
+  +++ b/pricing.lit
+  @@ -7,3 +7,3 @@
+     def unit_price(qty, price):
+  -      if qty &gt;= 12:
+  +      if qty &gt;= 10:
+             return round(price * 0.95, 2)
+
+  absorbed edits from 1 file(s) into shop.lit; sourcemap refreshed</span></pre></div>
       <div class="gotcha">
         <h3>Rules for chapters</h3>
         <ul>
@@ -545,14 +284,7 @@ section is a chunk, in reading order.
         </ul>
       </div>
     </section>
-  ```
-}
 
-#page: the sync lab{
-  A small lab in which the document and a generated file are edited separately, and tangle, absorb
-  and merge are run on them.
-
-  ```
     <section class="block" id="scenario">
       <div class="intro">
         <h2>The sync lab</h2>
@@ -587,22 +319,113 @@ section is a chunk, in reading order.
       <div class="two">
         <div class="panel">
           <h3>The document, with two gaps</h3>
-          [[code:words.lit:words.lit]]
+          <div class="codefile"><div class="file-head"><span>words.lit</span><span>36 lines</span></div><pre>#h1{Word counter}
+  Counts the words on its standard input and prints the ten most common.
+
+  #main.go{
+    ```
+    package main
+
+    import (
+    	"bufio"
+    	"fmt"
+    	"os"
+    	"sort"
+    	"strings"
+    )
+
+    func main() {
+    	counts := map[string]int{}
+    	&lt;&lt;&lt;read the words&gt;&gt;&gt;
+    	&lt;&lt;&lt;print the top ten&gt;&gt;&gt;
+    }
+    ```
+  }
+
+  #h2{Reading}
+  Words are separated by white space and compared without regard to case.
+
+  #read the words{
+    #agent-fill-in{count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts}
+  }
+
+  #h2{Printing}
+  Most frequent first; words that are equally frequent come in alphabetical order.
+
+  #print the top ten{
+    #agent-fill-in{print at most ten lines of count and word, most frequent first, ties alphabetical}
+  }</pre></div>
         </div>
         <div class="panel">
           <h3>What the assistant is given</h3>
           <p>Each gap becomes a prompt of ten sections, general first and specific last. When the document is large, the distant ones are trimmed first and the task and the chunk never are. Look at one without calling anybody:</p>
-          [[term:t9:lit fill words.lit --list]]
-          [[term:t9:lit fill words.lit --dry-run --show-context]]
+          <div class="term"><button class="btn copy" data-copy="lit fill words.lit --list">Copy</button><pre><span class="p">$ </span><span class="c">lit fill words.lit --list</span>
+  <span class="o">  0  words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+    1  words.lit:35  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit fill words.lit --dry-run --show-context">Copy</button><pre><span class="p">$ </span><span class="c">lit fill words.lit --dry-run --show-context</span>
+  <span class="o">hint 0: words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+  sections: task; where in the document; what the program is; prose of this section; where this chunk is used; other unfilled hints; the chunk, with the gap marked; the tangled file main.go around the gap
+  prompt: 1208 characters</span></pre></div>
         </div>
       </div>
       <p>The assistant is anything that reads a prompt on standard input and prints a reply, or the Anthropic API when <code>ANTHROPIC_API_KEY</code> is set. In the run below it is a canned shell script, so that the example is reproducible; a model takes its place with <code>--agent anthropic</code> or <code>--agent 'claude -p'</code>. Each answer is checked before it is written: the whole program must still parse and tangle, generated Go and JSON files must be valid, and a reply with <code>TODO</code> in it is not an answer. A check of your own, such as <code>go vet</code>, runs on the tangled program in a scratch directory once the last gap is filled, and a failure goes back to the assistant with its error.</p>
-      [[term:t9:lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go']]
+      <div class="term"><button class="btn copy" data-copy="lit fill words.lit --agent &#x27;sh agent.sh&#x27; --check &#x27;go vet main.go&#x27;">Copy</button><pre><span class="p">$ </span><span class="c">lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go'</span>
+  <span class="o">filling words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
+    filled as f-ea0cf1 (6 line(s)); lit review shows it
+  filling words.lit:45  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
+    filled as f-663c33 (17 line(s)); lit review shows it
+  2 filled, 0 failed, 0 hint(s) still open</span></pre></div>
       <p>The code is in the document now, with your words kept as prose above it, and every fill is recorded beside it. Review is for the person who comes back later. It checks again, optionally asks a second assistant, and lets you approve each fill, or reject it, which puts your original gap back.</p>
-      [[term:t9:lit review words.lit --ai --agent 'sh review.sh']]
-      [[term:t9:lit review words.lit --approve-all]]
-      [[term:t9:lit tangle words.lit .]]
-      [[term:t9:go run main.go < sample.txt]]
+      <div class="term"><button class="btn copy" data-copy="lit review words.lit --ai --agent &#x27;sh review.sh&#x27;">Copy</button><pre><span class="p">$ </span><span class="c">lit review words.lit --ai --agent 'sh review.sh'</span>
+  <span class="o">== f-ea0cf1  «read the words»  words.lit:28  [pending, as written]
+     hint:  count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts
+     agent: command: sh agent.sh
+     | sc := bufio.NewScanner(os.Stdin)
+     | for sc.Scan() {
+     | 	for _, w := range strings.Fields(sc.Text()) {
+     | 		counts[strings.ToLower(w)]++
+     | 	}
+     | }
+     ok: parses, tangles, no placeholders
+     second opinion:
+       VERDICT: concerns
+       - the error of the scanner is never looked at
+       - fine otherwise: it does what the hint says
+  == f-663c33  «print the top ten»  words.lit:45  [pending, as written]
+     hint:  print at most ten lines of count and word, most frequent first, ties alphabetical
+     agent: command: sh agent.sh
+     | type kv struct {
+     | 	word string
+     | 	n    int
+     | }
+     | var all []kv
+     | for w, n := range counts {
+     | 	all = append(all, kv{w, n})
+     | }
+     | sort.Slice(all, func(i, j int) bool {
+     | 	if all[i].n != all[j].n {
+     | 		return all[i].n &gt; all[j].n
+     | 	}
+     | … (5 more line(s); --full shows all)
+     ok: parses, tangles, no placeholders
+     second opinion:
+       VERDICT: concerns
+       - the error of the scanner is never looked at
+       - fine otherwise: it does what the hint says
+
+  the checks passed, but a second opinion raised concerns; read them above. lit review --approve ID records that you looked.</span></pre></div>
+      <div class="term"><button class="btn copy" data-copy="lit review words.lit --approve-all">Copy</button><pre><span class="p">$ </span><span class="c">lit review words.lit --approve-all</span>
+  <span class="o">approved f-ea0cf1
+  approved f-663c33</span></pre></div>
+      <div class="term"><button class="btn copy" data-copy="lit tangle words.lit .">Copy</button><pre><span class="p">$ </span><span class="c">lit tangle words.lit .</span>
+  <span class="o">wrote main.go
+  wrote words.lit.map</span></pre></div>
+      <div class="term"><button class="btn copy" data-copy="go run main.go &lt; sample.txt">Copy</button><pre><span class="p">$ </span><span class="c">go run main.go &lt; sample.txt</span>
+  <span class="o">3 the
+  2 and
+  1 bird
+  1 cat
+  1 dog</span></pre></div>
       <div class="gotcha">
         <h3>What this does and does not do</h3>
         <ul>
@@ -613,94 +436,6 @@ section is a chunk, in reading order.
       </div>
     </section>
 
-  [[TUTORIAL]]
-  [[INSTALL]]
-  ```
-}
-
-#page: the toolbelt{
-  The seven tools: the figure of the overview chapter, which the builder takes from the tangled
-  `docs/tools.svg`, and a grid filled in by the interface script from a list.
-
-  ```
-    <section class="block" id="tools">
-      <div class="intro">
-        <h2>The toolbelt</h2>
-        <p>Each tool is a subcommand of one Go binary, <code>lit</code>, built from the standard library and the brashtag parser and nothing else. The skill that teaches an assistant the notation is inside the binary too, and it carries the same tools a second time as Python scripts that need only Python's standard library, so an assistant with just the skill folder can write literate programs and run every tool, including fill and review, with <code>python3</code>.</p>
-      </div>
-      [[svg:../internal/skill/files/docs/tools.svg|How the tools move text between the document, the generated files and the woven page.]]
-      <div class="tools" id="toolgrid"></div>
-    </section>
-  ```
-}
-
-#page: it tangles itself{
-  The claim that this page is itself part of what it describes, with the numbers from the linter
-  and the output of the build. The numbers are placeholders that the builder fills in from the
-  linter's summary line, so they are always the numbers of the document that produced the page.
-
-  ```
-    <section class="block" id="itself">
-      <div class="intro">
-        <h2>It tangles itself</h2>
-        <p>The tools are themselves a literate program, split into thirty-one files: a root and a chapter for each tool or subsystem, ordered by importance, with the plain details in an appendix at the end. Tangling it writes every Go source, the skill's files, the tests, the build script and this page: the page you are reading is one of the chapters. The build vets and tests the Go program, then tangles the document a second time with the binary it just built. The two outputs must be identical. Last, the build runs the tests of the Python scripts and checks that they tangle the document to the same files as the binary.</p>
-      </div>
-      <div class="stats">
-        <div class="stat"><b>__CHUNKS__</b><span>chunks</span></div>
-        <div class="stat"><b>__CODE__</b><span>lines of code</span></div>
-        <div class="stat"><b>__PROSE__</b><span>words of prose</span></div>
-        <div class="stat"><b>29</b><span>files, one root and twenty-eight chapters</span></div>
-      </div>
-      <div class="build" aria-label="Output of build.sh"><span class="m">$</span> sh build.sh
-  <span class="m">== tangle</span>
-  <span class="m">== vet and test</span> <span class="g">go vet clean, go test ok</span>
-  <span class="m">== build</span>        bin/lit, bin/mkpage
-  <span class="m">== fixed point</span>  <span class="g">identical</span>
-  <span class="m">== lint</span>         __LINT__
-  <span class="m">== weave</span>        lit.html, lit.tex
-  <span class="m">== page</span>        <span class="g">15 JavaScript checks passed</span></div>
-      <p class="small-note">Counts are from the linter run on the root and its chapters.</p>
-    </section>
-  </main>
-
-  <footer><div class="wrap">
-    <span>Notation and parser: <a href="https://github.com/PratikDeoghare/brashtag">brashtag</a> by Pratik Deoghare, MIT license.</span>
-    <span>Ideas: Knuth, <i>Literate Programming</i>, 1984; Ramsey, <i>Literate Programming Simplified</i>, 1994.</span>
-  </div></footer>
-  ```
-}
-
-#web/page.body.html{
-  The file is its parts, in the order of the source.
-
-  ```
-  <<<page: top bar and hero>>>
-
-  <<<page: what the tools add>>>
-
-  <<<page: getting the understanding back>>>
-
-  <<<page: the notation>>>
-
-  <<<page: the playground>>>
-
-  <<<page: conventions>>>
-
-  <<<page: chapters>>>
-
-  <<<page: the sync lab>>>
-  <<<page: the toolbelt>>>
-
-  <<<page: it tangles itself>>>
-  ```
-}
-
-#web/tutorial.html{
-  The linear tutorial: one legacy script taken through every tool. Everything in double brackets
-  is replaced by the builder with recorded output or file text, so the commands shown are the
-  commands that were run.
-
-  ```
     <section class="block" id="tutorial">
       <div class="intro">
         <h2>Tutorial: a legacy script, start to finish</h2>
@@ -710,106 +445,306 @@ section is a chunk, in reading order.
         <li>
           <h3>Install</h3>
           <p>Put the binary on your path, then put the skill where Claude looks for skills.</p>
-          [[term:t1:lit install-skill]]
+          <div class="term"><button class="btn copy" data-copy="lit install-skill">Copy</button><pre><span class="p">$ </span><span class="c">lit install-skill</span>
+  <span class="o">installed the skill brashtag-literate 0.2.0 in ~/.claude/skills/brashtag-literate</span></pre></div>
         </li>
         <li>
           <h3>Start from code nobody wants to read</h3>
           <p>This is the whole program: three functions and a demo. It works. It does not say why Oregon is special, where the tax rate comes from, or what happens at 100 units.</p>
-          [[code:invoice.orig.py:invoice.py]]
+          <div class="codefile"><div class="file-head"><span>invoice.py</span><span>40 lines</span></div><pre>import sys
+
+  TAX = 0.0825
+
+
+  def price_for(qty, unit):
+      # volume pricing
+      if qty &gt;= 100:
+          unit = unit * 0.85
+      elif qty &gt;= 10:
+          unit = unit * 0.95
+      return unit
+
+
+  def invoice(items, region="TX"):
+      sub = 0
+      lines = []
+      for name, qty, unit in items:
+          p = price_for(qty, unit)
+          amt = round(p * qty, 2)
+          lines.append((name, qty, p, amt))
+          sub += amt
+      tax = 0 if region == "OR" else round(sub * TAX, 2)
+      total = round(sub + tax, 2)
+      return lines, sub, tax, total
+
+
+  def render(lines, sub, tax, total):
+      out = []
+      for name, qty, p, amt in lines:
+          out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+      out.append("%-12s %29.2f" % ("subtotal", sub))
+      out.append("%-12s %29.2f" % ("tax", tax))
+      out.append("%-12s %29.2f" % ("TOTAL", total))
+      return "\n".join(out)
+
+
+  if __name__ == "__main__":
+      items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
+      print(render(*invoice(items, sys.argv[1] if len(sys.argv) &gt; 1 else "TX")))</pre></div>
           <p>Keep a copy of the original. You will compare against it in a moment.</p>
-          [[cmd:cp invoice.py ../invoice.orig.py]]
+          <div class="term"><button class="btn copy" data-copy="cp invoice.py ../invoice.orig.py">Copy</button><pre><span class="p">$ </span><span class="c">cp invoice.py ../invoice.orig.py</span></pre></div>
         </li>
         <li>
           <h3>Ask Claude</h3>
           <p>Open Claude in the project and give it the prompt from above. It reads the code, runs it, and writes <code>invoice.lit</code>. Here is the part of the document that covers pricing. The prose is new, and the code is the original, line for line.</p>
-          [[file:invoice.before-absorb.lit:12:35:invoice.lit]]
+          <div class="codefile"><div class="file-head"><span>invoice.lit (excerpt)</span><span>24 lines</span></div><pre>#h2{Volume pricing}
+
+  #price_for{
+    The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
+    from 100 units a 15 percent discount. The discount applies to the unit price, not to the line,
+    and the thresholds are the first match in order, so a quantity of 100 gets the larger discount
+    only and the two never combine.
+
+    ```
+    def price_for(qty, unit):
+        # volume pricing
+        &lt;&lt;&lt;discount tiers&gt;&gt;&gt;
+        return unit
+    ```
+
+    #discount tiers{
+      ```
+      if qty &gt;= 100:
+          unit = unit * 0.85
+      elif qty &gt;= 10:
+          unit = unit * 0.95
+      ```
+    }
+  }</pre></div>
           <p>The same document ends with an <b>Open questions</b> section for things the code does not settle. That section is how you tell an explanation from a guess.</p>
         </li>
         <li>
           <h3>Check it</h3>
           <p>Lint checks the document's structure. Tangle writes the code into the project, next to where it always lived, so nothing about the build changes. Then compare against your copy.</p>
-          [[term:t1:lit lint invoice.lit]]
-          [[term:t1:lit tangle invoice.lit .]]
-          [[term:t1:diff ../invoice.orig.py invoice.py]]
+          <div class="term"><button class="btn copy" data-copy="lit lint invoice.lit">Copy</button><pre><span class="p">$ </span><span class="c">lit lint invoice.lit</span>
+  <span class="o">7 chunks, 46 code lines, 399 words of prose, 0 citations, 0 bibliography entries; 0 error(s), 0 warning(s)</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit tangle invoice.lit .">Copy</button><pre><span class="p">$ </span><span class="c">lit tangle invoice.lit .</span>
+  <span class="o">wrote invoice.py
+  wrote invoice.lit.map</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="diff ../invoice.orig.py invoice.py">Copy</button><pre><span class="p">$ </span><span class="c">diff ../invoice.orig.py invoice.py</span></pre></div>
           <p>No output from <code>diff</code> means the generated file is identical to the original. The behaviour cannot have changed, and the program still runs:</p>
-          [[term:t1:python3 invoice.py]]
+          <div class="term"><button class="btn copy" data-copy="python3 invoice.py">Copy</button><pre><span class="p">$ </span><span class="c">python3 invoice.py</span>
+  <span class="o">widget         12 x     3.32 =      39.90
+  gizmo           1 x    19.99 =      19.99
+  bolt          250 x     0.10 =      25.50
+  subtotal                             85.39
+  tax                                   7.04
+  TOTAL                                92.43</span></pre></div>
         </li>
         <li>
           <h3>Read it</h3>
           <p>Weave turns the document into a page with a table of contents, numbered chunks you can click through, and a chunk index. It also writes LaTeX, ready for your own engine.</p>
-          [[term:t1:lit weave invoice.lit -o site]]
+          <div class="term"><button class="btn copy" data-copy="lit weave invoice.lit -o site">Copy</button><pre><span class="p">$ </span><span class="c">lit weave invoice.lit -o site</span>
+  <span class="o">wrote site/invoice.html  (7 chunks, 0 citations)
+  wrote site/invoice.tex   -&gt; compile with:  latexmk -pdf invoice.tex</span></pre></div>
           <p>Open <code>site/invoice.html</code> in a browser. A <code>.lit</code> file is also perfectly readable in any editor, because it is plain text.</p>
         </li>
         <li>
           <h3>Find your way around</h3>
           <p>Tangle also wrote a sourcemap. Ask where line 23 of <code>invoice.py</code> came from, and then where line 66 of the document ends up. Output is <code>path:line:column</code>, which most editors can jump to.</p>
-          [[term:t1:lit addr invoice.lit invoice.py:23]]
-          [[term:t2:lit addr invoice.lit invoice.lit:66]]
+          <div class="term"><button class="btn copy" data-copy="lit addr invoice.lit invoice.py:23">Copy</button><pre><span class="p">$ </span><span class="c">lit addr invoice.lit invoice.py:23</span>
+  <span class="o">invoice.lit:66:5  «tax and total»</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit addr invoice.lit invoice.lit:66">Copy</button><pre><span class="p">$ </span><span class="c">lit addr invoice.lit invoice.lit:66</span>
+  <span class="o">invoice.py:23:5  «tax and total»</span></pre></div>
         </li>
         <li>
           <h3>A teammate changes the code</h3>
           <p>Someone fixes <code>invoice.py</code> in their editor without knowing a document exists. They raise the discount threshold to 12 and add a guard for an empty order.</p>
-          [[term:t2:diff ../invoice.orig.py invoice.py]]
+          <div class="term"><button class="btn copy" data-copy="diff ../invoice.orig.py invoice.py">Copy</button><pre><span class="p">$ </span><span class="c">diff ../invoice.orig.py invoice.py</span>
+  <span class="o">10c10
+  &lt;     elif qty &gt;= 10:
+  ---
+  &gt;     elif qty &gt;= 12:
+  15a16,17
+  &gt;     if not items:
+  &gt;         raise ValueError("no items")</span></pre></div>
           <p>Ask absorb what it would do. It maps each changed line through the sourcemap to the chunk that wrote it, and removes the indentation that references added.</p>
-          [[term:t2:lit absorb invoice.lit --dry-run]]
+          <div class="term"><button class="btn copy" data-copy="lit absorb invoice.lit --dry-run">Copy</button><pre><span class="p">$ </span><span class="c">lit absorb invoice.lit --dry-run</span>
+  <span class="o">  invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
+    invoice.py:15+  2 line(s) added
+  --- a/invoice.lit
+  +++ b/invoice.lit
+  @@ -30,3 +30,3 @@
+           unit = unit * 0.85
+  -    elif qty &gt;= 10:
+  +    elif qty &gt;= 12:
+           unit = unit * 0.95
+  @@ -48,2 +48,4 @@
+     def invoice(items, region="TX"):
+  +      if not items:
+  +          raise ValueError("no items")
+         sub = 0
+
+  (dry run: nothing written)</span></pre></div>
           <p>Looks right. Run it for real, without <code>--dry-run</code>. Then see what it did to the document.</p>
-          [[term:t2:lit absorb invoice.lit]]
+          <div class="term"><button class="btn copy" data-copy="lit absorb invoice.lit">Copy</button><pre><span class="p">$ </span><span class="c">lit absorb invoice.lit</span>
+  <span class="o">  invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
+    invoice.py:15+  2 line(s) added
+  --- a/invoice.lit
+  +++ b/invoice.lit
+  @@ -30,3 +30,3 @@
+           unit = unit * 0.85
+  -    elif qty &gt;= 10:
+  +    elif qty &gt;= 12:
+           unit = unit * 0.95
+  @@ -48,2 +48,4 @@
+     def invoice(items, region="TX"):
+  +      if not items:
+  +          raise ValueError("no items")
+         sub = 0
+
+  absorbed edits from 1 file(s) into invoice.lit; sourcemap refreshed</span></pre></div>
           <p>The code in the document now matches the code in the project. The prose does not: it still says the discount starts at 10 units. Absorb changes code and never prose, because only you know what the words should say.</p>
-          [[term:t2:grep -n From 10 units invoice.lit|grep -n "From 10 units" invoice.lit]]
+          <div class="term"><button class="btn copy" data-copy="grep -n &quot;From 10 units&quot; invoice.lit">Copy</button><pre><span class="p">$ </span><span class="c">grep -n "From 10 units" invoice.lit</span>
+  <span class="o">15:  The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and</span></pre></div>
           <p>Fix the sentence in the document. That is an ordinary edit.</p>
         </li>
         <li>
           <h3>You both edit, on the same day</h3>
           <p>You raise the tax rate in the document. Meanwhile the teammate exempts New Hampshire in <code>invoice.py</code>. Whichever of tangle and absorb you ran first used to decide whose edit survived. Sync remembers what both sides looked like at the last agreement, and compares each against that.</p>
-          [[term:t3:lit sync invoice.lit status]]
-          [[term:t3:lit sync invoice.lit diff]]
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit status">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit status</span>
+  <span class="o">  invoice.py                   in sync
+
+  everything is in sync.</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit diff">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit diff</span>
+  <span class="o">
+  == invoice.py  region 1/2  (base lines 3-3)  made in the .lit; the generated file does not have it
+        1 | import sys
+        2 | 
+   -     | TAX = 0.0825
+   +     | TAX = 0.0875
+        4 | 
+        5 | 
+        6 | def price_for(qty, unit):
+
+  == invoice.py  region 2/2  (base lines 25-25)  made in the generated file; the .lit does not have it
+       22 |         amt = round(p * qty, 2)
+       23 |         lines.append((name, qty, p, amt))
+       24 |         sub += amt
+   -     |     tax = 0 if region == "OR" else round(sub * TAX, 2)
+   +     |     tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+       26 |     total = round(sub + tax, 2)
+       27 |     return lines, sub, tax, total
+       28 | </span></pre></div>
           <p>Two changes in different places. Merge brings each across, in its own direction.</p>
-          [[term:t3:lit sync invoice.lit merge]]
-          [[term:t3:lit sync invoice.lit status]]
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit merge">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit merge</span>
+  <span class="o">
+  the .lit would change:
+  --- a/invoice.lit
+  +++ b/invoice.lit
+  @@ -67,3 +67,3 @@
+       ```
+  -    tax = 0 if region == "OR" else round(sub * TAX, 2)
+  +    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
+       total = round(sub + tax, 2)
+  generated files rewritten: invoice.py
+
+  synced. .lit updated; wrote: invoice.py. Previous versions are kept (see `log`).</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit status">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit status</span>
+  <span class="o">  invoice.py                   in sync
+
+  everything is in sync.</span></pre></div>
         </li>
         <li>
           <h3>When you touch the same line</h3>
           <p>You set <code>TAX = 0.0925</code> in the document. The teammate sets <code>TAX = 0.09</code> in the file. Merge will not choose for you.</p>
-          [[term:t4:lit sync invoice.lit merge]]
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit merge">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit merge</span>
+  <span class="o">
+  the .lit would not change
+  generated files rewritten: none
+  left pending: 1 region(s)
+
+  synced. .lit unchanged; wrote: no generated files. Previous versions are kept (see `log`).
+  1 conflict(s) left pending; resolve with `pick` or `merge --prefer ...`</span></pre><span class="exit">exit 1</span></div>
           <p>Nothing was changed. You can decide with <code>--prefer lit</code>, <code>--prefer gen</code> or <code>--prefer newer</code>, or pick by hand, as in the step after next. Here the document wins. The losing text is not gone:</p>
-          [[term:t4:lit sync invoice.lit merge --prefer lit]]
-          [[term:t5:lit sync invoice.lit restore invoice.py --list]]
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit merge --prefer lit">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit merge --prefer lit</span>
+  <span class="o">
+  the .lit would not change
+  generated files rewritten: invoice.py
+
+  synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit restore invoice.py --list">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit restore invoice.py --list</span>
+  <span class="o">19:35:20  backup    4171669d  before sync
+  19:35:20  backup    ab79045c  before sync
+  19:35:21  backup    ba30967a  replaced by tangle</span></pre></div>
         </li>
         <li>
           <h3>You forgot to sync and ran tangle</h3>
           <p>Tangle rewrites generated files. If one holds an edit that the document does not have, tangle says so and keeps a copy first.</p>
-          [[term:t5:lit tangle invoice.lit .]]
-          [[term:t5:lit sync invoice.lit restore invoice.py --list]]
+          <div class="term"><button class="btn copy" data-copy="lit tangle invoice.lit .">Copy</button><pre><span class="p">$ </span><span class="c">lit tangle invoice.lit .</span>
+  <span class="o">wrote invoice.py
+  wrote invoice.lit.map
+  warning: invoice.py had edits that are not in the .lit; tangle replaced them, but a copy is kept (snapshot ba30967a; see lit sync invoice.lit log / restore)</span></pre></div>
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit restore invoice.py --list">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit restore invoice.py --list</span>
+  <span class="o">19:35:20  backup    4171669d  before sync
+  19:35:20  backup    ab79045c  before sync
+  19:35:21  backup    ba30967a  replaced by tangle</span></pre></div>
           <p>Bring one back with <code>lit sync invoice.lit restore invoice.py --sha ba30967a</code>, or print it with <code>--stdout</code>.</p>
         </li>
         <li>
           <h3>Choose, change by change</h3>
           <p>Pick walks through every region, like <code>git add -p</code> but in both directions. Here the document changed one line, the file another. The keys are in the prompt: apply, leave alone, revert, edit, and so on. I answered <b>y</b>, <b>n</b>, then <b>y</b> to write.</p>
-          [[pick]]
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit pick">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit pick</span>
+  <span class="o">== invoice.py  region 1/2  (base lines 18-18)  made in the .lit; the generated file does not have it
+       15 | def invoice(items, region="TX"):
+       16 |     if not items:
+       17 |         raise ValueError("no items")
+   -     |     sub = 0
+   +     |     sub = 0.0
+       19 |     lines = []
+       20 |     for name, qty, unit in items:
+       21 |         p = price_for(qty, unit)
+  apply to the generated file? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] &gt; y
+  == invoice.py  region 2/2  (base lines 33-33)  made in the generated file; the .lit does not have it
+       30 | def render(lines, sub, tax, total):
+       31 |     out = []
+       32 |     for name, qty, p, amt in lines:
+   -     |         out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+   +     |         out.append("%-14s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
+       34 |     out.append("%-12s %29.2f" % ("subtotal", sub))
+       35 |     out.append("%-12s %29.2f" % ("tax", tax))
+       36 |     out.append("%-12s %29.2f" % ("TOTAL", total))
+  apply to the .lit? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] &gt; n
+  the .lit would not change
+  generated files rewritten: invoice.py
+  left pending: 1 region(s)
+
+  Write these changes? [y/n] &gt; y
+
+  synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).</span></pre></div>
           <p>The change from the document went into the file. The file's change was left pending, so it is still there next time:</p>
-          [[term:t7:lit sync invoice.lit status]]
+          <div class="term"><button class="btn copy" data-copy="lit sync invoice.lit status">Copy</button><pre><span class="p">$ </span><span class="c">lit sync invoice.lit status</span>
+  <span class="o">  invoice.py                   1 edited in the file
+
+  1 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick</span></pre></div>
         </li>
         <li>
           <h3>Watch, if you like</h3>
           <p>Watch records every change to the document and its files, and never modifies anything. Leave <code>lit watch invoice.lit</code> running in a terminal. With <code>--once</code> it records what changed since it last ran and exits.</p>
-          [[term:t6:lit watch invoice.lit --once]]
+          <div class="term"><button class="btn copy" data-copy="lit watch invoice.lit --once">Copy</button><pre><span class="p">$ </span><span class="c">lit watch invoice.lit --once</span>
+  <span class="o">          waiting: 1 change(s) from the .lit, 1 edit(s) in generated files   -&gt;  lit sync invoice.lit status</span></pre></div>
           <p><code>lit sync invoice.lit log</code> then shows the journal, and <code>sync ... merge --prefer newer</code> uses the recorded edit times to settle conflicts.</p>
         </li>
         <li>
           <h3>Remove it</h3>
           <p>When you are done, one command removes the skill and, after asking, the package.</p>
-          [[term:t7:lit uninstall-skill]]
+          <div class="term"><button class="btn copy" data-copy="lit uninstall-skill">Copy</button><pre><span class="p">$ </span><span class="c">lit uninstall-skill</span>
+  <span class="o">removed ~/.claude/skills/brashtag-literate</span></pre></div>
           <p>Plain <code>lit uninstall</code> removes the skill and then asks before it removes the package. Add <code>--yes</code> to skip the question.</p>
         </li>
       </ol>
     </section>
-  ```
-}
 
-#web/install.html{
-  Install and remove, with the two commands each way.
-
-  ```
     <section class="block" id="install">
       <div class="intro">
         <h2>Install and remove</h2>
@@ -830,7 +765,134 @@ section is a chunk, in reading order.
         </div>
       </div>
     </section>
-  ```
+
+    <section class="block" id="tools">
+      <div class="intro">
+        <h2>The toolbelt</h2>
+        <p>Each tool is a subcommand of one Go binary, <code>lit</code>, built from the standard library and the brashtag parser and nothing else. The skill that teaches an assistant the notation is inside the binary too, and it carries the same tools a second time as Python scripts that need only Python's standard library, so an assistant with just the skill folder can write literate programs and run every tool, including fill and review, with <code>python3</code>.</p>
+      </div>
+      <figure class="diagram"><div class="scroll"><svg role="img" aria-label="How the tools move text between the document, the generated files and the woven page." xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 590" width="980" height="590">
+    <title>How the tools move text between the literate document, the generated files and the woven page</title>
+    <style>
+      .fx-box { fill: currentColor; fill-opacity: .05; stroke: currentColor; stroke-opacity: .55; stroke-width: 1.5 }
+      .fx-out { stroke-dasharray: 7 5; fill-opacity: .02 }
+      .fx-t { font: 600 18px system-ui, Helvetica, Arial, sans-serif; fill: currentColor }
+      .fx-s { font: 13px system-ui, Helvetica, Arial, sans-serif; fill: currentColor; fill-opacity: .72 }
+      .fx-tool { font: 700 16px ui-monospace, Menlo, Consolas, monospace; fill: #c2410c }
+      .fx-arrow { stroke: #c2410c; stroke-width: 2.6; fill: none }
+      .fx-thin { stroke: currentColor; stroke-opacity: .5; stroke-width: 1.4; stroke-dasharray: 3 4; fill: none }
+      .fx-note { font: italic 13px system-ui, Helvetica, Arial, sans-serif; fill: currentColor; fill-opacity: .72 }
+    </style>
+    <defs>
+      <marker id="fx-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0 0L10 5L0 10z" fill="#c2410c"/>
+      </marker>
+      <marker id="fx-l" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M10 0L0 5L10 10z" fill="#c2410c"/>
+      </marker>
+    </defs>
+
+    <!-- the three places text lives -->
+    <rect class="fx-box fx-out" x="10" y="200" width="160" height="140" rx="12"/>
+    <text class="fx-t" x="90" y="262" text-anchor="middle">existing code</text>
+    <text class="fx-s" x="90" y="284" text-anchor="middle">legacy, or written</text>
+    <text class="fx-s" x="90" y="302" text-anchor="middle">by an agent</text>
+
+    <rect class="fx-box" x="290" y="200" width="230" height="140" rx="12"/>
+    <text class="fx-t" x="405" y="252" text-anchor="middle">the document</text>
+    <text class="fx-s" x="405" y="276" text-anchor="middle">one .lit root</text>
+    <text class="fx-s" x="405" y="294" text-anchor="middle">plus a chapter file</text>
+    <text class="fx-s" x="405" y="312" text-anchor="middle">for each subsystem</text>
+
+    <rect class="fx-box" x="700" y="200" width="230" height="140" rx="12"/>
+    <text class="fx-t" x="815" y="252" text-anchor="middle">generated files</text>
+    <text class="fx-s" x="815" y="276" text-anchor="middle">.py  .js  .go  .toml ...</text>
+    <text class="fx-s" x="815" y="294" text-anchor="middle">what the compiler and</text>
+    <text class="fx-s" x="815" y="312" text-anchor="middle">your teammates see</text>
+
+    <!-- reading: lit -> woven -> pdf -->
+    <rect class="fx-box" x="500" y="30" width="200" height="64" rx="12"/>
+    <text class="fx-t" x="600" y="58" text-anchor="middle">woven page</text>
+    <text class="fx-s" x="600" y="78" text-anchor="middle">.html and .tex</text>
+    <rect class="fx-box fx-out" x="770" y="30" width="190" height="64" rx="12"/>
+    <text class="fx-t" x="865" y="58" text-anchor="middle">pdf</text>
+    <text class="fx-s" x="865" y="78" text-anchor="middle">to read or print</text>
+    <path class="fx-arrow" d="M405 200 V62 H498" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="452" y="52" text-anchor="middle">weave</text>
+    <path class="fx-arrow" d="M702 62 H768" marker-end="url(#fx-r)" stroke-dasharray="7 5"/>
+    <text class="fx-s" x="735" y="52" text-anchor="middle">xelatex</text>
+    <path class="fx-arrow" d="M865 96 V128" marker-end="url(#fx-r)" stroke-dasharray="7 5" stroke-width="1.8"/>
+    <rect class="fx-box fx-out" x="770" y="130" width="190" height="56" rx="12"/>
+    <text class="fx-t" x="865" y="154" text-anchor="middle">paper</text>
+    <text class="fx-s" x="865" y="173" text-anchor="middle">where the tradition began</text>
+
+    <!-- checking -->
+    <rect class="fx-box" x="40" y="30" width="170" height="64" rx="12"/>
+    <text class="fx-t" x="125" y="58" text-anchor="middle">lint</text>
+    <text class="fx-s" x="125" y="78" text-anchor="middle">structure, citations</text>
+    <path class="fx-arrow" d="M125 94 V150 H340 V198" marker-end="url(#fx-r)" stroke-width="1.8"/>
+
+    <!-- writing: existing code -> lit -->
+    <path class="fx-arrow" d="M172 270 H288" marker-end="url(#fx-r)" stroke-dasharray="7 5"/>
+    <text class="fx-tool" x="230" y="256" text-anchor="middle">Claude</text>
+    <text class="fx-s" x="230" y="292" text-anchor="middle">with the skill</text>
+
+    <!-- the three ways between document and files -->
+    <path class="fx-arrow" d="M522 236 H698" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="610" y="228" text-anchor="middle">tangle</text>
+    <path class="fx-arrow" d="M522 270 H698" marker-start="url(#fx-l)" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="610" y="262" text-anchor="middle">sync</text>
+    <path class="fx-arrow" d="M698 304 H522" marker-end="url(#fx-r)"/>
+    <text class="fx-tool" x="610" y="326" text-anchor="middle">absorb</text>
+
+    <!-- shared state -->
+    <path class="fx-thin" d="M200 410 V385 H900 V410 M340 385 V342 M800 385 V342 M605 385 V400"/>
+    <rect class="fx-box" x="415" y="400" width="380" height="84" rx="12"/>
+    <text class="fx-t" x="605" y="428" text-anchor="middle">what the tools remember</text>
+    <text class="fx-s" x="605" y="452" text-anchor="middle">.map: which line of the document wrote each generated line</text>
+    <text class="fx-s" x="605" y="470" text-anchor="middle">.sync/: the last agreed state, every version, a journal</text>
+
+    <rect class="fx-box" x="60" y="410" width="210" height="64" rx="12"/>
+    <text class="fx-tool" x="165" y="438" text-anchor="middle">watch</text>
+    <text class="fx-s" x="165" y="458" text-anchor="middle">records edits on both sides</text>
+    <rect class="fx-box" x="830" y="410" width="140" height="64" rx="12"/>
+    <text class="fx-tool" x="900" y="438" text-anchor="middle">addr</text>
+    <text class="fx-s" x="900" y="458" text-anchor="middle">line to line</text>
+
+    <text class="fx-note" x="490" y="530" text-anchor="middle">Solid arrows: a tool that writes. Dotted lines: the shared state that tangle, absorb, sync, watch and addr read.</text>
+    <text class="fx-note" x="490" y="550" text-anchor="middle">Dashed boxes and arrows: not part of the toolkit. Every tool is also a subcommand of lit.</text>
+  </svg></div><figcaption>How the tools move text between the document, the generated files and the woven page.</figcaption></figure>
+      <div class="tools" id="toolgrid"></div>
+    </section>
+
+    <section class="block" id="itself">
+      <div class="intro">
+        <h2>It tangles itself</h2>
+        <p>The tools are themselves a literate program, split into thirty-one files: a root and a chapter for each tool or subsystem, ordered by importance, with the plain details in an appendix at the end. Tangling it writes every Go source, the skill's files, the tests, the build script and this page: the page you are reading is one of the chapters. The build vets and tests the Go program, then tangles the document a second time with the binary it just built. The two outputs must be identical. Last, the build runs the tests of the Python scripts and checks that they tangle the document to the same files as the binary.</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>368</b><span>chunks</span></div>
+        <div class="stat"><b>17,415</b><span>lines of code</span></div>
+        <div class="stat"><b>16,366</b><span>words of prose</span></div>
+        <div class="stat"><b>29</b><span>files, one root and twenty-eight chapters</span></div>
+      </div>
+      <div class="build" aria-label="Output of build.sh"><span class="m">$</span> sh build.sh
+  <span class="m">== tangle</span>
+  <span class="m">== vet and test</span> <span class="g">go vet clean, go test ok</span>
+  <span class="m">== build</span>        bin/lit, bin/mkpage
+  <span class="m">== fixed point</span>  <span class="g">identical</span>
+  <span class="m">== lint</span>         0 error(s), 3 warning(s)
+  <span class="m">== weave</span>        lit.html, lit.tex
+  <span class="m">== page</span>        <span class="g">15 JavaScript checks passed</span></div>
+      <p class="small-note">Counts are from the linter run on the root and its chapters.</p>
+    </section>
+  </main>
+
+  <footer><div class="wrap">
+    <span>Notation and parser: <a href="https://github.com/PratikDeoghare/brashtag">brashtag</a> by Pratik Deoghare, MIT license.</span>
+    <span>Ideas: Knuth, <i>Literate Programming</i>, 1984; Ramsey, <i>Literate Programming Simplified</i>, 1994.</span>
+  </div></footer>
+  ````
 }
 
 #h2{The page's style}
@@ -2374,1018 +2436,241 @@ each is a file chunk of its own.
   ````
 }
 
-#h2{Recorded runs}
+#h2{The parser for the page}
 
-The tutorial shows what `lit` printed when it was run on a small legacy script, in a scratch
-home directory. The transcripts are recordings, kept as data: a transcript line that starts with
-a dollar sign is a command, and the exit status closes each run. The script and the two stages
-of its literate version are kept beside them.
+The page runs the brashtag parser in the reader's browser, so it needs the parser as JavaScript.
+It is the parser of the brashtag repository, the same grammar as the Go parser's, and it is kept
+here, next to the page, so that tangling this document is all it takes: nothing else has to be
+found or installed.
 
-#web/tut/t1.txt{
-  Install the skill, lint, tangle, check the result against the original script, run it, weave,
-  and look up an address.
-
-  ```
-  $ lit install-skill
-  installed the skill brashtag-literate 0.2.0 in /tmp/rec/home/.claude/skills/brashtag-literate
-  [exit 0]
-
-  $ lit lint invoice.lit
-  7 chunks, 46 code lines, 399 words of prose, 0 citations, 0 bibliography entries; 0 error(s), 0 warning(s)
-  [exit 0]
-
-  $ lit tangle invoice.lit .
-  wrote invoice.py
-  wrote invoice.lit.map
-  [exit 0]
-
-  $ diff ../invoice.orig.py invoice.py
-  [exit 0]
-
-  $ python3 invoice.py
-  widget         12 x     3.32 =      39.90
-  gizmo           1 x    19.99 =      19.99
-  bolt          250 x     0.10 =      25.50
-  subtotal                             85.39
-  tax                                   7.04
-  TOTAL                                92.43
-  [exit 0]
-
-  $ lit weave invoice.lit -o site
-  wrote site/invoice.html  (7 chunks, 0 citations)
-  wrote site/invoice.tex   -> compile with:  latexmk -pdf invoice.tex
-  [exit 0]
-
-  $ ls site
-  invoice.html
-  invoice.tex
-  [exit 0]
-
-  $ lit addr invoice.lit invoice.py:23
-  invoice.lit:66:5  «tax and total»
-  [exit 0]
-  ```
-}
-
-#web/tut/t2.txt{
-  A teammate edits the generated file; a dry run of absorb, then absorb itself.
+#web/parser.js{
+  The file is the one from the repository (github.com/PratikDeoghare/brashtag, parser.js), without
+  its leading and trailing blank lines.
 
   ```
-  $ lit addr invoice.lit invoice.lit:66
-  invoice.py:23:5  «tax and total»
-  [exit 0]
 
-  # (a teammate edits invoice.py in their editor: threshold 10 -> 12, plus an empty-list guard)
-
-  $ diff ../invoice.orig.py invoice.py
-  10c10
-  <     elif qty >= 10:
-  ---
-  >     elif qty >= 12:
-  15a16,17
-  >     if not items:
-  >         raise ValueError("no items")
-  [exit 1]
-
-  $ lit absorb invoice.lit --dry-run
-    invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
-    invoice.py:15+  2 line(s) added
-  --- a/invoice.lit
-  +++ b/invoice.lit
-  @@ -30,3 +30,3 @@
-           unit = unit * 0.85
-  -    elif qty >= 10:
-  +    elif qty >= 12:
-           unit = unit * 0.95
-  @@ -48,2 +48,4 @@
-     def invoice(items, region="TX"):
-  +      if not items:
-  +          raise ValueError("no items")
-         sub = 0
-
-  (dry run: nothing written)
-  [exit 0]
-
-  $ lit absorb invoice.lit
-    invoice.py:10  «discount tiers», invoice.lit:31: 1 changed
-    invoice.py:15+  2 line(s) added
-  --- a/invoice.lit
-  +++ b/invoice.lit
-  @@ -30,3 +30,3 @@
-           unit = unit * 0.85
-  -    elif qty >= 10:
-  +    elif qty >= 12:
-           unit = unit * 0.95
-  @@ -48,2 +48,4 @@
-     def invoice(items, region="TX"):
-  +      if not items:
-  +          raise ValueError("no items")
-         sub = 0
-
-  absorbed edits from 1 file(s) into invoice.lit; sourcemap refreshed
-  [exit 0]
-
-  $ diff ../invoice.before-absorb.lit invoice.lit
-  31c31
-  <     elif qty >= 10:
-  ---
-  >     elif qty >= 12:
-  48a49,50
-  >       if not items:
-  >           raise ValueError("no items")
-  [exit 1]
-
-  $ grep -n From 10 units invoice.lit
-  15:  The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
-  [exit 0]
-  ```
-}
-
-#web/tut/t3.txt{
-  Both sides edited, in different places: status, diff and merge.
-
-  ````
-  # (you fix the prose in invoice.lit: "From 10 units" becomes "From 12 units", and change the tax rate in the .lit)
-
-  # (the teammate, meanwhile, exempts New Hampshire in invoice.py)
-
-  $ lit sync invoice.lit status
-  the .lit has changed since the last sync
-    invoice.py                   1 from the .lit, 1 edited in the file
-
-  2 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
-  [exit 0]
-
-  $ lit sync invoice.lit diff
-
-  == invoice.py  region 1/2  (base lines 3-3)  made in the .lit; the generated file does not have it
-        1 | import sys
-        2 | 
-   -     | TAX = 0.0825
-   +     | TAX = 0.0875
-        4 | 
-        5 | 
-        6 | def price_for(qty, unit):
-
-  == invoice.py  region 2/2  (base lines 25-25)  made in the generated file; the .lit does not have it
-       22 |         amt = round(p * qty, 2)
-       23 |         lines.append((name, qty, p, amt))
-       24 |         sub += amt
-   -     |     tax = 0 if region == "OR" else round(sub * TAX, 2)
-   +     |     tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
-       26 |     total = round(sub + tax, 2)
-       27 |     return lines, sub, tax, total
-       28 | 
-  [exit 0]
-
-  $ lit sync invoice.lit merge
-
-  the .lit would change:
-  --- a/invoice.lit
-  +++ b/invoice.lit
-  @@ -67,3 +67,3 @@
-       ```
-  -    tax = 0 if region == "OR" else round(sub * TAX, 2)
-  +    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
-       total = round(sub + tax, 2)
-  generated files rewritten: invoice.py
-
-  synced. .lit updated; wrote: invoice.py. Previous versions are kept (see `log`).
-  [exit 0]
-
-  $ grep -n -e TAX =  -e OR invoice.py
-  3:TAX = 0.0875
-  25:    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
-  [exit 0]
-
-  $ grep -n -e TAX =  -e region in invoice.lit
-  68:    tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
-  119:  TAX = 0.0875
-  [exit 0]
-
-  $ lit sync invoice.lit status
-    invoice.py                   in sync
-
-  everything is in sync.
-  [exit 0]
-  ````
-}
-
-#web/tut/t4.txt{
-  Both sides edited in the same place: the conflict, and merge preferring the document.
-
-  ```
-  # (you set TAX = 0.0925 in the .lit; the teammate sets TAX = 0.09 in invoice.py)
-
-  $ lit sync invoice.lit merge
-
-  the .lit would not change
-  generated files rewritten: none
-  left pending: 1 region(s)
-
-  synced. .lit unchanged; wrote: no generated files. Previous versions are kept (see `log`).
-  1 conflict(s) left pending; resolve with `pick` or `merge --prefer ...`
-  [exit 1]
-
-  $ lit sync invoice.lit merge --prefer lit
-
-  the .lit would not change
-  generated files rewritten: invoice.py
-
-  synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).
-  [exit 0]
-
-  $ cat invoice.py
-  import sys
-
-  TAX = 0.0925
-
-
-  def price_for(qty, unit):
-      # volume pricing
-      if qty >= 100:
-          unit = unit * 0.85
-      elif qty >= 12:
-          unit = unit * 0.95
-      return unit
-
-
-  def invoice(items, region="TX"):
-      if not items:
-          raise ValueError("no items")
-      sub = 0
-      lines = []
-      for name, qty, unit in items:
-          p = price_for(qty, unit)
-          amt = round(p * qty, 2)
-          lines.append((name, qty, p, amt))
-          sub += amt
-      tax = 0 if region in ("OR", "NH") else round(sub * TAX, 2)
-      total = round(sub + tax, 2)
-      return lines, sub, tax, total
-
-
-  def render(lines, sub, tax, total):
-      out = []
-      for name, qty, p, amt in lines:
-          out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-      out.append("%-12s %29.2f" % ("subtotal", sub))
-      out.append("%-12s %29.2f" % ("tax", tax))
-      out.append("%-12s %29.2f" % ("TOTAL", total))
-      return "\n".join(out)
-
-
-  if __name__ == "__main__":
-      items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
-      print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
-  [exit 0]
-  ```
-}
-
-#web/tut/t5.txt{
-  The recorded versions: the list, the log, and a tangle that does not lose the teammate's edit.
-
-  ```
-  $ lit sync invoice.lit restore invoice.py --list
-  19:35:20  backup    4171669d  before sync
-  19:35:20  backup    ab79045c  before sync
-  [exit 0]
-
-  $ lit sync invoice.lit log -n 6
-  2026-11-09 19:35:20  sync      lit  invoice.lit                  -  invoice.py
-  2026-11-09 19:35:20  base      lit  invoice.lit                  1ada16f0  sync
-  2026-11-09 19:35:20  sync      lit  invoice.lit                  -  
-  2026-11-09 19:35:20  backup    gen  invoice.py                   ab79045c  before sync
-  2026-11-09 19:35:20  base      lit  invoice.lit                  1ada16f0  sync
-  2026-11-09 19:35:20  sync      lit  invoice.lit                  -  invoice.py
-  [exit 0]
-
-  # (the teammate edits invoice.py again, and you run tangle before syncing)
-
-  $ lit tangle invoice.lit .
-  wrote invoice.py
-  wrote invoice.lit.map
-  warning: invoice.py had edits that are not in the .lit; tangle replaced them, but a copy is kept (snapshot ba30967a; see lit sync invoice.lit log / restore)
-  [exit 0]
-
-  $ lit sync invoice.lit restore invoice.py --list
-  19:35:20  backup    4171669d  before sync
-  19:35:20  backup    ab79045c  before sync
-  19:35:21  backup    ba30967a  replaced by tangle
-  [exit 0]
-  ```
-}
-
-#web/tut/t6.txt{
-  Choosing region by region with pick, then the state and the watcher's recording.
-
-  ```
-  $ lit sync invoice.lit pick
-
-  == invoice.py  region 1/2  (base lines 18-18)  made in the .lit; the generated file does not have it
-       15 | def invoice(items, region="TX"):
-       16 |     if not items:
-       17 |         raise ValueError("no items")
-   -     |     sub = 0
-   +     |     sub = 0.0
-       19 |     lines = []
-       20 |     for name, qty, unit in items:
-       21 |         p = price_for(qty, unit)
-  apply to the generated file? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
-  == invoice.py  region 2/2  (base lines 33-33)  made in the generated file; the .lit does not have it
-       30 | def render(lines, sub, tax, total):
-       31 |     out = []
-       32 |     for name, qty, p, amt in lines:
-   -     |         out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-   +     |         out.append("%-14s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-       34 |     out.append("%-12s %29.2f" % ("subtotal", sub))
-       35 |     out.append("%-12s %29.2f" % ("tax", tax))
-       36 |     out.append("%-12s %29.2f" % ("TOTAL", total))
-  apply to the .lit? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
-  the .lit would not change
-  generated files rewritten: invoice.py
-  left pending: 1 region(s)
-
-  Write these changes? [y/n] > nothing written.
-  [exit 1]
-
-  $ lit sync invoice.lit status
-  the .lit has changed since the last sync
-    invoice.py                   1 from the .lit, 1 edited in the file
-
-  2 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
-  [exit 0]
-
-  $ lit watch invoice.lit --once
-            waiting: 1 change(s) from the .lit, 1 edit(s) in generated files   ->  lit sync invoice.lit status
-  [exit 0]
-  ```
-}
-
-#web/tut/t7.txt{
-  The rest of the pick session, the state, and the removal of the skill.
-
-  ```
-  $ lit sync invoice.lit pick
-
-  == invoice.py  region 1/2  (base lines 18-18)  made in the .lit; the generated file does not have it
-       15 | def invoice(items, region="TX"):
-       16 |     if not items:
-       17 |         raise ValueError("no items")
-   -     |     sub = 0
-   +     |     sub = 0.0
-       19 |     lines = []
-       20 |     for name, qty, unit in items:
-       21 |         p = price_for(qty, unit)
-  apply to the generated file? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
-  == invoice.py  region 2/2  (base lines 33-33)  made in the generated file; the .lit does not have it
-       30 | def render(lines, sub, tax, total):
-       31 |     out = []
-       32 |     for name, qty, p, amt in lines:
-   -     |         out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-   +     |         out.append("%-14s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-       34 |     out.append("%-12s %29.2f" % ("subtotal", sub))
-       35 |     out.append("%-12s %29.2f" % ("tax", tax))
-       36 |     out.append("%-12s %29.2f" % ("TOTAL", total))
-  apply to the .lit? [y]es [n]o/leave [r]evert [e]dit [a]ll in file [A]ll [p]rev [d]one [q]uit [?] > 
-  the .lit would not change
-  generated files rewritten: invoice.py
-  left pending: 1 region(s)
-
-  Write these changes? [y/n] > 
-  synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`).
-  [exit 0]
-
-  $ lit sync invoice.lit status
-    invoice.py                   1 edited in the file
-
-  1 thing(s) to reconcile: lit sync invoice.lit merge   or   ... pick
-  [exit 0]
-
-  $ lit uninstall-skill
-  removed /tmp/rec/home/.claude/skills/brashtag-literate
-  [exit 0]
-  ```
-}
-
-#web/tut/t9.txt{
-  Gaps for an assistant: list, the context of one, fill with a check, review, and the program that
-  results.
-
-  ```
-  $ lit fill words.lit --list
-    0  words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
-    1  words.lit:35  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
-  [exit 0]
-
-  $ lit fill words.lit --dry-run --show-context
-  hint 0: words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
-  sections: task; where in the document; what the program is; prose of this section; where this chunk is used; other unfilled hints; the chunk, with the gap marked; the tangled file main.go around the gap
-  prompt: 1208 characters
-  [exit 0]
-
-  $ lit fill words.lit --agent 'sh agent.sh' --check 'go vet main.go'
-  filling words.lit:28  «read the words»  count the words of standard input with bufio.Scanner and strings.Fields, lower-c
-    filled as f-ea0cf1 (6 line(s)); lit review shows it
-  filling words.lit:45  «print the top ten»  print at most ten lines of count and word, most frequent first, ties alphabetica
-    filled as f-663c33 (17 line(s)); lit review shows it
-  2 filled, 0 failed, 0 hint(s) still open
-  [exit 0]
-
-  $ lit review words.lit --ai --agent 'sh review.sh'
-  == f-ea0cf1  «read the words»  words.lit:28  [pending, as written]
-     hint:  count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts
-     agent: command: sh agent.sh
-     | sc := bufio.NewScanner(os.Stdin)
-     | for sc.Scan() {
-     | 	for _, w := range strings.Fields(sc.Text()) {
-     | 		counts[strings.ToLower(w)]++
-     | 	}
-     | }
-     ok: parses, tangles, no placeholders
-     second opinion:
-       VERDICT: concerns
-       - the error of the scanner is never looked at
-       - fine otherwise: it does what the hint says
-  == f-663c33  «print the top ten»  words.lit:45  [pending, as written]
-     hint:  print at most ten lines of count and word, most frequent first, ties alphabetical
-     agent: command: sh agent.sh
-     | type kv struct {
-     | 	word string
-     | 	n    int
-     | }
-     | var all []kv
-     | for w, n := range counts {
-     | 	all = append(all, kv{w, n})
-     | }
-     | sort.Slice(all, func(i, j int) bool {
-     | 	if all[i].n != all[j].n {
-     | 		return all[i].n > all[j].n
-     | 	}
-     | … (5 more line(s); --full shows all)
-     ok: parses, tangles, no placeholders
-     second opinion:
-       VERDICT: concerns
-       - the error of the scanner is never looked at
-       - fine otherwise: it does what the hint says
-
-  the checks passed, but a second opinion raised concerns; read them above. lit review --approve ID records that you looked.
-  [exit 0]
-
-  $ lit review words.lit --approve-all
-  approved f-ea0cf1
-  approved f-663c33
-  [exit 0]
-
-  $ lit tangle words.lit .
-  wrote main.go
-  wrote words.lit.map
-  [exit 0]
-
-  $ go run main.go < sample.txt
-  3 the
-  2 and
-  1 bird
-  1 cat
-  1 dog
-  [exit 0]
-  ```
-}
-
-#web/tut/t8.txt{
-  A project in three files: lint, tangle, addresses in chapter files, and absorb writing into the
-  chapter that owns the line.
-
-  ```
-  $ lit lint shop.lit
-  3 chunks, 11 code lines, 109 words of prose, 0 citations, 0 bibliography entries; 0 error(s), 0 warning(s)
-  [exit 0]
-
-  $ lit tangle shop.lit .
-  wrote shop.py
-  wrote shop.lit.map
-  [exit 0]
-
-  $ python3 shop.py
-  widget       12 x    3.32 =    39.84
-  gizmo         1 x   19.99 =    19.99
-  [exit 0]
-
-  $ lit addr shop.lit shop.py:3
-  pricing.lit:9:3  «pricing»
-  [exit 0]
-
-  $ lit addr shop.lit report.lit:8
-  shop.py:6:1  «report»
-  [exit 0]
-
-  # (a teammate lowers the threshold from 12 to 10 in shop.py)
-
-  $ lit absorb shop.lit
-    shop.py:2  «pricing», pricing.lit:8: 1 changed
-  --- a/pricing.lit
-  +++ b/pricing.lit
-  @@ -7,3 +7,3 @@
-     def unit_price(qty, price):
-  -      if qty >= 12:
-  +      if qty >= 10:
-             return round(price * 0.95, 2)
-
-  absorbed edits from 1 file(s) into shop.lit; sourcemap refreshed
-  [exit 0]
-
-  $ lit tangle shop.lit .
-  wrote shop.py
-  wrote shop.lit.map
-  [exit 0]
-  ```
-}
-
-#web/tut/shop/shop.lit{
-  The root of the three-file project.
-
-  ````
-  #h1{A small shop}
-
-  This program prices an order and prints it. It is split into chapters, one for each part of the
-  program: how a unit price is worked out, and how an order is reported. This file is the root: it says
-  what the program is, lists the chapters in reading order, and assembles the one file they produce.
-
-  #include{pricing.lit}
-  #include{report.lit}
-
-  #shop.py{
-    ```
-    \<<<pricing>>>
-
-    \<<<report>>>
-    ```
-  }
-  ````
-}
-
-#web/tut/shop/pricing.lit{
-  A chapter.
-
-  ````
-  #h1{Pricing}
-
-  The unit price falls with the quantity bought: from 12 units there is a discount of 5 percent.
-
-  #pricing{
-    ```
-    def unit_price(qty, price):
-        if qty >= 12:
-            return round(price * 0.95, 2)
-        return price
-    ```
-  }
-  ````
-}
-
-#web/tut/shop/report.lit{
-  Another chapter, which uses a chunk of the first.
-
-  ````
-  #h1{The report}
-
-  An order is a list of (name, quantity, price) triples. Each line is printed with its total. The
-  chapter on pricing says how the unit price is worked out; this one only uses it.
-
-  #report{
-    ```
-    ORDER = [("widget", 12, 3.50), ("gizmo", 1, 19.99)]
-    for name, qty, price in ORDER:
-        unit = unit_price(qty, price)
-        print(f"{name:10s} {qty:4d} x {unit:7.2f} = {qty * unit:8.2f}")
-    ```
-  }
-  ````
-}
-
-#web/tut/words.lit{
-  The word counter with two gaps, which the run of t9 fills in.
-
-  ````
-  #h1{Word counter}
-  Counts the words on its standard input and prints the ten most common.
-
-  #main.go{
-    ```
-    package main
-
-    import (
-    	"bufio"
-    	"fmt"
-    	"os"
-    	"sort"
-    	"strings"
-    )
-
-    func main() {
-    	counts := map[string]int{}
-    	\<<<read the words>>>
-    	\<<<print the top ten>>>
+  export class Bag {
+    constructor(tag, kids = []) {
+      this.tag = tag;
+      this.kids = kids;
     }
-    ```
-  }
 
-  #h2{Reading}
-  Words are separated by white space and compared without regard to case.
+    addKids(...kids) {
+      this.kids.push(...kids);
+    }
 
-  #read the words{
-    #agent-fill-in{count the words of standard input with bufio.Scanner and strings.Fields, lower-cased, into counts}
-  }
+    setTag(tag) {
+      this.tag = tag;
+    }
 
-  #h2{Printing}
-  Most frequent first; words that are equally frequent come in alphabetical order.
-
-  #print the top ten{
-    #agent-fill-in{print at most ten lines of count and word, most frequent first, ties alphabetical}
-  }
-  ````
-}
-
-#web/tut/agent.sh{
-  The stand-in for an assistant: a script that recognises which gap it is asked about and prints a
-  fenced answer. A real model replaces it with a flag.
-
-  ````
-  #!/bin/sh
-  # A canned answer standing in for a model: it recognises which gap it is asked about.
-  p=$(cat)
-  case "$p" in
-  *"Chunk to fill: «read the words»"*)
-  cat <<'X'
-  ```
-  sc := bufio.NewScanner(os.Stdin)
-  for sc.Scan() {
-  	for _, w := range strings.Fields(sc.Text()) {
-  		counts[strings.ToLower(w)]++
-  	}
-  }
-  ```
-  X
-  ;;
-  *)
-  cat <<'X'
-  ```
-  type kv struct {
-  	word string
-  	n    int
-  }
-  var all []kv
-  for w, n := range counts {
-  	all = append(all, kv{w, n})
-  }
-  sort.Slice(all, func(i, j int) bool {
-  	if all[i].n != all[j].n {
-  		return all[i].n > all[j].n
-  	}
-  	return all[i].word < all[j].word
-  })
-  for i := 0; i < len(all) && i < 10; i++ {
-  	fmt.Println(all[i].n, all[i].word)
-  }
-  ```
-  X
-  ;;
-  esac
-  ````
-}
-
-#web/tut/review.sh{
-  The stand-in for a second opinion.
-
-  ```
-  #!/bin/sh
-  # A canned second opinion standing in for a model.
-  cat >/dev/null
-  printf 'VERDICT: concerns\n- the error of the scanner is never looked at\n- fine otherwise: it does what the hint says\n'
-  ```
-}
-
-#web/tut/invoice.orig.py{
-  The legacy script the tutorial starts from.
-
-  ```
-  import sys
-
-  TAX = 0.0825
-
-
-  def price_for(qty, unit):
-      # volume pricing
-      if qty >= 100:
-          unit = unit * 0.85
-      elif qty >= 10:
-          unit = unit * 0.95
-      return unit
-
-
-  def invoice(items, region="TX"):
-      sub = 0
-      lines = []
-      for name, qty, unit in items:
-          p = price_for(qty, unit)
-          amt = round(p * qty, 2)
-          lines.append((name, qty, p, amt))
-          sub += amt
-      tax = 0 if region == "OR" else round(sub * TAX, 2)
-      total = round(sub + tax, 2)
-      return lines, sub, tax, total
-
-
-  def render(lines, sub, tax, total):
-      out = []
-      for name, qty, p, amt in lines:
-          out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-      out.append("%-12s %29.2f" % ("subtotal", sub))
-      out.append("%-12s %29.2f" % ("tax", tax))
-      out.append("%-12s %29.2f" % ("TOTAL", total))
-      return "\n".join(out)
-
-
-  if __name__ == "__main__":
-      items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
-      print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
-  ```
-}
-
-#web/tut/invoice.before-absorb.lit{
-  The literate version as the assistant wrote it.
-
-  ````
-  #h1{Invoicing}
-
-  This program turns a list of purchased items into a printed invoice. It is a small script that grew
-  in place: three functions and a demo. This document explains what each part does and, where the code
-  does not say, what is unknown. The code has not been changed. Tangling this document reproduces
-  `invoice.py` exactly.
-
-  An item is a triple of name, quantity and unit price. An invoice is the priced lines, a subtotal, a
-  tax and a total. Every amount is a Python float rounded to cents, which matters in the section on
-  rounding.
-
-  #h2{Volume pricing}
-
-  #price_for{
-    The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
-    from 100 units a 15 percent discount. The discount applies to the unit price, not to the line,
-    and the thresholds are the first match in order, so a quantity of 100 gets the larger discount
-    only and the two never combine.
-
-    ```
-    def price_for(qty, unit):
-        # volume pricing
-        \<<<discount tiers>>>
-        return unit
-    ```
-
-    #discount tiers{
-      ```
-      if qty >= 100:
-          unit = unit * 0.85
-      elif qty >= 10:
-          unit = unit * 0.95
-      ```
+    string() {
+      return `#${this.tag}{${this.kids.map(k => k.string()).join("")}}`;
     }
   }
 
-  #h2{Pricing a whole invoice}
+  export class Code {
+    constructor(tag, text) {
+      this.tag = tag;
+      this.text = text;
+    }
 
-  #invoice{
-    Each item is priced, its line amount rounded to cents, and the rounded amounts are summed. Rounding
-    each line before summing means the subtotal is the sum of what the customer sees on the page, which
-    is usually what an invoice should do, but it can differ by a cent from rounding the unscaled sum.
+    setTag(tag) {
+      this.tag = tag;
+    }
 
-    The function returns the lines too, because printing needs the discounted unit price, not the
-    original.
+    setText(text) {
+      this.text = text;
+    }
 
-    ```
-    def invoice(items, region="TX"):
-        sub = 0
-        lines = []
-        for name, qty, unit in items:
-            p = price_for(qty, unit)
-            amt = round(p * qty, 2)
-            lines.append((name, qty, p, amt))
-            sub += amt
-        \<<<tax and total>>>
-        return lines, sub, tax, total
-    ```
-
-    #tax and total{
-      Tax is a flat rate on the subtotal, except in region OR, where it is zero. Oregon has no
-      state sales tax, which is the likely reason for the exception. Nothing in the code says so, and
-      no other region is special, so this is an open question for whoever owns the tax rules.
-
-      ```
-      tax = 0 if region == "OR" else round(sub * TAX, 2)
-      total = round(sub + tax, 2)
-      ```
+    string() {
+      return `${this.tag}${this.text}${this.tag}`;
     }
   }
 
-  #h2{Printing}
+  export class Blob {
+    constructor(text) {
+      this.text = text;
+    }
 
-  #render{
-    The layout is fixed-width text: name, quantity, discounted unit price and line amount on each
-    line, then three summary lines whose amounts line up under the line amounts. The widths are
-    literal numbers in the format strings, so changing a width means changing every line that
-    shares it.
+    setText(text) {
+      this.text = text;
+    }
 
-    ```
-    def render(lines, sub, tax, total):
-        out = []
-        for name, qty, p, amt in lines:
-            out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-        out.append("%-12s %29.2f" % ("subtotal", sub))
-        out.append("%-12s %29.2f" % ("tax", tax))
-        out.append("%-12s %29.2f" % ("TOTAL", total))
-        return "\n".join(out)
-    ```
-  }
-
-  #h2{Running it}
-
-  #demo{
-    Run as a script, the module prices three sample items and prints the invoice. An optional first
-    argument is the region.
-
-    ```
-    if __name__ == "__main__":
-        items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
-        print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
-    ```
-  }
-
-  #h2{Open questions}
-
-  The tax rate is a module constant, `0.0825`, with no note of where it comes from or whether it
-  varies by region. The region check treats exactly the string `OR` as exempt and every other string,
-  including a typo, as taxable at the default rate. Neither is changed here.
-
-  #h2{Assembly}
-
-  #invoice.py{
-    ```
-    import sys
-
-    TAX = 0.0825
-
-
-    \<<<price_for>>>
-
-
-    \<<<invoice>>>
-
-
-    \<<<render>>>
-
-
-    \<<<demo>>>
-    ```
-  }
-  ````
-}
-
-#web/tut/invoice.lit{
-  The literate version after absorbing the teammate's edit.
-
-  ````
-  #h1{Invoicing}
-
-  This program turns a list of purchased items into a printed invoice. It is a small script that grew
-  in place: three functions and a demo. This document explains what each part does and, where the code
-  does not say, what is unknown. The code has not been changed. Tangling this document reproduces
-  `invoice.py` exactly.
-
-  An item is a triple of name, quantity and unit price. An invoice is the priced lines, a subtotal, a
-  tax and a total. Every amount is a Python float rounded to cents, which matters in the section on
-  rounding.
-
-  #h2{Volume pricing}
-
-  #price_for{
-    The unit price falls with the quantity bought. From 10 units there is a 5 percent discount, and
-    from 100 units a 15 percent discount. The discount applies to the unit price, not to the line,
-    and the thresholds are the first match in order, so a quantity of 100 gets the larger discount
-    only and the two never combine.
-
-    ```
-    def price_for(qty, unit):
-        # volume pricing
-        \<<<discount tiers>>>
-        return unit
-    ```
-
-    #discount tiers{
-      ```
-      if qty >= 100:
-          unit = unit * 0.85
-      elif qty >= 12:
-          unit = unit * 0.95
-      ```
+    string() {
+      return this.text;
     }
   }
 
-  #h2{Pricing a whole invoice}
+  export function parse(text) {
 
-  #invoice{
-    Each item is priced, its line amount rounded to cents, and the rounded amounts are summed. Rounding
-    each line before summing means the subtotal is the sum of what the customer sees on the page, which
-    is usually what an invoice should do, but it can differ by a cent from rounding the unscaled sum.
+    const result = parseBag(text);
 
-    The function returns the lines too, because printing needs the discounted unit price, not the
-    original.
-
-    ```
-    def invoice(items, region="TX"):
-        if not items:
-            raise ValueError("no items")
-        sub = 0
-        lines = []
-        for name, qty, unit in items:
-            p = price_for(qty, unit)
-            amt = round(p * qty, 2)
-            lines.append((name, qty, p, amt))
-            sub += amt
-        \<<<tax and total>>>
-        return lines, sub, tax, total
-    ```
-
-    #tax and total{
-      Tax is a flat rate on the subtotal, except in region OR, where it is zero. Oregon has no
-      state sales tax, which is the likely reason for the exception. Nothing in the code says so, and
-      no other region is special, so this is an open question for whoever owns the tax rules.
-
-      ```
-      tax = 0 if region == "OR" else round(sub * TAX, 2)
-      total = round(sub + tax, 2)
-      ```
+    if (result.error) {
+      throw new Error(result.error);
     }
+
+    if (result.rest.length !== 0) {
+      throw new Error(
+        "unexpected trailing input: " +
+        result.rest.slice(0, 100)
+      );
+    }
+
+    return result.node;
   }
 
-  #h2{Printing}
+  export function parseBag(text) {
 
-  #render{
-    The layout is fixed-width text: name, quantity, discounted unit price and line amount on each
-    line, then three summary lines whose amounts line up under the line amounts. The widths are
-    literal numbers in the format strings, so changing a width means changing every line that
-    shares it.
+    const root = new Bag("");
 
-    ```
-    def render(lines, sub, tax, total):
-        out = []
-        for name, qty, p, amt in lines:
-            out.append("%-12s %4d x %8.2f = %10.2f" % (name, qty, p, amt))
-        out.append("%-12s %29.2f" % ("subtotal", sub))
-        out.append("%-12s %29.2f" % ("tax", tax))
-        out.append("%-12s %29.2f" % ("TOTAL", total))
-        return "\n".join(out)
-    ```
+    let c = 0;
+    let bagOpen = false;
+
+    while (c < text.length) {
+
+      if (text[c] !== "{") {
+        c++;
+      } else {
+        bagOpen = true;
+        break;
+      }
+    }
+
+    if (!bagOpen) {
+      return {
+        error: "unopened bag missing { after #",
+        rest: text
+      };
+    }
+
+    root.setTag(text.slice(1, c));
+
+    text = text.slice(c + 1);
+
+    while (text.length > 0) {
+
+      if (text[0] === "#") {
+
+        const result = parseBag(text);
+
+        if (result.error) return result;
+
+        root.addKids(result.node);
+
+        text = result.rest;
+
+        continue;
+      }
+
+      if (text[0] === "`") {
+
+        const result = parseCode(text);
+
+        if (result.error) return result;
+
+        root.addKids(result.node);
+
+        text = result.rest;
+
+        continue;
+      }
+
+      if (text[0] === "}") {
+
+        return {
+          node: root,
+          rest: text.slice(1)
+        };
+      }
+
+      const result = parseBlob(text);
+
+      if (result.error) return result;
+
+      root.addKids(result.node);
+
+      text = result.rest;
+    }
+
+    return {
+      error: "bag not closed",
+      rest: text
+    };
   }
 
-  #h2{Running it}
+  export function parseCode(text) {
 
-  #demo{
-    Run as a script, the module prices three sample items and prints the invoice. An optional first
-    argument is the region.
+    const root = new Code("", "");
 
-    ```
-    if __name__ == "__main__":
-        items = [("widget", 12, 3.50), ("gizmo", 1, 19.99), ("bolt", 250, 0.12)]
-        print(render(*invoice(items, sys.argv[1] if len(sys.argv) > 1 else "TX")))
-    ```
+    let c = 0;
+
+    while (c < text.length && text[c] === "`") {
+      c++;
+    }
+
+    root.setTag(text.slice(0, c));
+
+    let j = c;
+
+    while (j < text.length - c + 1) {
+
+      if (text.slice(j, j + c) !== root.tag) {
+        j++;
+      } else {
+
+        root.setText(text.slice(c, j));
+
+        return {
+          node: root,
+          rest: text.slice(j + c)
+        };
+      }
+    }
+
+    return {
+      error: "code not closed",
+      rest: text
+    };
   }
 
-  #h2{Open questions}
+  export function parseBlob(text) {
 
-  The tax rate is a module constant, `0.0825`, with no note of where it comes from or whether it
-  varies by region. The region check treats exactly the string `OR` as exempt and every other string,
-  including a typo, as taxable at the default rate. Neither is changed here.
+    const root = new Blob("");
 
-  #h2{Assembly}
+    let j = 0;
 
-  #invoice.py{
-    ```
-    import sys
+    while (j < text.length) {
 
-    TAX = 0.0825
+      switch (text[j]) {
 
+        case "`":
+        case "#":
+        case "}":
 
-    \<<<price_for>>>
+          root.setText(text.slice(0, j));
 
+          return {
+            node: root,
+            rest: text.slice(j)
+          };
 
-    \<<<invoice>>>
+        case "{":
 
+          return {
+            error: "unexpected {"
+          };
 
-    \<<<render>>>
+        default:
+          j++;
+      }
+    }
 
+    root.setText(text.slice(0, j));
 
-    \<<<demo>>>
-    ```
+    return {
+      node: root,
+      rest: text.slice(j)
+    };
   }
-  ````
+  ```
 }

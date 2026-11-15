@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/pratikdeoghare/lit/internal/lit"
+	"github.com/pratikdeoghare/brashtag-literate/internal/lit"
 )
 
 func main() {

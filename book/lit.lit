@@ -2,11 +2,11 @@
 
 This document is the source of `lit`, the one program that reads, writes and maintains documents
 like it. It is a literate program in brashtag notation, the notation it implements: tangling it
-produces the Go sources, the skill that teaches an assistant to use them, the tests and a build
-script; weaving it produces the document you are reading. A program that tangles itself needs a
-place to start, and that is the bootstrap described in the chapter on the build. The document is
-long, so it is split over files, one chapter for each tool or subsystem, with this file as the
-root that introduces them.
+produces the Go sources, the skill that teaches an assistant to use them, the tests and the
+landing page; weaving it produces the document you are reading. A program that tangles itself
+needs a place to start, and that is the bootstrap described in the chapter on the build. The
+document is long, so it is split over files, one chapter for each tool or subsystem, with this
+file as the root that introduces them.
 
 The design follows from one decision about what a literate source is. A tangled file is a
 function of the document, so the document is the source of truth, but people edit generated

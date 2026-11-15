@@ -1,0 +1,22 @@
+#h1{Bootstrapping and checking}
+
+A program that tangles itself needs something to start from. The first time, use any `lit`
+binary, for example one built from an earlier release; tangling this document with it writes
+every file of the program, the skill and the landing page, and building the result gives a `lit`
+that came from the document. From then on use that one. There is no build script: the document
+is the build, and what a script would do is a few commands. They are listed here so that each
+can be run when it is wanted.
+
+```
+lit tangle lit.lit out            # writes everything, landing.html included
+cd out
+go vet ./... && go test ./...    # the Go program and its tests
+go build -o bin/lit ./cmd/lit    # the new lit
+python3 internal/skill/pytests/test_fill_review.py
+cat web/parser.js web/core.js web/core.tests.mjs > /tmp/t.mjs && node /tmp/t.mjs
+bin/lit lint ../lit.lit          # warnings and errors of the document
+bin/lit tangle ../lit.lit out2   # the fixed point: diff -r out out2 shows nothing
+```
+
+The last pair is the check that the document describes a program that can make itself: the `lit`
+that came out of the document tangles the document again to the same files.

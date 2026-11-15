@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/pratikdeoghare/lit/internal/brashtag"
+	"github.com/pratikdeoghare/brashtag-literate/internal/brashtag"
 )
 
 // A Piece says that Text[Start:End] came from file Name, starting at byte Ofs of that file.
