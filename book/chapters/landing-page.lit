@@ -28,7 +28,7 @@ the one the Go program uses, copied from the brashtag repository, and the page's
 next sections run on the same three files, put one after the other: `cat web/parser.js
 web/core.js web/core.tests.mjs > t.mjs && node t.mjs`.
 
-#landing.html{
+#docs/landing.html{
   The file is its parts. A reference to a file chunk expands to the whole of that file, which is
   how the style, the examples and the three scripts come in.
 
@@ -620,11 +620,11 @@ command; where the tools change, the block is recorded again and the text here r
   <span class="o">
   == invoice.py  region 1/2  (base lines 3-3)  made in the .lit; the generated file does not have it
         1 | import sys
-        2 | 
+        2 |
    -     | TAX = 0.0825
    +     | TAX = 0.0875
-        4 | 
-        5 | 
+        4 |
+        5 |
         6 | def price_for(qty, unit):
 
   == invoice.py  region 2/2  (base lines 25-25)  made in the generated file; the .lit does not have it
