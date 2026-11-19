@@ -331,7 +331,7 @@
 \expandafter\gdef\csname cn@chunk283\endcsname{internal/\allowbreak{}skill/\allowbreak{}files/\allowbreak{}references/\allowbreak{}citations.\allowbreak{}md}
 \expandafter\gdef\csname cn@chunk284\endcsname{internal/\allowbreak{}skill/\allowbreak{}files/\allowbreak{}references/\allowbreak{}tools.\allowbreak{}md}
 \expandafter\gdef\csname cn@chunk285\endcsname{internal/\allowbreak{}skill/\allowbreak{}files/\allowbreak{}assets/\allowbreak{}example.\allowbreak{}lit}
-\expandafter\gdef\csname cn@chunk286\endcsname{landing.\allowbreak{}html}
+\expandafter\gdef\csname cn@chunk286\endcsname{docs/\allowbreak{}landing.\allowbreak{}html}
 \expandafter\gdef\csname cn@chunk287\endcsname{landing page: text}
 \expandafter\gdef\csname cn@chunk288\endcsname{style: tokens and base}
 \expandafter\gdef\csname cn@chunk289\endcsname{style: top bar}
@@ -10392,14 +10392,15 @@ code\{background:none;padding:0;font-size:.86em\}
 .chunk\{margin:2.2rem 0;padding:0\}
 .chunk.nested\{margin:1.4rem 0 1.4rem .9rem;padding-left:.9rem;border-left:1px solid var(--rule)\}
 .chunk:target>.chunk-head\{background:var(--hl)\}
-.chunk-head\{font-size:1.02rem;padding:.1rem .3rem;margin-left:-.3rem\}
-.chunk-head .num\{color:var(--muted);margin-right:.4rem\}
-.cname\{font-style:normal;font-family:"Latin Modern Mono",ui-monospace,"DejaVu Sans Mono",monospace;font-size:.88em\}.eq\{color:var(--muted)\}
+.chunk-head\{font-size:1rem;padding:.1rem .3rem;margin-left:-.3rem;margin-top:.2rem\}
+.chunk-head .num\{color:var(--accent);font-weight:700;margin-right:.5rem\}
+.cname\{font-style:normal;font-family:"Latin Modern Mono",ui-monospace,"DejaVu Sans Mono",monospace;font-weight:700;font-size:.86em\}.eq\{color:var(--muted)\}
 .badge\{font-variant:small-caps;letter-spacing:.06em;color:var(--muted);font-size:.9rem;font-weight:400\}
-.fname\{font-weight:400\}
+.fname\{font-weight:400;color:var(--accent)\}
+.meta a\{color:var(--accent);text-decoration-color:var(--rule)\}.meta a:hover\{text-decoration-color:var(--accent)\}
 .meta\{font-style:italic;font-size:.82rem;line-height:1.4;color:var(--muted);margin:.1rem 0 .6rem\}
 pre.code\{background:none;border:0;border-left:1px solid var(--rule);border-radius:0;padding:.15rem 0 .15rem 1rem;white-space:pre-wrap;overflow-wrap:anywhere;
- font-size:.8rem;line-height:1.45;margin:.9rem 0;tab-size:4\}
+ font-size:.76rem;line-height:1.42;margin:.7rem 0 1.1rem;tab-size:4\}
 a.ref\{font-weight:400\}.ref.bad\{color:var(--bad)\}.rn\{color:var(--muted);font-size:.8em;margin-left:.15rem\}
 .hint\{border-left:2px solid var(--accent);padding:.2rem .9rem;font-style:italic;margin:1rem 0\}
 table.index\{border-collapse:collapse;width:100%;font-size:.9rem;border-top:2px solid var(--fg);border-bottom:2px solid var(--fg)\}
@@ -14878,14 +14879,15 @@ code\{background:none;padding:0;font-size:.86em\}
 .chunk\{margin:2.2rem 0;padding:0\}
 .chunk.nested\{margin:1.4rem 0 1.4rem .9rem;padding-left:.9rem;border-left:1px solid var(--rule)\}
 .chunk:target>.chunk-head\{background:var(--hl)\}
-.chunk-head\{font-size:1.02rem;padding:.1rem .3rem;margin-left:-.3rem\}
-.chunk-head .num\{color:var(--muted);margin-right:.4rem\}
-.cname\{font-style:normal;font-family:"Latin Modern Mono",ui-monospace,"DejaVu Sans Mono",monospace;font-size:.88em\}.eq\{color:var(--muted)\}
+.chunk-head\{font-size:1rem;padding:.1rem .3rem;margin-left:-.3rem;margin-top:.2rem\}
+.chunk-head .num\{color:var(--accent);font-weight:700;margin-right:.5rem\}
+.cname\{font-style:normal;font-family:"Latin Modern Mono",ui-monospace,"DejaVu Sans Mono",monospace;font-weight:700;font-size:.86em\}.eq\{color:var(--muted)\}
 .badge\{font-variant:small-caps;letter-spacing:.06em;color:var(--muted);font-size:.9rem;font-weight:400\}
-.fname\{font-weight:400\}
+.fname\{font-weight:400;color:var(--accent)\}
+.meta a\{color:var(--accent);text-decoration-color:var(--rule)\}.meta a:hover\{text-decoration-color:var(--accent)\}
 .meta\{font-style:italic;font-size:.82rem;line-height:1.4;color:var(--muted);margin:.1rem 0 .6rem\}
 pre.code\{background:none;border:0;border-left:1px solid var(--rule);border-radius:0;padding:.15rem 0 .15rem 1rem;white-space:pre-wrap;overflow-wrap:anywhere;
- font-size:.8rem;line-height:1.45;margin:.9rem 0;tab-size:4\}
+ font-size:.76rem;line-height:1.42;margin:.7rem 0 1.1rem;tab-size:4\}
 a.ref\{font-weight:400\}.ref.bad\{color:var(--bad)\}.rn\{color:var(--muted);font-size:.8em;margin-left:.15rem\}
 .hint\{border-left:2px solid var(--accent);padding:.2rem .9rem;font-style:italic;margin:1rem 0\}
 table.index\{border-collapse:collapse;width:100%;font-size:.9rem;border-top:2px solid var(--fg);border-bottom:2px solid var(--fg)\}
@@ -16483,7 +16485,7 @@ The build needs the brashtag parser as a JavaScript module. The builder copies i
 The page is a single file, \texttt{landing.\allowbreak{}html}, and tangling this document writes it. Nothing has to be run afterwards: the file is only an assembly of chunks, in the order the browser needs them. The style comes first, then the text of the page, then the examples that the editors can load, each in a script element that the browser does not run, and last one script that holds, in this order, the brashtag parser, the core and the interface. The script is a module because the parser is used exactly as it is published, with its \texttt{export} keywords, and a module may contain them; being a module also keeps its names out of the page. The parser is the JavaScript build of the one the Go program uses, copied from the brashtag repository, and the page's tests in the next sections run on the same three files, put one after the other: \texttt{cat web/\allowbreak{}parser.\allowbreak{}js
 web/\allowbreak{}core.\allowbreak{}js web/\allowbreak{}core.\allowbreak{}tests.\allowbreak{}mjs \textgreater{} t.\allowbreak{}mjs \&\& node t.\allowbreak{}mjs}.
 
-\chunkhead{chunk286}{\filebadge\ \textbf{\texttt{landing.\allowbreak{}html}}}
+\chunkhead{chunk286}{\filebadge\ \textbf{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The file is its parts. A reference to a file chunk expands to the whole of that file, which is how the style, the examples and the three scripts come in.
 \begin{Verbatim}
 <title>Brashtag Literate</title>
@@ -16527,7 +16529,7 @@ The file is its parts. A reference to a file chunk expands to the whole of that 
 The text is HTML in sections. Its terminal blocks show what \texttt{lit} printed when it was run on a small legacy script in a scratch directory, and its figure is the diagram of the tools; they are kept as they were recorded and drawn, and so are the numbers about this document in the section about the program, which are the ones the linter reported when the page was last written. Where a block shows the same thing the program would show today it can be checked by running the command; where the tools change, the block is recorded again and the text here replaced.
 
 \chunkhead{chunk287}{\textbf{\ensuremath{\langle}\texttt{landing page: text}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The body of the page, after its header, up to the end of its footer.
 \begin{Verbatim}
 <header class="top wrap">
@@ -17068,11 +17070,11 @@ everything is in sync.</span></pre></div>
 <span class="o">
 == invoice.py  region 1/2  (base lines 3-3)  made in the .lit; the generated file does not have it
       1 | import sys
-      2 | 
+      2 |
  -     | TAX = 0.0825
  +     | TAX = 0.0875
-      4 | 
-      5 | 
+      4 |
+      5 |
       6 | def price_for(qty, unit):
 
 == invoice.py  region 2/2  (base lines 25-25)  made in the generated file; the .lit does not have it
@@ -17348,7 +17350,7 @@ synced. .lit unchanged; wrote: invoice.py. Previous versions are kept (see `log`
 One stylesheet, with colours defined as variables for a light and a dark theme, so that the lamp changes a single attribute. Each part is a chunk.
 
 \chunkhead{chunk288}{\textbf{\ensuremath{\langle}\texttt{style: tokens and base}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The tokens: a warm paper for light, a dim lamp-lit room for dark, one accent, and the font stacks. The layout is a single centred column that never scrolls sideways.
 \begin{Verbatim}
 :root\{
@@ -17390,7 +17392,7 @@ button\{font:inherit;color:inherit;cursor:pointer\}
 \end{Verbatim}
 
 \chunkhead{chunk289}{\textbf{\ensuremath{\langle}\texttt{style: top bar}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The top bar and the lamp.
 \begin{Verbatim}
 /* top bar */
@@ -17406,7 +17408,7 @@ The top bar and the lamp.
 \end{Verbatim}
 
 \chunkhead{chunk290}{\textbf{\ensuremath{\langle}\texttt{style: hero}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The first screen.
 \begin{Verbatim}
 /* hero */
@@ -17430,7 +17432,7 @@ section.block\{padding-block:3rem 1rem\}
 \end{Verbatim}
 
 \chunkhead{chunk291}{\textbf{\ensuremath{\langle}\texttt{style: chips}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The small buttons that load examples.
 \begin{Verbatim}
 /* chips */
@@ -17441,7 +17443,7 @@ The small buttons that load examples.
 \end{Verbatim}
 
 \chunkhead{chunk292}{\textbf{\ensuremath{\langle}\texttt{style: panes and editor}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The editor is a transparent text area over a highlighted copy of the same text, so the text keeps native editing and the highlight follows it.
 \begin{Verbatim}
 /* panes and editor */
@@ -17496,7 +17498,7 @@ pre.gen\{margin:0 0 .6rem;font-size:13px;line-height:var(--lh)\}
 \end{Verbatim}
 
 \chunkhead{chunk293}{\textbf{\ensuremath{\langle}\texttt{style: woven view}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The rendered document inside the playground.
 \begin{Verbatim}
 /* woven */
@@ -17518,7 +17520,7 @@ The rendered document inside the playground.
 \end{Verbatim}
 
 \chunkhead{chunk294}{\textbf{\ensuremath{\langle}\texttt{style: sync lab}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The lab, its regions and its log.
 \begin{Verbatim}
 /* lab */
@@ -17554,7 +17556,7 @@ ul.log .bad\{color:var(--bad)\}ul.log .good\{color:var(--ok)\}
 \end{Verbatim}
 
 \chunkhead{chunk295}{\textbf{\ensuremath{\langle}\texttt{style: notation}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The tree inspector.
 \begin{Verbatim}
 /* notation */
@@ -17568,7 +17570,7 @@ The tree inspector.
 \end{Verbatim}
 
 \chunkhead{chunk296}{\textbf{\ensuremath{\langle}\texttt{style: tools}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The toolbelt grid.
 \begin{Verbatim}
 /* tools */
@@ -17584,7 +17586,7 @@ The toolbelt grid.
 \end{Verbatim}
 
 \chunkhead{chunk297}{\textbf{\ensuremath{\langle}\texttt{style: self-hosting}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The numbers and the build output.
 \begin{Verbatim}
 /* itself */
@@ -17614,7 +17616,7 @@ textarea.plain:focus\{outline:none\}
 \end{Verbatim}
 
 \chunkhead{chunk298}{\textbf{\ensuremath{\langle}\texttt{style: workflow}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 The four steps.
 \begin{Verbatim}
 /* understand / flow */
@@ -17629,7 +17631,7 @@ The four steps.
 \end{Verbatim}
 
 \chunkhead{chunk299}{\textbf{\ensuremath{\langle}\texttt{style: tutorial}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
+\chunkmeta{used in \chunklink{chunk300}{\texttt{web/\allowbreak{}page.\allowbreak{}css}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk300]{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
 Terminal blocks, file blocks and the tutorial's rhythm.
 \begin{Verbatim}
 /* tutorial */
@@ -17658,7 +17660,7 @@ p code,li code,.small-note code\{overflow-wrap:anywhere\}
 \end{Verbatim}
 
 \chunkhead{chunk300}{\filebadge\ \textbf{\texttt{web/\allowbreak{}page.\allowbreak{}css}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The file is its parts, in the order of the source.
 \begin{Verbatim}
 \chunkrefv{chunk288}
@@ -17691,7 +17693,7 @@ The file is its parts, in the order of the source.
 This is a port of the Go tools to JavaScript, as small as it can be while giving the same answers on the page's examples. It is checked by tests below, which run in Node.
 
 \chunkhead{chunk301}{\textbf{\ensuremath{\langle}\texttt{core: constants and errors}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 The same constants as the Go tangle, the escape rule, and an error type that carries a line number. Messages are rewritten into plainer sentences.
 \begin{Verbatim}
 /* ---------- literate core: load, tangle, sourcemap, absorb, three-way merge, weave ---------- */
@@ -17715,7 +17717,7 @@ const FRIENDLY = \{
 \end{Verbatim}
 
 \chunkhead{chunk302}{\textbf{\ensuremath{\langle}\texttt{core: loading}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 Loading wraps the text in an implicit root bag for the reason the Go tangle does, and turns parser errors into messages with a line.
 \begin{Verbatim}
 function load(text) \{
@@ -17734,7 +17736,7 @@ function load(text) \{
 \end{Verbatim}
 
 \chunkhead{chunk303}{\textbf{\ensuremath{\langle}\texttt{core: positions and layout}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 Offsets by summed lengths, as in the sourcemap, and the layout of a fence: the lines of its text with the offset of each and the indentation to remove.
 \begin{Verbatim}
 function offsets(root) \{
@@ -17765,7 +17767,7 @@ function layout(code, off) \{
 \end{Verbatim}
 
 \chunkhead{chunk304}{\textbf{\ensuremath{\langle}\texttt{core: analysing and tangling}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 Analysis collects chunks and blocks, expansion substitutes references with indentation, and tangle returns the files together with the origin of every line, which is what the page uses to trace lines both ways.
 \begin{Verbatim}
 const isFence = (c) => c.tag.length >= 3;
@@ -17816,7 +17818,7 @@ function tangle(text) \{
 \end{Verbatim}
 
 \chunkhead{chunk305}{\textbf{\ensuremath{\langle}\texttt{core: diff}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 A line diff by longest common subsequence, returning hunks like \texttt{git diff -U0}.
 \begin{Verbatim}
 /* ---------- diff ---------- */
@@ -17841,7 +17843,7 @@ function hunks(a, b) \{
 \end{Verbatim}
 
 \chunkhead{chunk306}{\textbf{\ensuremath{\langle}\texttt{core: absorb}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 Absorb folds an edited generated file back into the text through the origins, replacing, deleting and inserting lines, and refuses when it cannot tell which copy of a shared chunk was meant.
 \begin{Verbatim}
 /* ---------- absorb: fold an edit of a generated file back into the .lit ---------- */
@@ -17896,7 +17898,7 @@ function absorb(text, fname, oldLines, newLines) \{
 \end{Verbatim}
 
 \chunkhead{chunk307}{\textbf{\ensuremath{\langle}\texttt{core: three-way merge}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 The merge runs in generated-file space against a base, as the Go sync does, and reports regions as coming from the document, from the file, from both or in conflict.
 \begin{Verbatim}
 /* ---------- three-way merge in generated-file space ---------- */
@@ -17954,7 +17956,7 @@ function mergeFile(litText, fname, baseLines, genLines, decisions = \{\}) \{
 \end{Verbatim}
 
 \chunkhead{chunk308}{\textbf{\ensuremath{\langle}\texttt{core: weave}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk309}{\texttt{web/\allowbreak{}core.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk309]{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
 A compact weave for the page: headings, prose with inline code and math, and the chunks with their references.
 \begin{Verbatim}
 /* ---------- weave: a compact version of weave.py for the page ---------- */
@@ -18035,7 +18037,7 @@ function fenceLines(code) \{
 \end{Verbatim}
 
 \chunkhead{chunk309}{\filebadge\ \textbf{\texttt{web/\allowbreak{}core.\allowbreak{}js}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The file is its parts, in the order of the source.
 \begin{Verbatim}
 \chunkrefv{chunk301}
@@ -18125,7 +18127,7 @@ assert(weave(LIT).includes("§2"), "weave");
 The interface script connects the core to the page. It has no framework; each part is a few functions bound to elements by id.
 
 \chunkhead{chunk311}{\textbf{\ensuremath{\langle}\texttt{ui: helpers, theme and copy buttons}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 Helpers, the examples read back from the page, the lamp, which remembers the choice if storage is available, and the copy buttons.
 \begin{Verbatim}
 /* ---------- page ---------- */
@@ -18155,7 +18157,7 @@ document.addEventListener("click", (e) => \{
 \end{Verbatim}
 
 \chunkhead{chunk312}{\textbf{\ensuremath{\langle}\texttt{ui: the editor}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 The editor draws a gutter and a highlighted copy of the text under the text area, and keeps them scrolled together.
 \begin{Verbatim}
 /* ---------- playground ---------- */
@@ -18194,7 +18196,7 @@ function setOn(keys) \{ $$(".gl", $("#out-tangled")).forEach((g) => g.classList.
 \end{Verbatim}
 
 \chunkhead{chunk313}{\textbf{\ensuremath{\langle}\texttt{ui: rendering and updating}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 Every change of the text tangles it again and redraws the files, the chunks and, when it is visible, the woven page. A document that does not parse shows the error and the line instead.
 \begin{Verbatim}
 function renderTangled(t) \{
@@ -18267,7 +18269,7 @@ $("#out-tangled").addEventListener("mouseleave", () => \{ setHot(new Set()); tra
 \end{Verbatim}
 
 \chunkhead{chunk314}{\textbf{\ensuremath{\langle}\texttt{ui: tracing and presets}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 Moving the caret into a code line shows where it is generated, and hovering a generated line shows where it came from. Presets load examples.
 \begin{Verbatim}
 function caretTrace() \{
@@ -18299,7 +18301,7 @@ loadPreset("merge");
 \end{Verbatim}
 
 \chunkhead{chunk315}{\textbf{\ensuremath{\langle}\texttt{ui: maths}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 MathJax is loaded after first paint, so that it never delays the page.
 \begin{Verbatim}
 /* MathJax, loaded after first paint */
@@ -18308,7 +18310,7 @@ window.MathJax = \{ tex: \{ inlineMath: [["\textbackslash{}\textbackslash{}(", "
 \end{Verbatim}
 
 \chunkhead{chunk316}{\textbf{\ensuremath{\langle}\texttt{ui: conventions}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 The list of conventions with the example each one loads.
 \begin{Verbatim}
 /* ---------- notation rules ---------- */
@@ -18332,7 +18334,7 @@ $("#rules").innerHTML = RULES.map((r, i) => `<div class="rule"><h3>$\{esc(r[0])\
 \end{Verbatim}
 
 \chunkhead{chunk317}{\textbf{\ensuremath{\langle}\texttt{ui: toolbelt}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 The list of tools.
 \begin{Verbatim}
 /* ---------- toolbelt ---------- */
@@ -18351,7 +18353,7 @@ $("#toolgrid").innerHTML = TOOLS.map((t) => `<div class="tool"><h3>$\{esc(t[0])\
 \end{Verbatim}
 
 \chunkhead{chunk318}{\textbf{\ensuremath{\langle}\texttt{ui: the sync lab}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 The lab holds a small program tangled from a document, applies canned edits to either side, and shows what tangle, absorb and merge do with them, reporting each action in a log.
 \begin{Verbatim}
 /* ---------- the lab ---------- */
@@ -18448,7 +18450,7 @@ reset();
 \end{Verbatim}
 
 \chunkhead{chunk319}{\textbf{\ensuremath{\langle}\texttt{ui: the tree inspector}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 The inspector parses a text with the brashtag parser and draws the tree of bags, blobs and code.
 \begin{Verbatim}
 /* ---------- the tree inspector ---------- */
@@ -18489,7 +18491,7 @@ $("#treeChips .chip").click();
 \end{Verbatim}
 
 \chunkhead{chunk320}{\textbf{\ensuremath{\langle}\texttt{ui: the tab key}\ensuremath{\rangle}}\enspace\ensuremath{\equiv}}
-\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
+\chunkmeta{used in \chunklink{chunk321}{\texttt{web/\allowbreak{}ui.\allowbreak{}js}} \textperiodcentered{} part of \hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}, \hyperref[chunk321]{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
 In a text area Tab normally moves focus away, which is wrong in an editor for code. Tab inserts a tab, and Escape followed by Tab leaves, so keyboard users are not trapped.
 \begin{Verbatim}
 /* ---------- Tab inserts a tab; Esc then Tab leaves the editor ---------- */
@@ -18523,7 +18525,7 @@ function tabbable(ta) \{
 \end{Verbatim}
 
 \chunkhead{chunk321}{\filebadge\ \textbf{\texttt{web/\allowbreak{}ui.\allowbreak{}js}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The file is its parts, in the order of the source.
 \begin{Verbatim}
 \chunkrefv{chunk311}
@@ -18552,7 +18554,7 @@ The file is its parts, in the order of the source.
 The examples the editors can load, each a small literate document. They are data, not code, so each is a file chunk of its own.
 
 \chunkhead{chunk322}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}merge.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 A merge sort with the code split into named parts.
 \begin{Verbatim}
 #h1\{Merge sort\}
@@ -18618,7 +18620,7 @@ which solves to `$\textbackslash{}Theta(n \textbackslash{}log n)$` #cite\{cormen
 \end{Verbatim}
 
 \chunkhead{chunk323}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}twice.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 A chunk defined twice: the definitions concatenate.
 \begin{Verbatim}
 #h1\{Imports, explained where they matter\}
@@ -18669,7 +18671,7 @@ next to the code that needs it, and tangle collects them at the top.
 \end{Verbatim}
 
 \chunkhead{chunk324}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}files.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 One chunk used by two files.
 \begin{Verbatim}
 #h1\{One chunk, two files\}
@@ -18706,7 +18708,7 @@ keeps the indentation of the reference that asked for it.
 \end{Verbatim}
 
 \chunkhead{chunk325}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}escape.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 A reference that is shown and not expanded.
 \begin{Verbatim}
 #h1\{Writing about the notation\}
@@ -18732,7 +18734,7 @@ front of it. Tangle removes exactly one backslash.
 \end{Verbatim}
 
 \chunkhead{chunk326}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}math.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 Mathematics and a citation in the prose.
 \begin{Verbatim}
 #h1\{Softmax, carefully\}
@@ -18777,7 +18779,7 @@ one math span becomes display math when woven.
 \end{Verbatim}
 
 \chunkhead{chunk327}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}oops.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 A document with a mistake, to see the error.
 \begin{Verbatim}
 #h1\{A document that does not parse\}
@@ -18793,7 +18795,7 @@ brace in the line above and the document comes back. Inside backticks they are f
 \end{Verbatim}
 
 \chunkhead{chunk328}{\filebadge\ \textbf{\texttt{web/\allowbreak{}presets/\allowbreak{}lab.\allowbreak{}lit}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The program the sync lab edits.
 \begin{Verbatim}
 #h1\{Splitting a bill\}
@@ -18828,7 +18830,7 @@ Divide the total by the number of people, after adding the tip.
 The page runs the brashtag parser in the reader's browser, so it needs the parser as JavaScript. It is the parser of the brashtag repository, the same grammar as the Go parser's, and it is kept here, next to the page, so that tangling this document is all it takes: nothing else has to be found or installed.
 
 \chunkhead{chunk329}{\filebadge\ \textbf{\texttt{web/\allowbreak{}parser.\allowbreak{}js}}}
-\chunkmeta{used in \chunklink{chunk286}{\texttt{landing.\allowbreak{}html}}}
+\chunkmeta{used in \chunklink{chunk286}{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}}}
 The file is the one from the repository (github.com/PratikDeoghare/brashtag, parser.js), without its leading and trailing blank lines.
 \begin{Verbatim}
 
@@ -19275,17 +19277,22 @@ README for github
 \begin{Verbatim}
 # lit
 
+## NOTE: This is coded by Claude. I am testing it and reviewing. Seems to work.
+
 ### Install
 ```
 go install github.com/pratikdeoghare/lit/cmd/lit@latest
 ```
 
 ### Tangle itself
+```
 lit tangle book/lit.lit .
+```
 
 ### Weave itself
+```
 lit weave book/lit.lit -o woven
-
+```
 
 \end{Verbatim}
 
@@ -19345,6 +19352,7 @@ lit weave book/lit.lit -o woven
 \hyperref[chunk171]{\chunkname{diff: hunks}} & \ref*{chunk171} & \hyperref[chunk174]{\ref*{chunk174}} \\
 \hyperref[chunk173]{\chunkname{diff: Myers's algorithm}} & \ref*{chunk173} & \hyperref[chunk174]{\ref*{chunk174}} \\
 \hyperref[chunk172]{\chunkname{diff: trimming and merging}} & \ref*{chunk172} & \hyperref[chunk174]{\ref*{chunk174}} \\
+\hyperref[chunk286]{\texttt{docs/\allowbreak{}landing.\allowbreak{}html}} & \ref*{chunk286} &  \\
 \hyperref[chunk125]{\chunkname{fill: filling the gaps}} & \ref*{chunk125} & \hyperref[chunk128]{\ref*{chunk128}} \\
 \hyperref[chunk127]{\chunkname{fill: one gap}} & \ref*{chunk127} & \hyperref[chunk128]{\ref*{chunk128}} \\
 \hyperref[chunk123]{\chunkname{fill: putting the code in}} & \ref*{chunk123} & \hyperref[chunk128]{\ref*{chunk128}} \\
@@ -19421,7 +19429,6 @@ lit weave book/lit.lit -o woven
 \hyperref[chunk153]{\texttt{internal/\allowbreak{}skill/\allowbreak{}pytests/\allowbreak{}test\_\allowbreak{}fill\_\allowbreak{}review.\allowbreak{}py}} & \ref*{chunk153} &  \\
 \hyperref[chunk279]{\texttt{internal/\allowbreak{}skill/\allowbreak{}skill.\allowbreak{}go}} & \ref*{chunk279} &  \\
 \hyperref[chunk287]{\chunkname{landing page: text}} & \ref*{chunk287} & \hyperref[chunk286]{\ref*{chunk286}} \\
-\hyperref[chunk286]{\texttt{landing.\allowbreak{}html}} & \ref*{chunk286} &  \\
 \hyperref[chunk101]{\chunkname{lint: the checks}} & \ref*{chunk101} & \hyperref[chunk103]{\ref*{chunk103}} \\
 \hyperref[chunk102]{\chunkname{lint: the report}} & \ref*{chunk102} & \hyperref[chunk103]{\ref*{chunk103}} \\
 \hyperref[chunk165]{\chunkname{lit: the command's main}} & \ref*{chunk165} & \hyperref[chunk166]{\ref*{chunk166}} \\
